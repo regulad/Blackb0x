@@ -1,31 +1,75 @@
-
 # Blackb0x
- Apple TV 2/3 Jailbreak [Download here](https://github.com/NSSpiral/Blackb0x/releases)
 
+Untethered jailbreak tool for the 2nd/3rd-gen Apple TV, via the checkm8/SHAtter DFU-mode
+boot exploit — side-loads Cydia + Kodi. This is a Linux CLI port of the original macOS
+app; it runs entirely from the command line, no GUI.
 
-Untethered jailbreak tool that runs on modern versions of macOS (10.11+). 
-
-
-Devices supported: 
+Devices supported:
 - Apple TV 3,2 (A1469) (tvOS 8.4.x untethered, tvOS 7.x tethered)
-- Apple TV 3,1 (A1427) (tvOS 8.4.x untethered, tvOS 7.x tethered)
+- Apple TV 3,1 (A1427) (tvOS 8.4.x untethered, tvOS 7.x tethered) — needs external
+  hardware (an Arduino running [synackuk's fork of checkm8-A5](https://github.com/synackuk/checkm8-a5))
+  to pwn DFU mode first; `blackb0x` picks up from there
 - Apple TV 2,1 (A1378) (tvOS 7.1.2 tethered, tvOS 6.1.4 untethered)
 
-![Screen Shot 2021-07-07 at 9 49 07 pm](https://user-images.githubusercontent.com/32339783/124758042-8c1de500-df71-11eb-8db3-32a34e2ed3a2.png)
+IMPORTANT: make sure your device is connected to the internet for the first boot. Do
+not turn it off during first boot until Kodi appears.
 
-IMPORTANT: 
-Make sure your device is connected to the internet for the first boot. Do not turn off during first boot until Kodi appears.
+## Build
 
-## Steps to Jailbreak: 
+```sh
+git clone --recurse-submodules https://github.com/NSSpiral/Blackb0x.git
+cd Blackb0x
+cmake -S . -B build
+cmake --build build -j$(nproc)
+```
 
-0. (3,1 Only) PWN with Arduino + [synackuk's fork of checkm8-A5](https://github.com/synackuk/checkm8-a5)
-1. Plug in your Apple TV via micro-USB **AND** plug in the power cable.
-2. Open Blackb0x - Right click Blackb0x.app then click Open *(Important)*
-3. Click Jailbreak.
-4. Follow instructions to enter DFU mode
-5. Once Jailbreak has finished installing connect to your tv and wait 5-10 minutes until Kodi appears (Be patient, go have a coffee).
+**Clone recursively** (`--recurse-submodules`) — every third-party dependency is
+vendored as a git submodule and built from source; without it, the build will fail
+with missing headers. Already cloned without it? `git submodule update --init --recursive`.
 
-<br>
+Requires a normal C/C++ toolchain (gcc or clang), CMake ≥3.16, autoconf/automake/
+libtool/pkg-config (most of the dependency tree is autotools-based), and `hfsprogs`
+(`mkfs.hfsplus`/`fsck.hfsplus`) with a kernel built with `CONFIG_HFSPLUS_FS`. Everything
+else — wolfSSL, curl, libusb, libimobiledevice, zlib, etc. — is built from source as
+part of the build above; nothing else needs installing system-wide.
+
+### One-time system setup: `usbmuxd --no-preflight`
+
+The system `usbmuxd` daemon needs to run with `--no-preflight`, or this hardware's
+Normal-mode discovery will silently never work. Add a systemd drop-in:
+
+```sh
+sudo mkdir -p /etc/systemd/system/usbmuxd.service.d
+sudo tee /etc/systemd/system/usbmuxd.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/usbmuxd --user usbmuxd --systemd --no-preflight
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart usbmuxd
+```
+
+(Adjust the `ExecStart=` path/args to match your distro's existing unit —
+`systemctl cat usbmuxd` shows the original.)
+
+## Steps to jailbreak
+
+0. (3,1 only) PWN with Arduino + [synackuk's fork of checkm8-A5](https://github.com/synackuk/checkm8-a5) first.
+1. Plug in your Apple TV via micro-USB **and** plug in the power cable.
+2. Run `sudo ./build/blackb0x` (root is required — raw USB access and the ramdisk
+   patching step both need it). Add `--dry-run` to preview the exploit/firmware steps
+   without actually running the exploit or uploading anything to the device.
+3. Follow the on-screen instructions to enter DFU mode.
+4. Once the jailbreak finishes installing, connect to your TV and wait 5–10 minutes
+   until Kodi appears (be patient, go have a coffee).
+
+SSH access on the jailbroken device uses your own `~/.ssh/authorized_keys`, not a
+shared default — make sure you have a real SSH keypair (`ssh-keygen`) before running.
+
+## Development
+
+See [`AGENTS.md`](AGENTS.md) for repo conventions, and
+[`docs/HISTORY.md`](docs/HISTORY.md) for the full port/debugging history.
 
 ## Credits
 **nyan_satan**
@@ -51,3 +95,6 @@ Make sure your device is connected to the internet for the first boot. Do not tu
 
 **p0sixninja**
 * SHAtter
+
+**[verygenericname](https://github.com/verygenericname/gaster)**
+* gaster (the checkm8 implementation this port shells out to)

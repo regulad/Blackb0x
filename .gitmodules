@@ -1,0 +1,54 @@
+[submodule "third_party/libplist"]
+	path = third_party/libplist
+	url = https://github.com/libimobiledevice/libplist.git
+[submodule "third_party/libusbmuxd"]
+	path = third_party/libusbmuxd
+	url = https://github.com/libimobiledevice/libusbmuxd.git
+[submodule "third_party/libimobiledevice"]
+	path = third_party/libimobiledevice
+	url = https://github.com/regulad/libimobiledevice.git
+	branch = legacy
+[submodule "third_party/libfragmentzip"]
+	path = third_party/libfragmentzip
+	url = https://github.com/regulad/libfragmentzip.git
+	branch = fix-cxx-stdbool-header
+[submodule "third_party/xpwn"]
+	path = third_party/xpwn
+	url = https://github.com/regulad/xpwn.git
+	branch = legacy
+[submodule "third_party/libirecovery"]
+	path = third_party/libirecovery
+	url = https://github.com/synackuk/libirecovery.git
+[submodule "third_party/libgeneral"]
+	path = third_party/libgeneral
+	url = https://github.com/tihmstar/libgeneral.git
+[submodule "third_party/libimobiledevice-glue"]
+	path = third_party/libimobiledevice-glue
+	url = https://github.com/libimobiledevice/libimobiledevice-glue.git
+[submodule "third_party/libplist-modern"]
+	path = third_party/libplist-modern
+	url = https://github.com/libimobiledevice/libplist.git
+[submodule "third_party/wolfssl"]
+	path = third_party/wolfssl
+	url = https://github.com/wolfSSL/wolfssl.git
+[submodule "third_party/curl"]
+	path = third_party/curl
+	url = https://github.com/curl/curl.git
+[submodule "third_party/libzip"]
+	path = third_party/libzip
+	url = https://github.com/nih-at/libzip.git
+[submodule "third_party/libusb"]
+	path = third_party/libusb
+	url = https://github.com/libusb/libusb.git
+[submodule "third_party/libpng"]
+	path = third_party/libpng
+	url = https://github.com/pnggroup/libpng.git
+[submodule "third_party/bzip2"]
+	path = third_party/bzip2
+	url = https://github.com/libarchive/bzip2.git
+[submodule "third_party/zlib"]
+	path = third_party/zlib
+	url = https://github.com/madler/zlib.git
+[submodule "third_party/gaster"]
+	path = third_party/gaster
+	url = https://github.com/verygenericname/gaster.git

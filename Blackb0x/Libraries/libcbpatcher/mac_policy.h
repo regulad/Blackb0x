@@ -8,6 +8,10 @@
 
 /* (xnu/security/mac_policy.h) */
 
+#include <stdint.h> /* uint32_t — previously relied on transitive inclusion
+                     * from the Apple mach-o/mach headers CBPatch.c includes
+                     * on __APPLE__ builds; needed explicitly on Linux. */
+
 struct mac_policy_ops90
 {
     uint32_t mpo_audit_check_postselect;

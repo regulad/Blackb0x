@@ -14,11 +14,21 @@ void decrypt(char *input_path, char *ouput_path, char *ip_key, char *ip_iv, char
 
 
 void decrypt(char *input_path, char *ouput_path, char *ip_key, char *ip_iv, char *decrypt, char *template_path) {
-    
-    printf("input_path %s", input_path);
+
   char* inData;
     size_t inDataSize;
     init_libxpwn();
+    // init_libxpwn() itself sets GlobalLogLevel = 0xFF, which (per Log()'s
+    // own "if(level >= GlobalLogLevel) return;" check in libxpwn.c) means
+    // "suppress nothing" -- every XLOG() call in third_party/xpwn fires.
+    // Almost all of them are genuinely useful level 0-3 progress/status
+    // lines; level 4/5 are exactly the two purely diagnostic ones that
+    // spammed every single decrypt() call (a raw payload-hash dump in
+    // img3.c's createAbstractFileFromImg3, and an LZSS
+    // compressed/uncompressed-length "match" line in lzssfile.c) --
+    // confirmed by grepping every XLOG() call site in third_party/xpwn:
+    // only 3 calls use level >= 4 out of ~130 total. Silencing just those.
+    libxpwn_loglevel(4);
     AbstractFile* template = NULL;
     AbstractFile* certificate = NULL;
     unsigned int* key = NULL;
@@ -41,8 +51,6 @@ void decrypt(char *input_path, char *ouput_path, char *ip_key, char *ip_iv, char
         hasIV = TRUE;
     }
     
-    printf("decrypt %d \n", doDecrypt);
-
     if(hasKey == TRUE) {
     
     size_t bytes;
