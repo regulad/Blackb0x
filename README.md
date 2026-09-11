@@ -50,12 +50,17 @@ fresh clone + build, not just assumed):
   loop-mounts a real HFS+ volume.
 - **`mount`/`umount`/`blkid`/`cp`/`tar`** — used directly (as subprocesses, no shell)
   by `patchRamdisk()`. Present on any mainstream Linux distro as a matter of course.
-- The system **`usbmuxd`**, running with `--no-preflight` — see below.
+- **`usbmuxd` itself must be installed** (most distros ship it as its own package,
+  e.g. `usbmuxd`), separately from it needing to run with `--no-preflight` — see
+  below. Without the daemon present at all, Normal-mode device discovery has nothing
+  to talk to, full stop.
 - **`ssh-keygen`** — you need a real SSH keypair of your own (see "Steps to
   jailbreak" below); this tool doesn't generate one for you.
-- **`stdbuf`** (GNU coreutils) — optional but recommended: without it, `gaster`'s
-  exploit-progress output won't stream live while it runs (a fallback still works,
-  just silently, until it finishes or times out).
+- **`stdbuf`** (GNU coreutils) — **required**, not optional: `blackb0x` refuses to
+  run the `checkm8` exploit at all without it. `gaster`'s own progress output only
+  gets flushed live through `stdbuf`; without it, a stuck/hanging exploit run would
+  be silently indistinguishable from a working one, which is worse than just
+  refusing to start.
 
 ### One-time system setup: `usbmuxd --no-preflight`
 

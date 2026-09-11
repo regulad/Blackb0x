@@ -57,6 +57,7 @@ static void request_image_validation(irecv_client_t client);
 static int msleep(long msec);
 static const char* mode_to_str(int mode);
 static int send_data(irecv_client_t client, unsigned char* data, size_t size);
+static bool commandExistsOnPath(const char* name);
 static int runGaster(const std::vector<std::string>& args, int timeoutSeconds = 0);
 static int boot_client(irecv_client_t client, void* buf, size_t sz);
 static int check_img3_file_format(irecv_client_t client, void* file, size_t sz, void** out, size_t* outsz);
@@ -304,6 +305,28 @@ static bool isUninterruptible(pid_t pid) {
     return result;
 }
 
+// Manual PATH search (no shell/system() — matches this file's own
+// no-shell convention elsewhere) for whether a bare command name resolves
+// to an executable file. Used to require `stdbuf` up front rather than
+// discovering its absence mid-exploit.
+static bool commandExistsOnPath(const char* name) {
+    const char* pathEnv = getenv("PATH");
+    if (!pathEnv) return false;
+    std::string path(pathEnv);
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t colon = path.find(':', start);
+        std::string dir = path.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
+        if (!dir.empty()) {
+            std::string candidate = dir + "/" + name;
+            if (access(candidate.c_str(), X_OK) == 0) return true;
+        }
+        if (colon == std::string::npos) break;
+        start = colon + 1;
+    }
+    return false;
+}
+
 // Spawns the vendored `gaster` binary (third_party/gaster, built as its own
 // executable alongside blackb0x — see CMakeLists.txt), streaming its
 // stdout/stderr straight through to blackb0x's own stdout/stderr, verbatim
@@ -344,12 +367,27 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
     // pwn` that runs for a long time before ever exiting (exactly the
     // "stuck" scenario this timeout/D-state handling exists for) would
     // never flush its "Stage: RESET"/"Stage: SETUP"/etc. progress lines to
-    // the pipe at all, making the live-streaming above silently useless
-    // for the one case it actually matters for. `stdbuf` (GNU coreutils,
+    // the pipe at all, making the live-streaming above silently useless for
+    // the one case it actually matters for. `stdbuf` (GNU coreutils,
     // LD_PRELOADs a constructor that calls setvbuf() before gaster's own
     // main() runs) fixes this without needing to fork gaster.c just to add
-    // a setvbuf() call. execvp() below falls back to running gaster
-    // directly if stdbuf isn't installed, rather than failing outright.
+    // a setvbuf() call.
+    //
+    // Treated as a hard requirement, not a nice-to-have: an earlier version
+    // of this function fell back to running gaster unbuffered if stdbuf
+    // wasn't found, which silently reintroduces exactly the "blind the
+    // whole time" blind spot documented in docs/HISTORY.md — the one this
+    // whole mechanism exists to fix, and precisely when it would matter
+    // most (a stuck/hanging exploit run). Fail loudly and immediately
+    // instead, before ever forking gaster.
+    if (!commandExistsOnPath("stdbuf")) {
+        fprintf(stderr,
+                "checkm8: `stdbuf` (GNU coreutils) is required but not found on PATH -- "
+                "without it, gaster's exploit progress can't be streamed live, which makes "
+                "a stuck/hanging run indistinguishable from a silently-working one. Install "
+                "coreutils and try again.\n");
+        return -1;
+    }
     std::vector<std::string> argvStrings = { "stdbuf", "-oL", "-eL", resolveGasterPath() };
     argvStrings.insert(argvStrings.end(), args.begin(), args.end());
     std::vector<char*> cargv;
@@ -381,11 +419,9 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
         close(outPipe[1]);
         close(errPipe[1]);
         execvp("stdbuf", cargv.data());
-        // stdbuf isn't installed: fall back to running gaster directly
-        // (losing live-flushed output, not the ability to run at all).
-        // cargv[3] is already the gaster path (argvStrings[3], right after
-        // "stdbuf"/"-oL"/"-eL"); reuse it rather than resolving it again.
-        execv(cargv[3], &cargv[3]);
+        // Only reachable if stdbuf disappeared between the PATH check above
+        // and this exec (a real TOCTOU window, not expected in practice) --
+        // no silent fallback here, per the "required" reasoning above.
         _exit(127);
     }
     close(outPipe[1]);

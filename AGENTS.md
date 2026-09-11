@@ -113,16 +113,21 @@ autoconf/automake/libtool/pkg-config (most of the tree is autotools-based), and
 - `mount`/`umount`/`blkid`/`cp`/`tar` (invoked directly as subprocesses, no shell) —
   also `patchRamdisk()`. Assumed present on any mainstream distro, not called out as
   a separate install step.
-- The system `usbmuxd` **must run with `--no-preflight`** (a systemd drop-in —
-  `/etc/systemd/system/usbmuxd.service.d/override.conf` — is the documented way; see
-  `docs/HISTORY.md` for exactly why) or Normal-mode device discovery silently never
-  fires. This has to ship in the end-user README.
+- `usbmuxd` itself must be installed (a separate requirement from the point below —
+  most distros package it separately, e.g. `usbmuxd`), and **must run with
+  `--no-preflight`** (a systemd drop-in — `/etc/systemd/system/usbmuxd.service.d/
+  override.conf` — is the documented way; see `docs/HISTORY.md` for exactly why) or
+  Normal-mode device discovery silently never fires. Both of these have to ship in
+  the end-user README.
 - The invoking user's own `~/.ssh/authorized_keys` must exist — `patchRamdisk()`
   refuses to proceed without it (no shared default key is ever baked into the
   ramdisk).
-- `stdbuf` (GNU coreutils) — optional: without it, `gaster`'s live exploit-progress
-  streaming silently falls back to non-interactive (`runGaster()` execs `gaster`
-  directly instead), not a hard failure.
+- `stdbuf` (GNU coreutils) — **required**, not optional: `runGaster()`
+  (`DeviceManager.cpp`) checks for it on `PATH` before ever forking `gaster` and
+  refuses to run the exploit at all if it's missing, rather than silently falling
+  back to unbuffered output. An earlier version of this code did fall back silently
+  — that's exactly the "blind the whole time" bug documented in `docs/HISTORY.md`,
+  reintroduced by treating this as optional. Don't re-add that fallback.
 
 ## Current status
 
