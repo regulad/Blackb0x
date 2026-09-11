@@ -27,11 +27,35 @@ cmake --build build -j$(nproc)
 vendored as a git submodule and built from source; without it, the build will fail
 with missing headers. Already cloned without it? `git submodule update --init --recursive`.
 
-Requires a normal C/C++ toolchain (gcc or clang), CMake ≥3.16, autoconf/automake/
-libtool/pkg-config (most of the dependency tree is autotools-based), and `hfsprogs`
-(`mkfs.hfsplus`/`fsck.hfsplus`) with a kernel built with `CONFIG_HFSPLUS_FS`. Everything
-else — wolfSSL, curl, libusb, libimobiledevice, zlib, etc. — is built from source as
-part of the build above; nothing else needs installing system-wide.
+### Build-time system dependencies
+
+Everything else — wolfSSL, curl, libusb, libimobiledevice, zlib, etc. — is vendored
+and built from source as part of the build above; nothing else needs installing
+system-wide. What *does* need to already be on the system (verified against a real
+fresh clone + build, not just assumed):
+
+- A C/C++ toolchain (gcc or clang) and **GNU make** — most of the dependency tree is
+  autotools-based and shells out to `make` directly regardless of which CMake
+  generator you use for the top-level build.
+- **CMake ≥3.16.**
+- **autoconf, automake, libtool, pkg-config** — for the autotools-based dependencies'
+  own `./configure`/`autoreconf` steps.
+- **`xxd`** (usually in a `vim-common`/`xxd`/`vim` package) — used to embed `gaster`'s
+  exploit payload binaries as C arrays at build time.
+
+### Runtime system dependencies
+
+- **`hfsprogs`** (`mkfs.hfsplus`/`fsck.hfsplus`) and a kernel built with
+  `CONFIG_HFSPLUS_FS` (built-in or loadable module) — `patchRamdisk()` builds and
+  loop-mounts a real HFS+ volume.
+- **`mount`/`umount`/`blkid`/`cp`/`tar`** — used directly (as subprocesses, no shell)
+  by `patchRamdisk()`. Present on any mainstream Linux distro as a matter of course.
+- The system **`usbmuxd`**, running with `--no-preflight` — see below.
+- **`ssh-keygen`** — you need a real SSH keypair of your own (see "Steps to
+  jailbreak" below); this tool doesn't generate one for you.
+- **`stdbuf`** (GNU coreutils) — optional but recommended: without it, `gaster`'s
+  exploit-progress output won't stream live while it runs (a fallback still works,
+  just silently, until it finishes or times out).
 
 ### One-time system setup: `usbmuxd --no-preflight`
 

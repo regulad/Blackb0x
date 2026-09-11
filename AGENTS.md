@@ -100,9 +100,19 @@ sudo ./build/blackb0x [--ecid <id> | --udid <id>] [--tether-boot] [--dry-run]
 (`CAP_SYS_ADMIN`/`CAP_CHOWN`) both need it. No udev rules, no install step — it runs
 from wherever it's built.
 
+**Build-time system dependencies, verified against a real fresh clone + build (see
+README for the full list)**: a C/C++ toolchain, GNU make, CMake ≥3.16,
+autoconf/automake/libtool/pkg-config (most of the tree is autotools-based), and
+`xxd` — genuinely required, easy to miss, since it's only used once: embedding
+`gaster`'s exploit payload binaries as C arrays at build time
+(`add_custom_command(... COMMAND xxd -iC ...)` in `CMakeLists.txt`).
+
 **Runtime requirements beyond the build** (not just build-time deps):
 - `mkfs.hfsplus`/`fsck.hfsplus` (`hfsprogs` package) and a kernel with `hfsplus`
   support (`CONFIG_HFSPLUS_FS`) — needed by `patchRamdisk()`.
+- `mount`/`umount`/`blkid`/`cp`/`tar` (invoked directly as subprocesses, no shell) —
+  also `patchRamdisk()`. Assumed present on any mainstream distro, not called out as
+  a separate install step.
 - The system `usbmuxd` **must run with `--no-preflight`** (a systemd drop-in —
   `/etc/systemd/system/usbmuxd.service.d/override.conf` — is the documented way; see
   `docs/HISTORY.md` for exactly why) or Normal-mode device discovery silently never
@@ -110,6 +120,9 @@ from wherever it's built.
 - The invoking user's own `~/.ssh/authorized_keys` must exist — `patchRamdisk()`
   refuses to proceed without it (no shared default key is ever baked into the
   ramdisk).
+- `stdbuf` (GNU coreutils) — optional: without it, `gaster`'s live exploit-progress
+  streaming silently falls back to non-interactive (`runGaster()` execs `gaster`
+  directly instead), not a hard failure.
 
 ## Current status
 
