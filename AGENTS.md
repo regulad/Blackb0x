@@ -52,13 +52,14 @@ original macOS Cocoa/Objective-C app (the `.m`/`.mm`/`.h` files still in
 
 ## Repo layout
 
-- `Blackb0x/Source/` — the real, ported C++ (`main.cpp`, `Cli.hpp`/`.cpp`,
+- `Blackb0x/Source/` — the ported C++, and nothing else: `main.cpp`, `Cli.hpp`/`.cpp`,
   `DeviceManager.hpp`/`.cpp`, `IPSW.hpp`/`.cpp`, `IPSWDownloader.hpp`/`.cpp`,
-  `Patcher.hpp`/`.cpp`, `ResourcePath.hpp`/`.cpp`) alongside the **original,
-  now-superseded Objective-C** (`AppDelegate`, `MainView`, `Blackb0x`, `TaskManager`,
-  and the `.m`/`.mm` counterparts of the files above) — kept for reference/provenance,
-  not built. `checkm8.h`/`SHAtter.h` are exploit payload byte arrays, `#include`d
-  directly by `DeviceManager.cpp`.
+  `Patcher.hpp`/`.cpp`, `ResourcePath.hpp`/`.cpp`. The original Objective-C
+  (`AppDelegate`, `MainView`, `Blackb0x.h`/`.m`, `TaskManager`, and the old
+  `.h`/`.m`/`.mm` counterparts of the files above) has been fully ported and deleted —
+  check `docs/HISTORY.md`/git history if you need to see what it looked like.
+  `checkm8.h`/`SHAtter.h` are exploit payload byte arrays, `#include`d directly by
+  `DeviceManager.cpp` — not leftover Cocoa, keep these.
 - `Blackb0x/Libraries/` — already-portable C kept in-tree and built directly by the
   root `CMakeLists.txt`: `CBPatcher.c`/`libcbpatcher/`, `libiboot32patcher.c`/
   `libiboot32patcher/`, `xpwntool.c`. `libbootkit/` is dead code, linked into nothing.
