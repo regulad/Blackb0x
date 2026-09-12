@@ -2041,13 +2041,45 @@ Linux system as a matter of course and aren't called out as new dependencies.
          against the already-built `build/deps/include` tree, matching the
          real `add_executable(gaster ...)` target's own include/define
          flags (`-DHAVE_LIBUSB`, wolfSSL's `options.h` force-included, the
-         same `libusb-1.0` include path). **Not yet verified against real
-         hardware** — the actual test is a real `gaster pwn` (or
-         `sudo ./build/blackb0x`, after `cmake --build build` picks up the
-         repointed submodule) run against the real AppleTV3,2 in DFU mode,
-         to see whether the `SETUP`→`SPRAY` transition now reconnects
-         cleanly instead of corrupting. **Still unresolved** until that
-         happens.
+         same `libusb-1.0` include path).
+     - **Second fix on the same fork/branch, same real root cause the
+       `apple_mfi_fastcharge` investigation surfaced but only partly
+       addressed: `gaster` never actually claims the USB interface.**
+       Every DFU class request this file sends (`bmRequestType` `0x21`,
+       recipient = interface) went out over usbfs with interface 0
+       unclaimed — this, not any specific competing driver, is what the
+       kernel's own "usbfs: process ... (gaster) did not claim interface 0
+       before use" warning was reporting, on every single real-hardware
+       capture in this whole investigation, `apple_mfi_fastcharge` bound
+       or not. `wait_usb_handle()` now calls
+       `libusb_set_auto_detach_kernel_driver(handle->device, 1)` right
+       after opening the device (Linux-only, a documented no-op on other
+       platforms) and then `libusb_claim_interface(handle->device, 0)`
+       before running `usb_check_cb`/returning the handle; the interface
+       is released again on both the "wrong device" retry path and in
+       `close_usb_handle()`. Two effects: proper libusb usage (interface
+       claimed for every request that needs it, matching normal libusb
+       API contract instead of relying on usbfs's permissive-but-warned
+       unclaimed-request fallback), and — via
+       `libusb_set_auto_detach_kernel_driver()` — automatic detach/
+       reattach of any kernel driver bound to that interface (exactly
+       `apple_mfi_fastcharge`'s case) scoped to precisely the claim/
+       release window, at the code level, rather than depending solely on
+       the driver being blacklisted system-wide ahead of time. The
+       existing README/AGENTS.md blacklist documentation is left in place
+       rather than removed on the strength of this alone — auto-detach
+       should make it redundant in theory, but that's exactly the kind of
+       claim this file's own history says not to trust without a real
+       test.
+     - **Compiles and links clean** (rebuilt standalone the same way as
+       the previous fix, same flags), still fully statically linked
+       (`ldd`: only `libc`/`libm`/`ld-linux`). **Not yet verified against
+       real hardware** — the actual test, for both fixes together, is a
+       real `gaster pwn` (or `sudo ./build/blackb0x`, after `cmake --build
+       build` picks up the repointed submodule) run against the real
+       AppleTV3,2 in DFU mode, to see whether the `SETUP`→`SPRAY`
+       transition now reconnects cleanly instead of corrupting.
+       **Still unresolved** until that happens.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's

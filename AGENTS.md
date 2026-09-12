@@ -84,7 +84,7 @@ statically linked. **Forked** means: patched on our own branch, pushed, pointed 
 | `libgeneral` | tihmstar/libgeneral | No |
 | `xpwn` | **regulad/xpwn**@`legacy` | Yes — a wolfSSL AES-CBC buffer over-read fix in `img3.c`, plus disabling the legacy-libusb-0.1-only `pwnmetheus2` subdirectory |
 | `wolfssl`, `curl`, `libusb`, `libzip`, `libpng`, `bzip2`, `zlib` | upstream | No — current HEAD or latest stable tag; none of these existed in the original app |
-| `gaster` | **regulad/gaster** (fork), `linux-reset-race` branch, off verygenericname/gaster | Yes — skips the post-`SETUP`/`SPRAY`-stage host-triggered `libusb_reset_device()` call (kept for `RESET`/`PATCH`, which genuinely need it) after real-hardware evidence that this Linux-specific reset was corrupting the device's own re-enumeration; see `docs/HISTORY.md` |
+| `gaster` | **regulad/gaster** (fork), `linux-reset-race` branch, off verygenericname/gaster | Yes — (1) skips the post-`SETUP`/`SPRAY`-stage host-triggered `libusb_reset_device()` call (kept for `RESET`/`PATCH`, which genuinely need it) after real-hardware evidence that this Linux-specific reset was corrupting the device's own re-enumeration; (2) claims interface 0 (with `libusb_set_auto_detach_kernel_driver()`) instead of sending every DFU class request unclaimed, which is what the kernel's own "did not claim interface 0 before use" warning was about; see `docs/HISTORY.md` |
 
 `Blackb0x/Libraries/xpwntool.c` (in-tree, not a submodule) is confirmed sourced from
 `zzanehip/xpwntool-swift`, unchanged.
@@ -181,6 +181,12 @@ first) — `SETUP`/`SPRAY` have no such requirement, and the corruption above ha
 exactly at the `SETUP`→`SPRAY` boundary. The fork skips that specific host-triggered
 reset on a successful `SETUP`/`SPRAY` transition, letting the next stage's own
 `wait_usb_handle()` reconnect to the still-present device instead of forcing an
-unnecessary bus reset. **Not yet tested against real hardware.** See `docs/HISTORY.md`'s
+unnecessary bus reset. The same fork also has `wait_usb_handle()` claim interface 0
+(with `libusb_set_auto_detach_kernel_driver()` enabled first) before running any DFU
+class request against it, instead of sending every one of those requests unclaimed —
+the direct fix for the "did not claim interface 0 before use" kernel warning seen
+throughout this investigation, and a code-level handling of a conflicting kernel driver
+(like `apple_mfi_fastcharge`) that doesn't depend solely on it being blacklisted ahead of
+time. **Not yet tested against real hardware.** See `docs/HISTORY.md`'s
 checkm8/gaster section for the full evidence trail and the six earlier real software
 bugs found and fixed getting here. **Still unresolved.**
