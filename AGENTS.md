@@ -213,6 +213,27 @@ investigation reached, now corroborated by elimination of every specific softwar
 mechanism tested plus the original report that this reproduces across multiple different
 Linux machines: a genuine host-side (kernel/xHCI) limitation, not a userspace software
 bug.** See `docs/HISTORY.md`'s checkm8/gaster section for the full evidence trail and the
-six earlier real software bugs found and fixed getting here. **Still unresolved; further
-blind changes to gaster's exploit-timing code are not recommended without a new, specific
-mechanism to test.**
+six earlier real software bugs found and fixed getting here.
+
+**That "host limitation" framing was re-examined instead of accepted outright, and a real
+bug in the interface-claim fix itself turned up.** Rather than guess further, directly
+validated the two things actually in question: whether libusb's Linux sysfs-based
+matching (this project builds with `--disable-udev`) really finds the device, and whether
+the device genuinely still exists while `gaster` is stuck. A standalone probe against the
+exact same static `libusb-1.0.a`, run live while `gaster` was stuck waiting, found and
+opened the device immediately and successfully called `libusb_set_configuration()` — the
+same call previously found wedged in `D` state — ruling out "libusb can't find/open the
+device" as an explanation. `libusb_claim_interface()` failed with
+`LIBUSB_ERROR_INVALID_PARAM`, and `lsusb -v` confirmed why: a genuinely truncated
+configuration descriptor (`bNumInterfaces 0`), stable for minutes with no exploit running
+at all — real device-side descriptor corruption after `SETUP`'s heap-race. The actual bug:
+`wait_usb_handle()` was *gating* success on that claim succeeding, but upstream `gaster`
+never claims at all — with a permanently-zero-interface descriptor, the claim failed every
+time and `wait_usb_handle()` never even reached `checkm8_check_usb_device()`'s own check,
+turning a possibly-transient exploit-related state into an unconditional "not found."
+Fixed: the claim is now attempted only when `libusb_get_active_config_descriptor()` shows
+`bNumInterfaces > 0`, and `wait_usb_handle()` proceeds to `usb_check_cb()` regardless of
+whether the claim happened — matching upstream's permissiveness for exactly the case
+where claiming isn't possible. **Not yet re-verified against real hardware.** Still
+unresolved; further blind changes to gaster's exploit-timing code are not recommended
+without a new, specific mechanism to test.

@@ -2154,6 +2154,77 @@ Linux system as a matter of course and aren't called out as new dependencies.
        verified-correct exploit-critical code applies in full now that
        three good-faith guesses have each been individually disproven
        rather than confirmed.
+     - **A real bug in the interface-claim fix itself, found by directly
+       validating the two things actually in question rather than
+       accepting the "host limitation" conclusion at face value**: (1)
+       whether libusb's Linux sysfs-based device matching (this project
+       builds libusb with `--disable-udev`, falling back to the
+       `linux_netlink.c` backend for hotplug — see `CMakeLists.txt`'s own
+       comment) actually finds this exact VID/PID pair, and (2) whether
+       the device genuinely still exists on the bus at the moment
+       `gaster` is stuck. Verified both directly: wrote a standalone probe
+       program (built, run, and deleted — not part of the permanent
+       tree), linked against the exact same static `libusb-1.0.a` this
+       project already builds, calling the identical
+       `libusb_open_device_with_vid_pid()` sequence `wait_usb_handle()`
+       uses. Run live, with shell access to the same physical test
+       machine, **while `gaster` was actively stuck waiting**: the probe
+       found and opened the device on the very first call, and
+       `libusb_get_configuration()`/`libusb_set_configuration(1)` (the
+       exact call previously seen wedged in `D` state) both succeeded
+       immediately. This directly confirms sysfs-based matching works
+       correctly and the device is genuinely present and at least
+       partially responsive — ruling out "libusb can't find/open the
+       device" as an explanation.
+       - `libusb_claim_interface(handle->device, 0)`, however, failed
+         with `LIBUSB_ERROR_INVALID_PARAM` — libusb only returns that
+         when the interface number doesn't exist in the device's cached
+         config descriptor. `lsusb -v -d 05ac:1227` at the same moment
+         confirmed why: a genuinely truncated configuration descriptor
+         (`bLength 9`, `wTotalLength 0x0019`, `bNumInterfaces 0` —
+         missing its interface descriptor entirely), stable and
+         unchanged across several minutes of no exploit activity at all,
+         plus empty/unreadable string descriptors. Real, persistent
+         device-side descriptor corruption following `SETUP`'s heap-race
+         technique, not a momentary glitch.
+       - **The actual bug**: the previous commit's `wait_usb_handle()`
+         *gated* success on `libusb_claim_interface()` succeeding — but
+         upstream `gaster` never claims the interface at all, so it never
+         had this dependency. With the config descriptor genuinely
+         showing zero interfaces, the claim fails every single time,
+         which meant `wait_usb_handle()` closed the handle and retried
+         *without ever reaching `usb_check_cb()`* (i.e.
+         `checkm8_check_usb_device()`'s own serial-string/cpid check) at
+         all — turning a possibly-transient, exploit-related descriptor
+         state into an unconditional, permanent "device not found," on
+         top of whatever the string-descriptor corruption would have
+         caused on its own.
+       - **Fixed**: `wait_usb_handle()` now calls
+         `libusb_get_active_config_descriptor()` and only attempts
+         `libusb_claim_interface()` when `bNumInterfaces > 0`; either way
+         it proceeds to `usb_check_cb()` regardless of whether the claim
+         happened, matching upstream's original permissiveness for
+         exactly the case where claiming isn't possible. Every DFU class
+         request this file sends was, is, and remains interface-recipient
+         (`bmRequestType` `0x21`) regardless of whether the claim
+         succeeds — claiming when possible only fixes the kernel's own
+         "did not claim interface 0" warning and enables auto-detach for
+         a conflicting kernel driver; it was never required for those
+         requests to actually go out. `usb_handle_t` gained an
+         `interface_claimed` flag so `close_usb_handle()` only releases
+         what was actually claimed (calling
+         `libusb_release_interface()` on an unclaimed interface is a
+         guaranteed error, not a harmless no-op).
+       - **Compiles and links clean**, still fully statically linked.
+         **Not yet re-verified against real hardware** — the actual test
+         is whether `checkm8_check_usb_device()` now gets a chance to run
+         against the still-corrupted-descriptor device, and if so,
+         whether its own string-descriptor read succeeds or fails for
+         the same underlying reason. If it fails too, that would show
+         this exact corruption (not just the interface-claim gate) is
+         what's actually blocking progress in every variant tried so
+         far, upstream included — a materially different, narrower
+         conclusion than "host-controller limitation."
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's
