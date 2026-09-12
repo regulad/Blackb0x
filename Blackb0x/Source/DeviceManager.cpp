@@ -493,99 +493,6 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
     return WEXITSTATUS(status);
 }
 
-// The in-tree Linux `apple_mfi_fastcharge` driver (drivers/usb/misc/
-// apple-mfi-fastcharge.c) matches *any* USB device with Apple's vendor ID
-// (0x05AC) whose product ID falls in 0x1200-0x12FF -- a range that includes
-// this device's real DFU-mode PID (0x1227), not just normal Lightning
-// accessories; a real upstream fix (`USB: apple-mfi-fastcharge: don't probe
-// unhandled devices`) narrowed its match from "any Apple device at all" to
-// this range, but the range itself was never narrowed to exclude DFU. gaster
-// never calls libusb_claim_interface() -- it talks straight to the default
-// control pipe -- so this driver stays attached throughout and independently
-// calls its own usb_reset_device() whenever gaster's raw control transfers
-// confuse it (confirmed via a real dmesg capture during a hung run: "usbfs:
-// process ... (gaster) did not claim interface 0 before use" immediately
-// followed by "reset high-speed USB device ... using xhci_hcd" from this
-// driver, not from gaster). Two independent actors resetting the same
-// device at once is exactly the kind of race that corrupts USB enumeration
-// (garbled string descriptors, -71/-110/-75 errors seen in that same
-// capture) and can wedge the xHCI command ring hard enough to leave a
-// process in D state -- see docs/HISTORY.md's checkm8/gaster section for the
-// full evidence trail, including why this reproduces on every Linux machine
-// tried (the module ships in virtually every mainstream kernel) after
-// initially looking like a single machine's host-controller quirk.
-//
-// A one-shot sysfs interface-unbind right before invoking gaster isn't
-// enough: gaster's own RESET->SETUP->SPRAY->PATCH state machine disconnects
-// and re-enumerates the real device several times *inside one `gaster pwn`
-// call*, and the kernel's driver core reprobes+rebinds this module fresh on
-// every single reconnect -- there is no way for blackb0x, watching from
-// outside gaster's own subprocess, to repeat a per-stage unbind in between.
-// Unloading the module for the whole exploit run is the only fix that
-// survives every reconnect. Scoped as an RAII guard (reloaded on every exit
-// path -- success, failure, or an early return) and deliberately narrow: it
-// only acts if the module is actually loaded and currently unused
-// (`refcnt` 0 -- if some other Apple device on this same PC is genuinely
-// mid-charge through it, ripping it out would be a worse regression than
-// the problem this fixes), and does nothing at all if `modprobe` isn't on
-// PATH, since without it there'd be no way to reliably put the module back
-// afterward. Not a system-wide blacklist -- charging a real iPhone from
-// this same PC afterward is unaffected once the guard's destructor runs.
-class ApplemfiFastchargeGuard {
-public:
-    ApplemfiFastchargeGuard() {
-        if (!commandExistsOnPath("modprobe") || !isLoaded() || isInUse()) return;
-        if (runModprobe({"-r", kModuleName}) == 0) {
-            unloaded_ = true;
-        }
-    }
-    ~ApplemfiFastchargeGuard() {
-        if (unloaded_) runModprobe({kModuleName});
-    }
-    ApplemfiFastchargeGuard(const ApplemfiFastchargeGuard&) = delete;
-    ApplemfiFastchargeGuard& operator=(const ApplemfiFastchargeGuard&) = delete;
-
-private:
-    static constexpr const char* kModuleName = "apple_mfi_fastcharge";
-    bool unloaded_ = false;
-
-    static bool isLoaded() {
-        return access(("/sys/module/" + std::string(kModuleName)).c_str(), F_OK) == 0;
-    }
-    static bool isInUse() {
-        std::string path = "/sys/module/" + std::string(kModuleName) + "/refcnt";
-        FILE* f = fopen(path.c_str(), "r");
-        if (!f) return true; // can't confirm it's safe -- assume in use, don't touch it
-        int refcnt = 0;
-        bool ok = fscanf(f, "%d", &refcnt) == 1;
-        fclose(f);
-        return !ok || refcnt != 0;
-    }
-    static int runModprobe(const std::vector<std::string>& args) {
-        std::vector<std::string> argvStrings = {"modprobe"};
-        argvStrings.insert(argvStrings.end(), args.begin(), args.end());
-        std::vector<char*> cargv;
-        cargv.reserve(argvStrings.size() + 1);
-        for (auto& a : argvStrings) cargv.push_back(const_cast<char*>(a.c_str()));
-        cargv.push_back(nullptr);
-
-        pid_t pid = fork();
-        if (pid < 0) return -1;
-        if (pid == 0) {
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-            }
-            execvp("modprobe", cargv.data());
-            _exit(127);
-        }
-        int status = 0;
-        waitpid(pid, &status, 0);
-        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    }
-};
-
 // The low-level USB request sequence/payload/timing that used to live
 // directly in this function (hand-ported from the original
 // DeviceManager.m) is gone: checkm8Attempt() now shells out to the
@@ -641,12 +548,6 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid) {
 
     status("Exploiting with checkm8");
     progress(10.0);
-
-    // Covers the pwn call, the failure-path reset call, and the post-pwn
-    // reconnect/verification below -- all of it touches the same real USB
-    // device apple_mfi_fastcharge would otherwise keep re-claiming on every
-    // reconnect. See the guard's own header comment above for why.
-    ApplemfiFastchargeGuard mfiGuard;
 
     int exitCode = runGaster({"pwn"}, 180);
     if (exitCode != 0) {

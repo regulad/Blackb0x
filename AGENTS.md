@@ -128,6 +128,11 @@ autoconf/automake/libtool/pkg-config (most of the tree is autotools-based), and
   back to unbuffered output. An earlier version of this code did fall back silently
   — that's exactly the "blind the whole time" bug documented in `docs/HISTORY.md`,
   reintroduced by treating this as optional. Don't re-add that fallback.
+- The in-tree `apple_mfi_fastcharge` kernel driver **must be blacklisted** (a
+  `/etc/modprobe.d` drop-in — see the README's own setup section) or it fights
+  `gaster` for the DFU-mode device mid-exploit; see `docs/HISTORY.md` for exactly
+  why. Same pattern as `usbmuxd --no-preflight` above: a documented one-time manual
+  step, not something `blackb0x` checks or fixes for you at runtime.
 
 ## Current status
 
@@ -148,11 +153,14 @@ device's real DFU PID `0x1227`) and independently issues its own `usb_reset_devi
 calls while `gaster`'s own raw, timing-sensitive control transfers are in flight — two
 actors resetting the same device at once, which explains both the corruption and why it
 reproduces on any Linux box with this common, usually-autoloaded kernel module present.
-Mitigated in `DeviceManager.cpp` (`ApplemfiFastchargeGuard`, scoped around the whole
-`checkm8Attempt()`): `modprobe -r`'s the module for the duration of the exploit (only if
-it's loaded, `modprobe` is on `PATH`, and it's currently unused) and puts it back
-afterward — not a permanent blacklist, and `gaster` itself stays unmodified. **Not yet
-re-verified against real hardware** — see `docs/HISTORY.md`'s checkm8/gaster section for
-the full evidence trail and the six earlier real software bugs found and fixed getting
-here. Next step is a real end-to-end attempt with this fix in place, not different host
-hardware.
+Fixed the same way as the `usbmuxd --no-preflight` requirement above — a one-time
+manual system setup step documented in the README, not code in `blackb0x` itself: the
+module needs to be blacklisted via `/etc/modprobe.d`, since a bare `modprobe -r` alone
+was tried first and confirmed insufficient on real hardware (the kernel reloads it on
+its own via `request_module()` on every one of gaster's stage-transition reconnects,
+independent of anything either binary does in userspace). `gaster` itself stays
+unmodified; see the README's own setup section for the exact commands. **Not yet
+re-verified against real hardware** — see `docs/HISTORY.md`'s checkm8/gaster section
+for the full evidence trail and the six earlier real software bugs found and fixed
+getting here. Next step is a real end-to-end attempt with this blacklisted, not
+different host hardware.

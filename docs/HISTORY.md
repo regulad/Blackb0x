@@ -1909,31 +1909,59 @@ Linux system as a matter of course and aren't called out as new dependencies.
        safe since the module's refcnt was 0 — nothing else on the test
        machine was actively using it) had not been reported back as of this
        writing.
-     - **Mitigated in `DeviceManager.cpp`, not in the vendored `gaster.c`**
-       (which stays unmodified, per this project's own convention) and not
-       via a permanent system-wide blacklist either: a new
-       `ApplemfiFastchargeGuard` RAII type, scoped across all of
-       `checkm8Attempt()` (the pwn call, the failure-path reset call, and
-       the post-pwn reconnect/verification — all touch the same device).
-       A single sysfs interface-unbind *before* invoking gaster was
-       considered and rejected: gaster's own internal
-       RESET→SETUP→SPRAY→PATCH state machine disconnects and
-       re-enumerates the real USB device several times *inside one
-       `gaster pwn` call*, and the kernel's driver core reprobes+rebinds
-       apple_mfi_fastcharge fresh on every single reconnect — there's no
-       way for code outside gaster's own subprocess to repeat a per-stage
-       unbind in between. Unloading the module for the whole exploit run
-       is the only fix that survives every reconnect, so the guard's
-       constructor `modprobe -r`'s it (only if loaded, on `PATH`, and its
-       `/sys/module/apple_mfi_fastcharge/refcnt` reads `0` — refusing to
-       touch it if some other Apple device on the same PC is genuinely
-       mid-charge through it right now) and its destructor `modprobe`'s it
-       back on every exit path. **Compiles clean** (verified via a
-       standalone `-fsyntax-only` pass against the already-built
-       `build/deps/include` tree, not yet a full incremental rebuild) but,
-       like the dmesg finding above, **not yet verified against real
-       hardware** — the actual test is a real `gaster pwn` run through
-       `blackb0x` itself with this guard in place.
+     - **Two code-based fixes were tried in `DeviceManager.cpp` and then
+       both abandoned, per explicit user direction, in favor of a
+       documented manual step instead — the same pattern already used for
+       `usbmuxd --no-preflight`.** Worth keeping the trail since the
+       reasoning that ruled each one out is real, even though none of this
+       code exists in the tree anymore:
+       - **First attempt (wrong): a bare `modprobe -r` up front, nothing
+         else, in a small RAII guard scoped around `checkm8Attempt()`.**
+         Tried against real hardware — the module came right back on its
+         own before the exploit got anywhere. Root cause: every one of
+         gaster's stage-transition reconnects fires the kernel's own
+         module-autoload path (`request_module()`, driven by the
+         re-enumerating device's USB modalias — the same mechanism whether
+         the kernel invokes `modprobe` directly via a usermode helper or
+         udev does it on the kernel's behalf), completely independently of
+         anything either blackb0x or gaster does in userspace. Removing an
+         already-loaded instance once does nothing to stop the very next
+         reconnect from loading it straight back in — a single sysfs
+         interface-unbind *before* invoking gaster was also considered and
+         rejected for the identical reason (gaster's own internal
+         RESET→SETUP→SPRAY→PATCH state machine reconnects several times
+         *inside one `gaster pwn` call*, with no way for code outside that
+         subprocess to repeat a per-stage unbind in between).
+       - **Second attempt (also abandoned): the RAII guard writing a
+         temporary `/etc/modprobe.d` `blacklist` entry itself** (removed
+         on construction along with an already-loaded, currently-unused
+         instance; both restored in the destructor on every exit path). A
+         `blacklist` directive is the right *mechanism* — `modprobe`/
+         `libkmod` honor it specifically for *automatic*, alias-triggered
+         loads while still allowing an *explicit* `modprobe
+         apple_mfi_fastcharge` to work — but having `blackb0x` itself
+         silently write and delete a system-wide `/etc/modprobe.d` file at
+         runtime was the wrong place to put that mechanism: not
+         signal-safe (a hard `SIGKILL`, or an uncaught `SIGINT`, skips the
+         destructor and can leave the blacklist file and/or the removed
+         module behind), and inconsistent with how this exact class of
+         problem is already handled elsewhere in this project.
+       - **Final decision: document it as a one-time manual setup step,
+         exactly like `usbmuxd --no-preflight`, and add no code at all.**
+         `blackb0x` never checks for or manages the daemon flag that
+         `usbmuxd --no-preflight` requires either — that's a documented
+         README/AGENTS.md prerequisite the user sets up once, not
+         something enforced at runtime — and this driver conflict is the
+         same shape of problem: a system-level configuration issue, not
+         something a single exploit run should be silently patching system
+         state to work around. README.md gained a new "One-time system
+         setup: blacklist `apple_mfi_fastcharge`" section (mirroring the
+         `usbmuxd` one immediately below it) with the exact
+         `/etc/modprobe.d/blacklist-apple-mfi-fastcharge.conf` +
+         `modprobe -r` commands; AGENTS.md's runtime-requirements list and
+         "Current status" section were updated to match. **Not yet
+         verified against real hardware** — the actual test is a real
+         `gaster pwn` run with the module blacklisted this way.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's

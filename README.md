@@ -62,6 +62,33 @@ fresh clone + build, not just assumed):
   be silently indistinguishable from a working one, which is worse than just
   refusing to start.
 
+### One-time system setup: blacklist `apple_mfi_fastcharge`
+
+The in-tree `apple_mfi_fastcharge` driver (Apple Lightning fast-charge support) binds
+to *any* USB device with Apple's vendor ID whose product ID falls in `0x1200`-`0x12ff`
+— a range that includes the Apple TV's real DFU-mode PID (`0x1227`), so this driver
+attaches to it even in DFU mode. `gaster` never claims the interface first, so this
+driver stays attached and independently resets the device while `gaster`'s own
+exploit-timing-sensitive USB transfers are in flight — two things resetting the same
+device at once, which corrupts USB enumeration and can hang the exploit (sometimes
+taking the whole USB stack down with it) in a way that reproduces across different
+Linux machines, not just one host's controller. Removing the module once isn't
+enough either — it reloads itself automatically the moment the device reconnects
+(which `gaster`'s own exploit does several times per run) — so it needs to be
+blacklisted, not just unloaded:
+
+```sh
+sudo mkdir -p /etc/modprobe.d
+sudo tee /etc/modprobe.d/blacklist-apple-mfi-fastcharge.conf <<'EOF'
+blacklist apple_mfi_fastcharge
+EOF
+sudo modprobe -r apple_mfi_fastcharge   # only if currently loaded
+```
+
+(If you actually use this same PC to fast-charge a real Apple device over USB,
+removing this blacklist afterward — `sudo rm /etc/modprobe.d/
+blacklist-apple-mfi-fastcharge.conf` — restores that.)
+
 ### One-time system setup: `usbmuxd --no-preflight`
 
 The system `usbmuxd` daemon needs to run with `--no-preflight`, or this hardware's
