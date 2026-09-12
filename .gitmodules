@@ -51,4 +51,5 @@
 	url = https://github.com/madler/zlib.git
 [submodule "third_party/gaster"]
 	path = third_party/gaster
-	url = https://github.com/verygenericname/gaster.git
+	url = https://github.com/regulad/gaster.git
+	branch = linux-reset-race

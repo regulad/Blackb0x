@@ -1997,16 +1997,57 @@ Linux system as a matter of course and aren't called out as new dependencies.
        single-machine) investigation described — that conclusion was
        correct as far as it went; the `apple_mfi_fastcharge` finding was a
        real, additive discovery (worth keeping — it's one less variable in
-       the way) but not the fix for the underlying problem. **Still
-       unresolved.** Not yet tried: patching `gaster`'s own
-       `reset_usb_handle()` call (a fork, since the project's convention
-       for vendored dependencies is to fork rather than locally patch) to
-       skip or delay the explicit host-side reset after stages where the
-       device is already mid-DFU-protocol-reset on its own — flagged as a
-       real experiment worth trying, not yet attempted, since it touches
-       exploit-adjacent timing code that (per this file's own repeated
-       lesson) shouldn't be changed on a guess without the ability to test
-       it immediately against real hardware.
+       the way) but not the fix for the underlying problem.
+     - **`gaster` forked to test the host-side-reset theory directly.**
+       Per this project's own convention (fork a vendored dependency rather
+       than carry a local patch — see "Vendored dependencies" in
+       `AGENTS.md`), forked to **regulad/gaster**, `linux-reset-race`
+       branch, off the exact commit already pinned
+       (`d4b98423ee92935ba04646ea41a1ed74a27202a1`). `.gitmodules`'s
+       `third_party/gaster` entry now points at that fork/branch instead of
+       `verygenericname/gaster` directly.
+       - **The actual change**: `gaster_checkm8()`'s state machine
+         (`RESET → SETUP → SPRAY → PATCH`) calls the same
+         `reset_usb_handle()` (a host-triggered `libusb_reset_device()`)
+         unconditionally after every single stage, win or lose. Reading
+         each stage's own ending sequence shows this isn't uniformly
+         necessary: `checkm8_stage_reset()` and `checkm8_stage_patch()`
+         both explicitly put the device into `DFU_STATE_MANIFEST_WAIT_RESET`
+         first (via `dfu_set_state_wait_reset()`/`dfu_check_status()`), a
+         real DFU-protocol state that genuinely requires a bus reset to
+         advance out of — for those two, the reset is doing necessary work.
+         `checkm8_stage_setup()` and `checkm8_stage_spray()` are pure
+         host-side control-transfer races (heap-hole timing tricks) whose
+         own last request is a plain STALL probe / `DFU_CLR_STATUS` — no
+         protocol-mandated reset-wait state at all. The corruption observed
+         above happened at exactly this boundary: right after
+         `Stage: SETUP` / `ret: true`, before `SPRAY`'s own
+         `wait_usb_handle()` ever found the device again. The fork adds a
+         `completed_stage` variable (capturing which stage just ran, before
+         the existing code advances `stage` to the next one) and skips the
+         `reset_usb_handle()` call specifically when the just-completed
+         stage was `SETUP` or `SPRAY` *and* it succeeded — a failed stage
+         still falls back to `STAGE_RESET` and still gets the real reset,
+         unchanged from upstream, since that recovery path genuinely wants
+         a clean device state before retrying from scratch. A 26-line diff
+         against upstream, touching only the state machine's control flow —
+         no change to any of the actual exploit request sequence, payload,
+         or timing values themselves, per this file's own repeated caution
+         about not touching verified-correct exploit-critical code.
+       - **Compiles clean**: built standalone with the exact `xxd -iC`
+         payload-header generation `CMakeLists.txt` uses (same working
+         directory + bare relative filename convention, to get the same
+         `payload_*_bin` variable names `gaster.c` expects) and `gcc -c`
+         against the already-built `build/deps/include` tree, matching the
+         real `add_executable(gaster ...)` target's own include/define
+         flags (`-DHAVE_LIBUSB`, wolfSSL's `options.h` force-included, the
+         same `libusb-1.0` include path). **Not yet verified against real
+         hardware** — the actual test is a real `gaster pwn` (or
+         `sudo ./build/blackb0x`, after `cmake --build build` picks up the
+         repointed submodule) run against the real AppleTV3,2 in DFU mode,
+         to see whether the `SETUP`→`SPRAY` transition now reconnects
+         cleanly instead of corrupting. **Still unresolved** until that
+         happens.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's

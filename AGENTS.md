@@ -84,7 +84,7 @@ statically linked. **Forked** means: patched on our own branch, pushed, pointed 
 | `libgeneral` | tihmstar/libgeneral | No |
 | `xpwn` | **regulad/xpwn**@`legacy` | Yes — a wolfSSL AES-CBC buffer over-read fix in `img3.c`, plus disabling the legacy-libusb-0.1-only `pwnmetheus2` subdirectory |
 | `wolfssl`, `curl`, `libusb`, `libzip`, `libpng`, `bzip2`, `zlib` | upstream | No — current HEAD or latest stable tag; none of these existed in the original app |
-| `gaster` | verygenericname/gaster | No — used unmodified, shelled out to for the actual checkm8 exploit |
+| `gaster` | **regulad/gaster** (fork), `linux-reset-race` branch, off verygenericname/gaster | Yes — skips the post-`SETUP`/`SPRAY`-stage host-triggered `libusb_reset_device()` call (kept for `RESET`/`PATCH`, which genuinely need it) after real-hardware evidence that this Linux-specific reset was corrupting the device's own re-enumeration; see `docs/HISTORY.md` |
 
 `Blackb0x/Libraries/xpwntool.c` (in-tree, not a submodule) is confirmed sourced from
 `zzanehip/xpwntool-swift`, unchanged.
@@ -158,8 +158,8 @@ manual system setup step documented in the README, not code in `blackb0x` itself
 module needs to be blacklisted via `/etc/modprobe.d`, since a bare `modprobe -r` alone
 was tried first and confirmed insufficient on real hardware (the kernel reloads it on
 its own via `request_module()` on every one of gaster's stage-transition reconnects,
-independent of anything either binary does in userspace). `gaster` itself stays
-unmodified; see the README's own setup section for the exact commands.
+independent of anything either binary does in userspace); see the README's own setup
+section for the exact commands.
 
 **Tested against real hardware with the module actually blacklisted — confirmed
 working as designed, but confirmed *not* the fix for the hang.** `apple_mfi_fastcharge`
@@ -169,7 +169,18 @@ hang happened anyway — `gaster` still got stuck at the same point, and the dev
 left in the same descriptor-corrupted state (`lsusb -v`: garbled `iManufacturer`/
 `iProduct`, `Couldn't open device`) that only clears on a physical unplug/replug. So
 `apple_mfi_fastcharge` was a real, additive conflict worth fixing, but not the (sole)
-root cause — this is back to looking like a genuine host-side (kernel/xHCI) limitation
+root cause — this pointed back at a genuine host-side (kernel/xHCI) limitation
 reinitializing this device after `gaster`'s own reset, independent of any competing
-driver. See `docs/HISTORY.md`'s checkm8/gaster section for the full evidence trail and
-the six earlier real software bugs found and fixed getting here. **Still unresolved.**
+driver.
+
+`gaster` is now forked (**regulad/gaster**, `linux-reset-race` branch — see the vendored
+dependencies table above) to test that theory directly: `gaster_checkm8()`'s
+unconditional post-stage `reset_usb_handle()` call is only protocol-required after
+`RESET`/`PATCH` (both explicitly put the device into `DFU_STATE_MANIFEST_WAIT_RESET`
+first) — `SETUP`/`SPRAY` have no such requirement, and the corruption above happened
+exactly at the `SETUP`→`SPRAY` boundary. The fork skips that specific host-triggered
+reset on a successful `SETUP`/`SPRAY` transition, letting the next stage's own
+`wait_usb_handle()` reconnect to the still-present device instead of forcing an
+unnecessary bus reset. **Not yet tested against real hardware.** See `docs/HISTORY.md`'s
+checkm8/gaster section for the full evidence trail and the six earlier real software
+bugs found and fixed getting here. **Still unresolved.**
