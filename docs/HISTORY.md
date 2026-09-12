@@ -1959,9 +1959,54 @@ Linux system as a matter of course and aren't called out as new dependencies.
          `usbmuxd` one immediately below it) with the exact
          `/etc/modprobe.d/blacklist-apple-mfi-fastcharge.conf` +
          `modprobe -r` commands; AGENTS.md's runtime-requirements list and
-         "Current status" section were updated to match. **Not yet
-         verified against real hardware** — the actual test is a real
-         `gaster pwn` run with the module blacklisted this way.
+         "Current status" section were updated to match.
+     - **Tested against real hardware with the module actually blacklisted
+       — confirmed real, confirmed insufficient on its own.** `lsmod`
+       during the test showed `apple_mfi_fastcharge` genuinely not
+       loaded (the blacklist worked as designed — no reload, unlike the
+       bare-`modprobe -r` attempt above), and no `gaster` process was left
+       hung afterward. **The identical corruption still happened anyway**:
+       a fresh `sudo journalctl -k` capture during the same `sudo
+       ./build/gaster pwn` run showed the exact same
+       "usbfs: process ... (gaster) did not claim interface 0 before use"
+       → "reset high-speed USB device ... using xhci_hcd" pair (twice,
+       once per completed stage), followed by the same disconnect/garbled-
+       re-enumeration storm (`error -90`, `config 1 has 0 interfaces`,
+       `can't set config #1, error -110`) — except this time every one of
+       those kernel log lines is attributed to the generic `usb` bus name
+       instead of `apple-mfi-fastcharge`, direct confirmation that no
+       competing driver is involved anymore. `gaster` hung again at the
+       same point (`Stage: SETUP` / `ret: true`, then `wait_usb_handle()`
+       for `SPRAY` never finding the device again), and the device was
+       left sitting in the same corrupted state observed live afterward
+       (`lsusb -v -d 05ac:1227`: `iManufacturer`/`iProduct` still read
+       garbled two-byte strings, `Couldn't open device`) — it never
+       actually recovered on its own, matching the "needs a physical
+       unplug/replug" recovery already documented above.
+       **Conclusion: the `apple_mfi_fastcharge` conflict was real, and the
+       blacklist genuinely fixes that specific conflict, but it was never
+       the (sole) root cause of this hang.** With it conclusively ruled
+       out, the corruption is happening purely between `gaster`'s own
+       control-transfer usage (interface-recipient requests without ever
+       claiming the interface — triggering the "did not claim" warning on
+       its own, independent of any driver) and its own unconditional
+       post-stage `reset_usb_handle()`/`libusb_reset_device()` call
+       colliding with however this host's USB core/xHCI driver
+       reinitializes the device afterward. This is genuinely the same
+       failure class the very first (pre-`apple_mfi_fastcharge`,
+       single-machine) investigation described — that conclusion was
+       correct as far as it went; the `apple_mfi_fastcharge` finding was a
+       real, additive discovery (worth keeping — it's one less variable in
+       the way) but not the fix for the underlying problem. **Still
+       unresolved.** Not yet tried: patching `gaster`'s own
+       `reset_usb_handle()` call (a fork, since the project's convention
+       for vendored dependencies is to fork rather than locally patch) to
+       skip or delay the explicit host-side reset after stages where the
+       device is already mid-DFU-protocol-reset on its own — flagged as a
+       real experiment worth trying, not yet attempted, since it touches
+       exploit-adjacent timing code that (per this file's own repeated
+       lesson) shouldn't be changed on a guess without the ability to test
+       it immediately against real hardware.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's

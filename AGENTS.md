@@ -159,8 +159,17 @@ module needs to be blacklisted via `/etc/modprobe.d`, since a bare `modprobe -r`
 was tried first and confirmed insufficient on real hardware (the kernel reloads it on
 its own via `request_module()` on every one of gaster's stage-transition reconnects,
 independent of anything either binary does in userspace). `gaster` itself stays
-unmodified; see the README's own setup section for the exact commands. **Not yet
-re-verified against real hardware** — see `docs/HISTORY.md`'s checkm8/gaster section
-for the full evidence trail and the six earlier real software bugs found and fixed
-getting here. Next step is a real end-to-end attempt with this blacklisted, not
-different host hardware.
+unmodified; see the README's own setup section for the exact commands.
+
+**Tested against real hardware with the module actually blacklisted — confirmed
+working as designed, but confirmed *not* the fix for the hang.** `apple_mfi_fastcharge`
+genuinely stayed unloaded through the whole run (no competing driver anymore, confirmed
+via `lsmod` and the kernel log's driver attribution), but the exact same corruption and
+hang happened anyway — `gaster` still got stuck at the same point, and the device was
+left in the same descriptor-corrupted state (`lsusb -v`: garbled `iManufacturer`/
+`iProduct`, `Couldn't open device`) that only clears on a physical unplug/replug. So
+`apple_mfi_fastcharge` was a real, additive conflict worth fixing, but not the (sole)
+root cause — this is back to looking like a genuine host-side (kernel/xHCI) limitation
+reinitializing this device after `gaster`'s own reset, independent of any competing
+driver. See `docs/HISTORY.md`'s checkm8/gaster section for the full evidence trail and
+the six earlier real software bugs found and fixed getting here. **Still unresolved.**
