@@ -2073,13 +2073,48 @@ Linux system as a matter of course and aren't called out as new dependencies.
        test.
      - **Compiles and links clean** (rebuilt standalone the same way as
        the previous fix, same flags), still fully statically linked
-       (`ldd`: only `libc`/`libm`/`ld-linux`). **Not yet verified against
-       real hardware** — the actual test, for both fixes together, is a
-       real `gaster pwn` (or `sudo ./build/blackb0x`, after `cmake --build
-       build` picks up the repointed submodule) run against the real
-       AppleTV3,2 in DFU mode, to see whether the `SETUP`→`SPRAY`
-       transition now reconnects cleanly instead of corrupting.
-       **Still unresolved** until that happens.
+       (`ldd`: only `libc`/`libm`/`ld-linux`).
+     - **Tested against real hardware with both fixes together — the
+       `SETUP`/`SPRAY` reset-skip is confirmed wrong, and reverted.** This
+       run showed neither the earlier corruption nor any kernel log noise
+       at all after `Stage: SETUP` / `ret: true` — just silence, and
+       `gaster` hanging in the same place. Direct proof it was a genuine
+       kernel-level hang, not a userspace retry loop: `ps` showed `Dl+`
+       (confirmed `D`, uninterruptible), and — since I had shell access to
+       the same physical test machine for this investigation —
+       `sudo cat /proc/<pid>/stack` gave an exact kernel stack instead of
+       another guess:
+       ```
+       usb_start_wait_urb
+       usb_control_msg
+       usb_reset_configuration
+       usbdev_do_ioctl
+       __x64_sys_ioctl
+       ```
+       `usb_reset_configuration()` is the kernel-side handler for
+       `USBDEVFS_SETCONFIGURATION` — i.e. this is `libusb_set_configuration()`
+       inside the *next* `wait_usb_handle()` call (for `SPRAY`), blocked
+       forever on a `SET_CONFIGURATION` control URB that never completes.
+       `lsusb -v` at the same moment showed clean, uncorrupted descriptors
+       this time (unlike the earlier `apple_mfi_fastcharge`-era runs) —
+       the device is sitting there looking fine at the descriptor-cache
+       level, but its actual USB peripheral controller has stopped
+       responding to this specific control request.
+       **Conclusion: the post-`SETUP` reset was never merely
+       precautionary DFU-protocol cleanup — it's load-bearing at the
+       hardware level.** `checkm8_stage_setup()`'s technique (aborting
+       async control transfers mid-flight via `libusb_cancel_transfer()`
+       to manipulate heap timing) appears to leave the device's own USB
+       peripheral hardware unresponsive to further standard requests
+       until a real bus reset clears it — independent of any DFU protocol
+       state, which is exactly the angle the original reasoning for this
+       fix missed. Reverted the reset-skip entirely (`gaster_checkm8()`
+       back to upstream's unconditional post-stage `reset_usb_handle()`
+       call for every stage); the interface-claim/auto-detach fix from
+       the previous commit stays, since it's independently justified and
+       untested in combination with the real (non-skipped) reset
+       behavior. **Still unresolved** — the next real test is this
+       reverted state (claim fix only) against real hardware.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's
