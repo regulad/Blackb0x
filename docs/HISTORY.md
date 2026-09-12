@@ -1858,6 +1858,82 @@ Linux system as a matter of course and aren't called out as new dependencies.
      ideally one with a legacy EHCI controller or a known-good xHCI
      implementation for this kind of workload — not further changes to this
      codebase.
+   - **SUPERSEDED — the above was a single-machine conclusion; a real,
+     fixable software cause was found once the same hang reproduced
+     identically across multiple, unrelated Linux machines.** Running the
+     vendored `gaster` binary directly (`sudo ./build/gaster pwn`, bypassing
+     `blackb0x`/`runGaster()` entirely) hung again — this time captured live
+     with `dmesg -w` running in a second terminal at the exact moment it
+     froze, right after `Stage: SETUP` / `ret: true`, before the next
+     stage's own `[libusb] Waiting for the USB handle...` line ever
+     printed. The kernel log showed the real cause directly, not inferred:
+     ```
+     apple-mfi-fastcharge 3-3: usbfs: process 402495 (gaster) did not claim interface 0 before use
+     apple-mfi-fastcharge 3-3: reset high-speed USB device number 29 using xhci_hcd
+     ```
+     followed by a disconnect/reconnect storm with garbled descriptors
+     (`Product: Љ`) and `-71`/`-110`/`-75` USB errors. `apple_mfi_fastcharge`
+     is a real, in-tree, commonly-autoloaded Linux driver (`drivers/usb/misc/
+     apple-mfi-fastcharge.c`, upstream author Bastien Nocera) for Lightning
+     fast-charge negotiation — confirmed present and loaded
+     (`modinfo apple_mfi_fastcharge`) with alias
+     `usb:v05ACp*d*dc*dsc*dp*ic*isc*ip*in*`. A real upstream fix,
+     [`USB: apple-mfi-fastcharge: don't probe unhandled devices`](https://lkml.iu.edu/hypermail/linux/kernel/2011.0/03254.html),
+     added a `mfi_fc_match()` check restricting probing to product IDs
+     `0x1200`-`0x12ff` — but this device's real DFU-mode PID is `0x1227`
+     and its normal-mode PID is `0x12a7`, both squarely inside that
+     "fixed" range. So even a fully up-to-date, upstream-patched kernel
+     still auto-binds this driver to the Apple TV whether it's in DFU mode
+     or not. `gaster` never calls `libusb_claim_interface()` (or any
+     kernel-driver-detach equivalent) — it talks straight to the default
+     control pipe via raw `libusb_control_transfer()` calls — so this
+     driver stays attached the whole time and independently calls its own
+     `usb_reset_device()` whenever gaster's raw, exploit-timing-sensitive
+     transfers confuse it. Two independent actors (gaster's own
+     `reset_usb_handle()` calls after every stage, and this driver's own
+     recovery-triggered resets) issuing USB resets against the same device
+     at once is exactly the kind of race that corrupts enumeration and can
+     wedge the xHCI command ring hard enough to produce the previously
+     observed D-state hangs — this is very likely the same underlying
+     mechanism as the "device-initiated reset" theory above, just with the
+     actual second actor identified instead of blamed on the host
+     controller itself. Explains the multi-machine reproducibility
+     directly: this module ships in essentially every mainstream
+     distro kernel, unrelated to any one machine's chipset/topology —
+     the earlier single-machine hub/Thunderbolt-routing investigation
+     never had a chance to rule this out, since nothing on that machine's
+     side varied it.
+     - **Not yet re-verified against real hardware.** The fastest
+       available manual confirmation
+       (`sudo modprobe -r apple_mfi_fastcharge && sudo ./build/gaster pwn`,
+       safe since the module's refcnt was 0 — nothing else on the test
+       machine was actively using it) had not been reported back as of this
+       writing.
+     - **Mitigated in `DeviceManager.cpp`, not in the vendored `gaster.c`**
+       (which stays unmodified, per this project's own convention) and not
+       via a permanent system-wide blacklist either: a new
+       `ApplemfiFastchargeGuard` RAII type, scoped across all of
+       `checkm8Attempt()` (the pwn call, the failure-path reset call, and
+       the post-pwn reconnect/verification — all touch the same device).
+       A single sysfs interface-unbind *before* invoking gaster was
+       considered and rejected: gaster's own internal
+       RESET→SETUP→SPRAY→PATCH state machine disconnects and
+       re-enumerates the real USB device several times *inside one
+       `gaster pwn` call*, and the kernel's driver core reprobes+rebinds
+       apple_mfi_fastcharge fresh on every single reconnect — there's no
+       way for code outside gaster's own subprocess to repeat a per-stage
+       unbind in between. Unloading the module for the whole exploit run
+       is the only fix that survives every reconnect, so the guard's
+       constructor `modprobe -r`'s it (only if loaded, on `PATH`, and its
+       `/sys/module/apple_mfi_fastcharge/refcnt` reads `0` — refusing to
+       touch it if some other Apple device on the same PC is genuinely
+       mid-charge through it right now) and its destructor `modprobe`'s it
+       back on every exit path. **Compiles clean** (verified via a
+       standalone `-fsyntax-only` pass against the already-built
+       `build/deps/include` tree, not yet a full incremental rebuild) but,
+       like the dmesg finding above, **not yet verified against real
+       hardware** — the actual test is a real `gaster pwn` run through
+       `blackb0x` itself with this guard in place.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's

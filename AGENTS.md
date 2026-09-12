@@ -138,9 +138,21 @@ re-encrypt pipeline, and `--dry-run` are all verified working against real hardw
 `AppleTV2,1`(SHAtter)/`AppleTV3,1` (external-hardware checkm8) paths are implemented
 from protocol analysis only, unverified.
 
-The actual `checkm8` exploit run is currently blocked — not by a software bug, but by
-what looks like a host-controller-level USB limitation on the current dev machine
-(direct connection, Thunderbolt routing, and two different USB hub topologies all hit
-the identical device-reset/reconnect failure). Full investigation, including the six
-real software bugs that were found and fixed getting here, is in `docs/HISTORY.md`.
-Next step is trying different host hardware, not further changes to this codebase.
+The actual `checkm8` exploit run has repeatedly hung/frozen the USB stack across
+*multiple different Linux machines* — initially misdiagnosed (on a single machine) as
+a host-controller-level USB limitation, since the symptoms (D-state hangs, corrupted
+enumeration) looked hardware-specific. A live `dmesg` capture during a real hang found
+the actual cause: the in-tree Linux `apple_mfi_fastcharge` driver auto-binds to the
+Apple TV even in DFU mode (its product-ID match range, `0x1200`-`0x12ff`, includes this
+device's real DFU PID `0x1227`) and independently issues its own `usb_reset_device()`
+calls while `gaster`'s own raw, timing-sensitive control transfers are in flight — two
+actors resetting the same device at once, which explains both the corruption and why it
+reproduces on any Linux box with this common, usually-autoloaded kernel module present.
+Mitigated in `DeviceManager.cpp` (`ApplemfiFastchargeGuard`, scoped around the whole
+`checkm8Attempt()`): `modprobe -r`'s the module for the duration of the exploit (only if
+it's loaded, `modprobe` is on `PATH`, and it's currently unused) and puts it back
+afterward — not a permanent blacklist, and `gaster` itself stays unmodified. **Not yet
+re-verified against real hardware** — see `docs/HISTORY.md`'s checkm8/gaster section for
+the full evidence trail and the six earlier real software bugs found and fixed getting
+here. Next step is a real end-to-end attempt with this fix in place, not different host
+hardware.
