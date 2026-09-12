@@ -2111,10 +2111,49 @@ Linux system as a matter of course and aren't called out as new dependencies.
        fix missed. Reverted the reset-skip entirely (`gaster_checkm8()`
        back to upstream's unconditional post-stage `reset_usb_handle()`
        call for every stage); the interface-claim/auto-detach fix from
-       the previous commit stays, since it's independently justified and
-       untested in combination with the real (non-skipped) reset
-       behavior. **Still unresolved** — the next real test is this
-       reverted state (claim fix only) against real hardware.
+       the previous commit stays, since it's independently justified.
+     - **Tested against real hardware in this reverted (claim-fix-only)
+       form — one real, permanent improvement confirmed, the core
+       reconnect corruption still not fixed.** The improvement:
+       `/proc/<pid>/stack` this time showed
+       `hrtimer_nanosleep`/`common_nsleep`/`__x64_sys_clock_nanosleep` —
+       the ordinary `sleep_ms()` between `wait_usb_handle()`'s poll
+       attempts, not a kernel-level wedge. The interface-claim fix
+       genuinely eliminated the unkillable `D`-state hang; this run
+       livelocked in an ordinary retry loop instead, which at least means
+       the process itself stays responsive. The core problem persisted
+       anyway: `dmesg` showed the identical corruption class as the very
+       first (pre-any-fix) capture — two resets against the same device
+       number right after `RESET` and `SETUP` complete, then 10 seconds
+       later a real `"device firmware changed"` + disconnect, then a
+       cascade of `error -110`/`error -75`/"config 1 has 0 interfaces"
+       re-enumeration failures. **Confirmed it never recovers on its
+       own** — left to run, it stayed in this state rather than
+       eventually settling into a clean reconnect.
+     - **Conclusion: three independent, real, confirmed software causes
+       have now each been ruled out one at a time
+       (`apple_mfi_fastcharge`, the SETUP/SPRAY reset-skip theory, and
+       unclaimed interfaces), and the identical corrupted-reconnect
+       symptom survived the elimination of every one of them.** Two of
+       the three fixes are real, permanent improvements worth keeping
+       regardless (no more competing kernel driver, no more unkillable
+       `D`-state hang, no more "did not claim interface" warnings) — but
+       none of them, together or separately, fixed the actual exploit
+       hang. This converges strongly on the same conclusion the very
+       first single-machine investigation reached, now corroborated by
+       controlled elimination of every specific software mechanism this
+       session could identify and test, on top of the original report
+       that this exact symptom reproduces across multiple different
+       Linux machines: **this looks like a genuine host-side (kernel/
+       xHCI) limitation reinitializing this specific device after a
+       reset performed mid-exploit, not a userspace software bug in
+       either `gaster` or this project.** Further blind changes to
+       `checkm8_stage_setup()`/`checkm8_stage_spray()`'s own request
+       timing are not recommended without a new, specific mechanism to
+       test — this file's own repeated lesson about not guessing at
+       verified-correct exploit-critical code applies in full now that
+       three good-faith guesses have each been individually disproven
+       rather than confirmed.
 5. **Phase 7 — packaging.** The end goal is deliberately minimal: clone the repo
    (with binary assets), build the static executable, run it. Resource-path
    resolution for `Blackb0x/Files/*` and a README rewrite (the CLI's

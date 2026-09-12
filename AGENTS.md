@@ -199,6 +199,20 @@ test disproved it:
   (like `apple_mfi_fastcharge`) that doesn't depend solely on it being blacklisted ahead
   of time.
 
-**Not yet tested against real hardware** in this (reverted-reset, claim-fix-only) form.
-See `docs/HISTORY.md`'s checkm8/gaster section for the full evidence trail and the six
-earlier real software bugs found and fixed getting here. **Still unresolved.**
+**Tested against real hardware in this (reverted-reset, claim-fix-only) form: one real
+improvement confirmed, the core hang still not fixed.** The unkillable `D`-state hang is
+gone — `/proc/<pid>/stack` this time showed the process just sleeping normally in
+`wait_usb_handle()`'s retry loop, not wedged in the kernel — but the device still fails
+to reconnect cleanly after the post-`SETUP` reset: the identical `error -110`/`error -75`/
+"config 1 has 0 interfaces" corruption as the very first capture, confirmed to never
+self-recover. Three independent, real software causes have now each been ruled out in
+turn (`apple_mfi_fastcharge`, the reset-skip theory, unclaimed interfaces) without fixing
+the underlying hang, though two of the three are genuine, permanent improvements worth
+keeping regardless. **This converges on the same conclusion the original single-machine
+investigation reached, now corroborated by elimination of every specific software
+mechanism tested plus the original report that this reproduces across multiple different
+Linux machines: a genuine host-side (kernel/xHCI) limitation, not a userspace software
+bug.** See `docs/HISTORY.md`'s checkm8/gaster section for the full evidence trail and the
+six earlier real software bugs found and fixed getting here. **Still unresolved; further
+blind changes to gaster's exploit-timing code are not recommended without a new, specific
+mechanism to test.**
