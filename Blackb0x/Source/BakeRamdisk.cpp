@@ -1,0 +1,2072 @@
+//
+//  BakeRamdisk.cpp
+//  Blackb0x
+//
+//  Implements bakeRamdisk() (see BakeRamdisk.hpp) — the one piece of this
+//  tool that needs CAP_SYS_ADMIN/CAP_CHOWN, since it loop-mounts a real
+//  HFS+ image. Deliberately not invoked by blackb0x itself. Touches exactly
+//  two things on the pristine ramdisk: overwrites `/sbin/launchd`'s content
+//  in place with the built entrypoint binary (spliceFileContentInPlace()) —
+//  see docs/HISTORY.md's "Entrypoint injection point" entry for why this
+//  isn't `/etc/rc.boot` (tried, and reverted: real on at least one firmware
+//  generation, that file doesn't exist at all) —
+//  and adds one brand new top-level directory, `/blackb0x` (stageBlackb0xTree()),
+//  a flat mirror of the real device's final layout with every file/dir/
+//  symlink already carrying its correct final owner/mode — entrypoint.c's
+//  own merge_tree() just blindly replicates whatever's under there onto
+//  the real device at boot, no branching left on-device at all. Which of
+//  the three known per-firmware persistence payloads goes into /blackb0x
+//  is decided here too, from this firmware's own ProductVersion — see
+//  stageVersionBranch(). Fully static either way (no per-device secrets
+//  get baked in — host key generation and authorized_keys delivery both
+//  happen elsewhere), so the same patched output is valid for every device
+//  on a given firmware build. bake-all-ramdisks (BakeAllRamdisks.cpp) calls
+//  this once per known firmware and writes the results to dist/;
+//  Patcher::patchRamdisk() just checks whether the expected dist/ output
+//  already exists and tells the user to (re-)run bake-all-ramdisks if not.
+//
+
+#include "BakeRamdisk.hpp"
+#include "ResourcePath.hpp"
+
+extern "C" {
+#include <xpwntool.h>
+}
+
+extern "C" {
+#include <abstractfile.h>
+#include <dmg/dmglib.h>
+#include <hfs/hfslib.h>
+#include <hfs/hfsplus.h>
+#include <xpwn/libxpwn.h>
+}
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace fs = std::filesystem;
+
+// ---------------------------------------------------------------------------
+// HFS+ volume helpers (replace hdiutil attach/detach/resize and tar -C) —
+// see the long comment on bakeRamdisk() below for why this went through two
+// other designs (an in-memory xpwn Volume, then libhfsp) before landing on
+// "loop-mount via the real Linux kernel driver, then use ordinary POSIX
+// tools" as the one that actually survives real firmware data.
+// ---------------------------------------------------------------------------
+
+// Runs a command to completion and returns whether it exited 0. Uses
+// fork()/execvp() (argv array, no shell) rather than system()/popen() so
+// paths never pass through shell interpretation. `cwd`, when non-empty, is
+// chdir()'d into in the child first — needed for `ar x`, which always
+// extracts into the current directory with no destination-directory flag
+// portable across ar implementations.
+static bool runCommand(const std::vector<std::string>& argv, const std::string& cwd = "") {
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
+        execvp(cargv[0], cargv.data());
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// Same argv/no-shell contract as runCommand(), but captures stdout instead
+// of just a pass/fail exit code — needed for `du -sb`/`blkid` below, which
+// this program needs the actual text output of, not just success/failure.
+static std::string runCommandCapture(const std::vector<std::string>& argv) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return "";
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return "";
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execvp(cargv[0], cargv.data());
+        _exit(127);
+    }
+    close(pipefd[1]);
+    std::string output;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) output.append(buf, (size_t)n);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) return "";
+    return output;
+}
+
+// Real on-disk content size via `du` (a real, standard tool — matches this
+// project's own established "shell out to real tools" convention) rather
+// than summing st_size ourselves, which would undercount actual space
+// consumed against allocation-block granularity. Deliberately NOT `-b`/
+// `--apparent-size`: that reports exact byte lengths, which is exactly the
+// undercount this needs to avoid — these trees have thousands of small
+// files (terminfo entries, dpkg info files, etc.), each of which consumes
+// a full allocation block on the destination HFS+ volume regardless of its
+// actual byte length. Plain `du -s --block-size=1` reports real block-
+// rounded disk usage instead (per the *host* filesystem's own block size,
+// not HFS+'s — not exact, but a real measurement of the same rounding
+// effect, unlike apparent size which has none at all). A real bake run
+// with this still on `-sb` ran out of space almost immediately despite a
+// volume nominally sized well past the apparent byte count, confirming
+// the undercount was real and not theoretical.
+static uint64_t directoryContentSize(const std::string& dir) {
+    std::string out = runCommandCapture({"du", "-s", "--block-size=1", dir});
+    if (out.empty()) return 0;
+    return (uint64_t)strtoull(out.c_str(), nullptr, 10);
+}
+
+// Reads the original ramdisk's volume label, so the freshly-mkfs'd
+// replacement can be given the same name. mkfs.hfsplus can only set this
+// at creation time — the volume name lives in the catalog (the root
+// folder's own record), not in the fixed-size volume header, so there's
+// no header-byte-copy shortcut for it the way there is for the fields in
+// copyVolumeHeaderMetadata() below.
+static std::string readVolumeLabel(const std::string& imagePath) {
+    std::string label = runCommandCapture({"blkid", "-o", "value", "-s", "LABEL", imagePath});
+    while (!label.empty() && (label.back() == '\n' || label.back() == '\r')) label.pop_back();
+    return label.empty() ? "ramdisk" : label;
+}
+
+// Copies a deliberately narrow set of "identity" fields from the original
+// volume's fixed-size HFS+ header into the freshly-mkfs'd replacement:
+//   - finderInfo (32 bytes): encodes blessed-folder/boot-related info. This
+//     is a bootable restore ramdisk, so this can plausibly affect boot
+//     behavior — cheap to preserve, and risky to guess is safe to drop.
+//   - createDate: the original firmware build's genuine volume-creation
+//     timestamp — meaningful provenance, not something mkfs.hfsplus can
+//     know to set correctly on its own.
+//   - lastMountedVersion: a 4-byte tag identifying what tool last wrote the
+//     volume — likewise provenance worth carrying over.
+// Deliberately NOT copied:
+//   - `attributes` (a state/journaling bitfield): copying it wholesale
+//     risks importing a stale "unmounted"/journaled bit that doesn't match
+//     the freshly-mkfs'd volume's actual, correct state.
+//   - fileCount/folderCount/blockSize/totalBlocks/free space/clump sizes:
+//     all content- or geometry-derived. mkfs.hfsplus already computed
+//     these correctly for the new volume's real size; copying the old
+//     volume's values would be actively wrong.
+//
+// This patches BOTH the primary header (fixed offset 1024, per the HFS+
+// spec) and the backup/alternate header (the second-to-last 512-byte
+// sector) so fsck.hfsplus doesn't flag a primary/alternate mismatch for the
+// fields touched here. This is a plain, fixed-offset byte copy touching
+// only the 512-byte header itself — no B-tree or catalog interaction at
+// all, unlike the catalog-growth code that broke both xpwn and libhfsp
+// (see the design-history comment on bakeRamdisk() below).
+static void copyVolumeHeaderMetadata(const std::string& origPath, const std::string& newPath) {
+    char origHeader[512] = {0};
+    {
+        std::ifstream in(origPath, std::ios::binary);
+        if (!in) return;
+        in.seekg(1024);
+        in.read(origHeader, sizeof(origHeader));
+        if (!in) return;
+    }
+
+    std::error_code ec;
+    auto newSize = fs::file_size(newPath, ec);
+    if (ec) return;
+
+    struct FieldCopy {
+        size_t offset;
+        size_t size;
+    };
+    static const FieldCopy fields[] = {
+        {offsetof(HFSPlusVolumeHeader, createDate), sizeof(uint32_t)},
+        {offsetof(HFSPlusVolumeHeader, lastMountedVersion), sizeof(uint32_t)},
+        {offsetof(HFSPlusVolumeHeader, finderInfo), sizeof(uint32_t) * 8},
+    };
+
+    std::fstream out(newPath, std::ios::binary | std::ios::in | std::ios::out);
+    if (!out) return;
+    for (const auto& f : fields) {
+        out.seekp((std::streamoff)1024 + (std::streamoff)f.offset);
+        out.write(origHeader + f.offset, (std::streamsize)f.size);
+        out.seekp((std::streamoff)newSize - 1024 + (std::streamoff)f.offset);
+        out.write(origHeader + f.offset, (std::streamsize)f.size);
+    }
+}
+
+static std::string makeTempDir(const std::string& prefix) {
+    std::string tmpl = (fs::temp_directory_path() / (prefix + "XXXXXX")).string();
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (!mkdtemp(buf.data())) return "";
+    return std::string(buf.data());
+}
+
+// RAII guard so a failed bakeRamdisk() run never leaks a stale mount or temp
+// mountpoint directory — `mounted` is only set true once the mount actually
+// succeeds, and unmounting/removal here is best-effort (there's nothing
+// more useful to do with a failure during cleanup after an error).
+struct MountGuard {
+    std::string mountpoint;
+    bool mounted = false;
+    ~MountGuard() {
+        if (mounted) runCommand({"umount", mountpoint});
+        if (!mountpoint.empty()) {
+            std::error_code ec;
+            fs::remove(mountpoint, ec);
+        }
+    }
+};
+
+// Runs `argv`, transparently re-invoked as the real (non-root) invoking
+// user via `runuser` when bakeRamdisk() itself is running under sudo. This
+// needs to happen: bakeRamdisk() runs privileged (CAP_SYS_ADMIN, for the
+// HFS+ mount below), but podman's own rootless image/volume storage —
+// `blackb0x-entrypoint-toolchain`, `blackb0x-cctools-target`, set up once
+// per entrypoint/README.md's own setup steps, and whatever
+// scripts/build_deb_cache.py's own podman calls need underneath it — all
+// belong to the real user, not root's own (separate) rootless podman
+// storage. Same $SUDO_USER convention ResourcePath's
+// findUserAuthorizedKeysPath() already uses, for the same reason (root's
+// own environment isn't the one that matters here).
+static bool runAsInvokingUser(const std::vector<std::string>& argv) {
+    std::vector<std::string> cmd;
+    const char* sudoUser = getenv("SUDO_USER");
+    if (sudoUser && *sudoUser) {
+        cmd = {"runuser", "-u", sudoUser, "--"};
+        // runuser does NOT reset XDG_RUNTIME_DIR — under `sudo`, that
+        // variable is still whatever the original (root) shell had it as
+        // (commonly /run/user/0), not the target user's own real runtime
+        // directory, even though the command genuinely now runs as that
+        // user. Confirmed directly against a real bake-all-ramdisks run:
+        // without this, podman failed with "mkdir /run/user/0/libpod:
+        // permission denied" — trying to use root's runtime dir while
+        // running as uid 1000. `env VAR=value` here is a real, separate
+        // argv entry (no shell involved), same "no shell interpretation"
+        // guarantee as every other runCommand() call in this file.
+        const char* sudoUid = getenv("SUDO_UID");
+        if (sudoUid && *sudoUid) {
+            cmd.push_back("env");
+            cmd.push_back(std::string("XDG_RUNTIME_DIR=/run/user/") + sudoUid);
+        }
+        cmd.insert(cmd.end(), argv.begin(), argv.end());
+    } else {
+        cmd = argv;
+    }
+    return runCommand(cmd);
+}
+
+// bakeRamdisk() itself runs as real root (sudo), so any temp dir it
+// creates via makeTempDir() comes out root-owned (mkdtemp() defaults to
+// 0700, owner-only) — but anything invoked through runAsInvokingUser()
+// runs as the non-root invoking user instead, and needs real write access
+// if it's expected to write its own output files into that same
+// directory. Confirmed directly against a real bake run: without this,
+// scripts/build_deb_cache.py crashed with a plain PermissionError trying
+// to write picklist.txt into a root-owned temp dir. Only the top-level
+// directory needs chowning — files that user creates inside it afterward
+// are already owned by them.
+static void chownToInvokingUserIfSudo(const std::string& path) {
+    const char* sudoUid = getenv("SUDO_UID");
+    const char* sudoGid = getenv("SUDO_GID");
+    if (sudoUid && *sudoUid && sudoGid && *sudoGid) {
+        chown(path.c_str(), (uid_t)atoi(sudoUid), (gid_t)atoi(sudoGid));
+    }
+}
+
+// Always the absolute /usr/bin/podman — a broken/shadowed `podman` earlier
+// on some PATH is a real failure mode this project has already hit once
+// (see entrypoint/README.md).
+static bool runPodman(const std::vector<std::string>& podmanArgs) {
+    std::vector<std::string> cmd = {"/usr/bin/podman"};
+    cmd.insert(cmd.end(), podmanArgs.begin(), podmanArgs.end());
+    return runAsInvokingUser(cmd);
+}
+
+// Builds entrypoint/'s freestanding ARMv6 replacement for /sbin/launchd,
+// rather than shipping a precompiled binary — see entrypoint/README.md for
+// why (needs cctools-port's real Apple ld64 port; a normal host toolchain
+// can't produce this). Assumes the one-time toolchain setup documented
+// there has already been done (the blackb0x-entrypoint-toolchain image
+// built, blackb0x-cctools-target volume populated via cctools-port's
+// SDK-gated build.sh) — this only runs the actual `make`, it doesn't
+// bootstrap the whole cross-toolchain from scratch, since that needs an SDK
+// that is deliberately not checked into this repo at all (Apple's
+// copyrighted material — see entrypoint/assets/README.md).
+//
+// The binary is identical for every firmware target (no per-firmware
+// customization at all), so BakeAllRamdisks.cpp's main() calls this exactly
+// once, before its per-firmware loop, and hands the resulting path to every
+// bakeRamdisk() call — same as it already does for ramdiskOverlayContentHash().
+// Not this function's own job to guard against being called more than
+// once; it just builds, every time it's asked to.
+std::string buildEntrypointBinary() {
+    std::string entrypointDir = fs::absolute(resolveEntrypointPath()).string();
+    std::string outputPath = entrypointDir + "/entrypoint";
+
+    // Remove any stale output first so a failed build can never be
+    // mistaken for a fresh one below.
+    std::error_code rmEc;
+    fs::remove(outputPath, rmEc);
+
+    bool ok = runPodman({
+        "run", "--rm", "--security-opt", "label=disable",
+        "-v", entrypointDir + ":/work",
+        "-v", "blackb0x-cctools-target:/opt/cctools-port/usage_examples/ios_toolchain:ro",
+        "-e", "PATH=/opt/cctools-port/usage_examples/ios_toolchain/target/bin:/usr/bin:/bin",
+        "-w", "/work",
+        "blackb0x-entrypoint-toolchain",
+        "make", "clean", "all",
+    });
+    if (!ok) {
+        fprintf(stderr,
+                "bakeRamdisk: failed to build entrypoint/ via podman — if this is the first run, see "
+                "entrypoint/README.md's one-time toolchain setup steps\n");
+        return "";
+    }
+    if (!fs::exists(outputPath)) {
+        fprintf(stderr, "bakeRamdisk: entrypoint/ build reported success but %s is missing\n", outputPath.c_str());
+        return "";
+    }
+    return outputPath;
+}
+
+// Overwrites `targetPath`'s content with `newContentPath`'s bytes while
+// preserving the target's existing mode/owner/group/mtime — for
+// `/sbin/launchd`, which already exists for real on every known firmware's
+// pristine ramdisk (unlike `/etc/rc.boot` — see docs/HISTORY.md's
+// "Entrypoint injection point" entry for the real firmware where that
+// assumption broke), where a blind overwrite-and-recreate would silently
+// replace Apple's own permission bits with whatever this repo's checked-in
+// replacement file happens to carry. Refuses to run if `targetPath` doesn't
+// already exist — that would mean an assumption about the pristine
+// ramdisk's layout is wrong, not something to paper over by creating the
+// file fresh with guessed permissions.
+static bool spliceFileContentInPlace(const std::string& targetPath, const std::string& newContentPath) {
+    struct stat st;
+    if (stat(targetPath.c_str(), &st) != 0) {
+        fprintf(stderr,
+                "bakeRamdisk: %s does not exist on the mounted volume — refusing to create it fresh with "
+                "guessed permissions\n",
+                targetPath.c_str());
+        return false;
+    }
+
+    std::ifstream in(newContentPath, std::ios::binary);
+    if (!in) {
+        fprintf(stderr, "bakeRamdisk: cannot open %s\n", newContentPath.c_str());
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    std::string content = ss.str();
+
+    int fd = open(targetPath.c_str(), O_WRONLY | O_TRUNC);
+    if (fd < 0) {
+        fprintf(stderr, "bakeRamdisk: cannot open %s for writing\n", targetPath.c_str());
+        return false;
+    }
+    ssize_t written = write(fd, content.data(), content.size());
+    close(fd);
+    if (written < 0 || (size_t)written != content.size()) {
+        fprintf(stderr, "bakeRamdisk: short write to %s\n", targetPath.c_str());
+        return false;
+    }
+
+    chmod(targetPath.c_str(), st.st_mode & 07777);
+    chown(targetPath.c_str(), st.st_uid, st.st_gid);
+    struct timespec times[2] = {st.st_atim, st.st_mtim};
+    utimensat(AT_FDCWD, targetPath.c_str(), times, 0);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// /blackb0x staging — NEO_FLOW's replacement for the old per-file
+// install_file() call list inside entrypoint.c. entrypoint.c's own
+// merge_tree() is now a completely blind, unconditional recursive copy: it
+// has no idea what firmware it's running on or what any of these files are
+// for, it just replicates whatever's staged under /blackb0x onto /mnt1
+// using each entry's own real owner/mode (read back via stat() at
+// runtime). Which files exist under /blackb0x, and with what final
+// owner/mode, is entirely decided here, at bake time — including which one
+// of the three known per-firmware persistence payloads applies, since this
+// firmware's own ProductVersion is already known here and was previously
+// only discovered by entrypoint.c on-device, at the one moment it's
+// actually too late to ship a different ramdisk.
+// ---------------------------------------------------------------------------
+
+// 501:20, "mobile:staff" — the standard iOS convention, matching
+// entrypoint.c's own UID_MOBILE/GID_STAFF.
+static constexpr uid_t kUidMobile = 501;
+static constexpr gid_t kGidStaff = 20;
+
+// Creates every path component between `root` and `fullPath`'s parent that
+// doesn't already exist, as root:wheel 0755 — the same convention every
+// other top-level pristine-ramdisk directory already uses (confirmed
+// against a real decrypted AppleTV2,1 RestoreRamdisk: /bin, /private,
+// /sbin, /usr are all uid 0 gid 0). Never touches a directory that already
+// exists, in either direction: a directory this creates fresh always gets
+// this default metadata, but a directory some other, explicit stageDir()
+// call already gave different metadata to (see below) is left alone
+// regardless of which one runs first — order-independent by construction.
+static void ensureParentDirs(const fs::path& root, const fs::path& fullPath) {
+    std::error_code relEc;
+    fs::path rel = fs::relative(fullPath.parent_path(), root, relEc);
+    if (relEc) return;
+    fs::path cur = root;
+    for (const auto& part : rel) {
+        if (part == ".") continue;
+        cur /= part;
+        std::error_code ec;
+        if (fs::create_directory(cur, ec)) {
+            chmod(cur.c_str(), 0755);
+            chown(cur.c_str(), 0, 0);
+        }
+    }
+}
+
+// Stages `hostSrcPath` at `<blackb0xRoot>/<destRelPath>` with the exact
+// owner/mode it should carry once entrypoint.c's merge_tree() copies it
+// onto the real device — that's the metadata this actually sets here, not
+// whatever `hostSrcPath` happens to already have on the build host. A
+// missing source is a warning, not a fatal error: several of these are
+// pre-existing, already-documented gaps (see entrypoint/README.md) rather
+// than something a single bake run can fix, and the rest of a firmware's
+// payload is still worth producing even if one loose end is missing.
+static bool stageFile(const fs::path& blackb0xRoot, const std::string& destRelPath, const std::string& hostSrcPath,
+                       uid_t uid, gid_t gid, mode_t mode) {
+    std::error_code existsEc;
+    if (!fs::exists(hostSrcPath, existsEc)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: missing source %s — not staging /blackb0x/%s\n", hostSrcPath.c_str(),
+                destRelPath.c_str());
+        return false;
+    }
+    fs::path destPath = blackb0xRoot / destRelPath;
+    ensureParentDirs(blackb0xRoot, destPath);
+    std::error_code ec;
+    fs::copy_file(hostSrcPath, destPath, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        fprintf(stderr, "bakeRamdisk: cannot stage %s -> %s (%s)\n", hostSrcPath.c_str(), destPath.c_str(),
+                ec.message().c_str());
+        return false;
+    }
+    chmod(destPath.c_str(), mode);
+    chown(destPath.c_str(), uid, gid);
+    return true;
+}
+
+// Stages an empty directory with specific final metadata — replaces the
+// old kCydiaDirs[]/create_cydia_directories()/mkdir_owned() machinery that
+// used to live in entrypoint.c entirely: these are just empty entries
+// under /blackb0x now, merge_tree() creates them like anything else. Always
+// unconditionally re-applies uid/gid/mode, regardless of whether
+// ensureParentDirs() already auto-created this same path as a root:wheel
+// 0755 implied parent of something else staged first — this call is always
+// the authority on this path's final metadata, whichever order runs first.
+static bool stageDir(const fs::path& blackb0xRoot, const std::string& destRelPath, uid_t uid, gid_t gid,
+                      mode_t mode) {
+    fs::path destPath = blackb0xRoot / destRelPath;
+    ensureParentDirs(blackb0xRoot, destPath);
+    std::error_code ec;
+    fs::create_directory(destPath, ec);
+    chmod(destPath.c_str(), mode);
+    chown(destPath.c_str(), uid, gid);
+    return true;
+}
+
+// Stages a real symlink under /blackb0x pointing at `target` verbatim —
+// `target` need not exist relative to /blackb0x or even the build host at
+// all (e.g. an absolute path into the real device's own /System, like
+// rtbuddyd's jsc swap below); it only has to resolve once merge_tree()
+// recreates this same symlink on the real /mnt1.
+static bool stageSymlink(const fs::path& blackb0xRoot, const std::string& destRelPath, const std::string& target) {
+    fs::path destPath = blackb0xRoot / destRelPath;
+    ensureParentDirs(blackb0xRoot, destPath);
+    std::error_code ec;
+    fs::remove(destPath, ec);
+    fs::create_symlink(target, destPath, ec);
+    if (ec) {
+        fprintf(stderr, "bakeRamdisk: cannot stage symlink %s -> %s (%s)\n", destPath.c_str(), target.c_str(),
+                ec.message().c_str());
+        return false;
+    }
+    return true;
+}
+
+// Recursively stages every regular file under `hostSrcDir` at
+// `<blackb0xRoot>/<destRelDir>/<same relative path>`, all with the same
+// owner/mode — used for the apt lists cache (stageAptListsCache() below),
+// which is a whole directory tree of files apt itself produced, not a
+// single named asset stageFile() already handles one at a time.
+static bool stageDirectoryTree(const fs::path& blackb0xRoot, const std::string& destRelDir,
+                                const fs::path& hostSrcDir, uid_t uid, gid_t gid, mode_t mode) {
+    std::error_code walkEc;
+    bool ok = true;
+    for (const auto& entry :
+         fs::recursive_directory_iterator(hostSrcDir, fs::directory_options::skip_permission_denied, walkEc)) {
+        if (walkEc) {
+            ok = false;
+            break;
+        }
+        std::error_code typeEc;
+        if (!fs::is_regular_file(entry.path(), typeEc) || typeEc) continue;
+        fs::path rel = fs::relative(entry.path(), hostSrcDir);
+        ok &= stageFile(blackb0xRoot, destRelDir + "/" + rel.string(), entry.path().string(), uid, gid, mode);
+    }
+    return ok;
+}
+
+// The base Cydia/dpkg/apt directory set every firmware needs regardless of
+// which persistence payload applies — ported verbatim from entrypoint.c's
+// old kCydiaDirs[] (see docs/HISTORY.md for FUN_00001b14's original order),
+// just without the /mnt1 prefix (relative to /blackb0x now) and staged here
+// instead of mkdir'd on-device. All mobile:staff 0755.
+static const std::vector<std::string> kCydiaDirs = {
+    "Library/LaunchDaemons",
+    "private/etc/alternatives",
+    "private/etc/apt",
+    "private/etc/apt/apt.conf.d",
+    "private/etc/apt/preferences.d",
+    "private/etc/apt/sources.list.d",
+    "private/etc/apt/trusted.gpg.d",
+    "private/etc/default",
+    "private/etc/dpkg",
+    "private/etc/dpkg/origins",
+    "private/etc/pam.d",
+    "private/etc/profile.d",
+    "private/etc/ssh",
+    "private/etc/ssl",
+    "private/etc/ssl/certs",
+    "private/etc/ssl/private",
+    "private/var/backups",
+    "private/var/cache",
+    "private/var/cache/apt",
+    "private/var/cache/apt/archives",
+    "private/var/cache/apt/archives/partial",
+    "private/var/cache/findutils",
+    "private/var/lib",
+    "private/var/lib/apt",
+    "private/var/lib/apt/lists",
+    "private/var/lib/apt/lists/partial",
+    "private/var/lib/apt/periodic",
+    "private/var/lib/cydia",
+    "private/var/lib/dpkg",
+    "private/var/lib/dpkg/alternatives",
+    "private/var/lib/dpkg/info",
+    "private/var/lib/dpkg/parts",
+    "private/var/lib/dpkg/updates",
+    "private/var/lib/misc",
+    "private/var/local",
+    "private/var/lock",
+    "private/var/log/apt",
+    "private/var/root/Media",
+    "private/var/run",
+    "usr/etc",
+    "usr/games",
+    "usr/include",
+    "usr/include/apt-pkg",
+    "usr/include/curl",
+    "usr/include/ncursesw",
+    "usr/include/openssl",
+    "usr/include/pam",
+    "usr/include/readline",
+    "usr/lib/_ncurses",
+    "usr/lib/apt",
+    "usr/lib/apt/methods",
+    "usr/lib/dpkg",
+    "usr/lib/dpkg/methods",
+    "usr/lib/dpkg/methods/apt",
+    "usr/lib/engines",
+    "usr/lib/gettext",
+    "usr/lib/pam",
+    "usr/lib/pkgconfig",
+    "usr/lib/ssl",
+    "usr/lib/ssl/misc",
+    "usr/libexec/cydia",
+    "usr/libexec/gnupg",
+    "usr/share/bigboss",
+    "usr/share/bigboss/icons",
+    "usr/share/bigboss/icons/.svn",
+    "usr/share/bigboss/icons/.svn/prop-base",
+    "usr/share/bigboss/icons/.svn/props",
+    "usr/share/bigboss/icons/.svn/text-base",
+    "usr/share/bigboss/icons/.svn/tmp",
+    "usr/share/bigboss/icons/.svn/tmp/prop-base",
+    "usr/share/bigboss/icons/.svn/tmp/props",
+    "usr/share/bigboss/icons/.svn/tmp/text-base",
+    "usr/share/dict",
+    "usr/share/dpkg",
+    "usr/share/dpkg/origins",
+    "usr/share/gnupg",
+    "usr/share/keyrings",
+    "usr/share/tabset",
+    "usr/share/terminfo",
+    "usr/share/terminfo/a",
+    "usr/share/terminfo/c",
+    "usr/share/terminfo/d",
+    "usr/share/terminfo/E",
+    "usr/share/terminfo/l",
+    "usr/share/terminfo/m",
+    "usr/share/terminfo/p",
+    "usr/share/terminfo/r",
+    "usr/share/terminfo/s",
+    "usr/share/terminfo/v",
+    "usr/share/terminfo/x",
+};
+
+// Stages a verbatim copy of build_deb_cache.py's own sandboxed `apt-get
+// update` cache (its real apt-lists/ output — see that script's own module
+// docstring) at the real device's own /var/lib/apt/lists/ path. This is
+// what lets apt on-device know about every package the configured
+// regulad/saurik/awkwardtv/xbmc repos currently offer — including anything
+// too big to also stage the .deb bytes for locally (kNeverStageDebs below)
+// — without needing network at install time at all; network only becomes
+// necessary for whatever wasn't also staged in private/var/cache/apt/archives/.
+static bool stageAptListsCache(const fs::path& blackb0xRoot, const std::string& aptListsDir) {
+    if (!fs::exists(aptListsDir)) {
+        fprintf(stderr, "bakeRamdisk: build_deb_cache.py did not produce apt-lists/\n");
+        return false;
+    }
+    return stageDirectoryTree(blackb0xRoot, "private/var/lib/apt/lists", aptListsDir, 0, 0, 0644);
+}
+
+// .deb filename prefixes that never get staged into the ramdisk's own apt
+// cache, even when scripts/build_deb_cache.py's real dependency resolution
+// says they're needed — real, but too big for this old A4-era ramdisk's
+// 70MB ceiling (kMaxRamdiskSize below) to absorb on top of everything else.
+// org.xbmc.kodi-atv2 alone is ~40MB; com.nito.nitotv is ~1.65MB on its own
+// (checked directly against the real vendored .deb — nowhere near
+// kodi-atv2's size, but still excluded on request). Not staging the .deb
+// bytes doesn't mean the package is unreachable, though: its real Packages
+// metadata still gets staged via stageAptListsCache() below, and
+// postinstall.sh's array (see stagePostinstallScript()) still lists it —
+// apt will fetch it over the network at install time if one is reachable,
+// and just fail to install that one specific package (not the rest) if
+// not, matching the "opportunistic network, not required" design this
+// whole staging pass is built around.
+static const std::vector<std::string> kNeverStageDebs = {
+    "org.xbmc.kodi-atv2_",
+    "com.nito.nitotv_",
+};
+
+static bool shouldSkipStagingDeb(const std::string& filename) {
+    for (const auto& prefix : kNeverStageDebs) {
+        if (filename.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Bake-time package preinstallation — for packages with no postinst (or a
+// trivial one, see Blackb0x/Misc/prebake_package_blacklist.txt's own
+// comment for the full audit) this unpacks the real .deb and writes real
+// dpkg status/info state directly into /blackb0x at bake time, instead of
+// just caching the .deb for postinstall.sh's own apt-get to install for
+// real later. apt on-device then sees these packages as already installed
+// and never touches their .deb at all — see stagePreinstalledPackages()
+// below for the actual mechanism (real era-appropriate dpkg, in a
+// container, not a hand-rolled reimplementation of dpkg's own status
+// format).
+// ---------------------------------------------------------------------------
+
+struct DebControlInfo {
+    std::string package;
+    std::string depends;
+    std::string preDepends;
+    bool hasPostinst = false;
+    bool hasPreinst = false;
+};
+
+// Extracts a .deb's control file via plain `ar`/`tar` (real, standard,
+// already-vendored tools — this is reading one text field out of an
+// archive, not reimplementing anything apt/dpkg itself does) and parses
+// out Package:/Depends:/Pre-Depends:, including real RFC822 continuation-
+// line folding (a field value can wrap onto following lines that start
+// with whitespace).
+static bool readDebControlInfo(const std::string& debPath, DebControlInfo& out) {
+    std::string tempDir = makeTempDir("blackb0x-controlinfo-");
+    if (tempDir.empty()) return false;
+    bool ok = runCommand({"ar", "x", fs::absolute(debPath).string()}, tempDir);
+    std::string controlTar;
+    if (ok) {
+        std::error_code dirEc;
+        for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
+            if (e.path().filename().string().rfind("control.tar", 0) == 0) {
+                controlTar = e.path().string();
+                break;
+            }
+        }
+        ok = !controlTar.empty();
+    }
+    if (ok) {
+        std::string listing = runCommandCapture({"tar", "--auto-compress", "-tf", controlTar});
+        out.hasPostinst = listing.find("./postinst") != std::string::npos;
+        // Same audit-then-strip treatment as postinst, just enforced
+        // differently: preinst runs unconditionally DURING --unpack
+        // itself, before a plain post-hoc file delete could ever
+        // intervene the way stripping postinst works, so a trivial
+        // preinst instead gets removed from the .deb's own control
+        // archive before dpkg ever sees it — see stripPreinstFromDeb().
+        // Confirmed by real disassembly, not guessed: ncurses's preinst
+        // (a real ARM Mach-O binary) turned out to be a harmless
+        // migration symlink (`/usr/lib/_ncurses` -> `/usr/lib`, only on
+        // install or upgrade-from-5.6-), identical on any platform — a
+        // genuine false positive if treated the same as firmware-sbin/
+        // rtadvd/pam/pam-modules's real, device-state-dependent preinst
+        // scripts (see prebake_package_blacklist.txt's own note on each,
+        // which — since preinst can't be stripped after the fact —
+        // are the actual, enforced exclusion for those four, not just
+        // documentation).
+        out.hasPreinst = listing.find("./preinst") != std::string::npos;
+    }
+    if (ok) ok = runCommand({"tar", "--auto-compress", "-xf", controlTar, "./control"}, tempDir);
+    std::ifstream in(tempDir + "/control");
+    if (!ok || !in) {
+        std::error_code rmEc;
+        fs::remove_all(tempDir, rmEc);
+        return false;
+    }
+    std::string line, field, value;
+    auto flush = [&]() {
+        if (field == "Package") out.package = value;
+        else if (field == "Depends") out.depends = value;
+        else if (field == "Pre-Depends") out.preDepends = value;
+        field.clear();
+        value.clear();
+    };
+    while (std::getline(in, line)) {
+        if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
+            if (!field.empty()) value += " " + line.substr(1);
+            continue;
+        }
+        if (!field.empty()) flush();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        field = line.substr(0, colon);
+        value = line.substr(colon + 1);
+        while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+    }
+    if (!field.empty()) flush();
+    std::error_code rmEc;
+    fs::remove_all(tempDir, rmEc);
+    return !out.package.empty();
+}
+
+// Rebuilds `srcDebPath` at `destDebPath` with its control archive's
+// `preinst` member removed — real `ar`/`tar`/`gzip`, not a hand-rolled .deb
+// writer, matching this project's own established convention of using
+// real tools for real archive formats. Needed because preinst runs
+// unconditionally DURING dpkg --unpack itself: unlike postinst (which can
+// just be deleted from an already-unpacked info/ directory before
+// --configure runs), there's no way to intervene between "dpkg extracts
+// preinst from the .deb" and "dpkg executes it" using plain dpkg flags —
+// the only way to make a confirmed-trivial preinst a no-op is to remove it
+// from the .deb's own control archive before dpkg ever sees the file at
+// all. Preserves member order (debian-binary, control.tar.*, data.tar.*)
+// and the original compression format of control.tar.* exactly.
+static bool stripPreinstFromDeb(const std::string& srcDebPath, const std::string& destDebPath) {
+    std::string tempDir = makeTempDir("blackb0x-stripdeb-");
+    if (tempDir.empty()) return false;
+    bool ok = runCommand({"ar", "x", fs::absolute(srcDebPath).string()}, tempDir);
+    std::string debianBinary = tempDir + "/debian-binary";
+    std::string controlTar, dataTar;
+    if (ok) {
+        std::error_code dirEc;
+        for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
+            std::string fn = e.path().filename().string();
+            if (fn.rfind("control.tar", 0) == 0) controlTar = e.path().string();
+            else if (fn.rfind("data.tar", 0) == 0) dataTar = e.path().string();
+        }
+        ok = fs::exists(debianBinary) && !controlTar.empty() && !dataTar.empty();
+    }
+    std::string extractDir = tempDir + "/control-extract";
+    if (ok) {
+        std::error_code mkEc;
+        fs::create_directories(extractDir, mkEc);
+        ok = runCommand({"tar", "--auto-compress", "-xf", controlTar, "-C", extractDir});
+    }
+    if (ok) {
+        std::error_code rmEc2;
+        fs::remove(fs::path(extractDir) / "preinst", rmEc2);
+    }
+    std::string newControlTar = tempDir + "/" + fs::path(controlTar).filename().string();
+    if (ok) ok = runCommand({"tar", "--auto-compress", "-cf", newControlTar, "-C", extractDir, "."});
+    if (ok) {
+        std::error_code rmDestEc;
+        fs::remove(destDebPath, rmDestEc);
+        ok = runCommand({"ar", "rc", fs::absolute(destDebPath).string(), debianBinary, newControlTar, dataTar});
+    }
+    std::error_code rmEc;
+    fs::remove_all(tempDir, rmEc);
+    return ok;
+}
+
+// Splits a Depends:/Pre-Depends: field into its comma-separated groups,
+// each itself a list of `|`-alternatives, with version constraints
+// ("(>= 1.2)") and whitespace stripped down to bare package names.
+static std::vector<std::vector<std::string>> parseDependencyGroups(const std::string& field) {
+    std::vector<std::vector<std::string>> groups;
+    std::stringstream ss(field);
+    std::string group;
+    while (std::getline(ss, group, ',')) {
+        std::vector<std::string> alts;
+        std::stringstream gs(group);
+        std::string alt;
+        while (std::getline(gs, alt, '|')) {
+            size_t paren = alt.find('(');
+            if (paren != std::string::npos) alt = alt.substr(0, paren);
+            size_t start = alt.find_first_not_of(" \t");
+            size_t end = alt.find_last_not_of(" \t");
+            if (start == std::string::npos) continue;
+            alts.push_back(alt.substr(start, end - start + 1));
+        }
+        if (!alts.empty()) groups.push_back(alts);
+    }
+    return groups;
+}
+
+static std::set<std::string> readPrebakeBlacklist() {
+    std::set<std::string> blacklist;
+    std::ifstream in(resolveMiscPath("prebake_package_blacklist.txt"));
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos || line[start] == '#') continue;
+        size_t end = line.find_last_not_of(" \t\r");
+        blacklist.insert(line.substr(start, end - start + 1));
+    }
+    return blacklist;
+}
+
+// Computes which of `resolvedFilenames` (picklist.txt's full transitive
+// closure) are safe to unpack + mark installed at bake time. A package is
+// eligible only if it is NOT in
+// Blackb0x/Misc/prebake_package_blacklist.txt AND every one of its real
+// Depends:/Pre-Depends: (extracted directly from the actual .deb, not
+// guessed) is ALSO eligible, transitively. This propagation is not
+// optional: cydia is blacklisted (real, stateful first-run postinst — see
+// the blacklist file's own comment), and plenty of otherwise-trivial
+// packages in this ecosystem Depends: on it — without walking the real
+// dependency graph, they'd end up marked "installed" in dpkg's own status
+// file while a real dependency was never actually satisfied: a genuinely
+// broken, inconsistent package database, not a merely-redundant one.
+//
+// Eligibility alone doesn't mean a package's postinst/preinst is safe to
+// actually RUN, though — stagePreinstalledPackages() runs a genuine, real
+// `dpkg --configure` over this whole set (needed to correctly resolve
+// this ecosystem's Pre-Depends: cycle, see kPreinstallInnerScript's own
+// comment), which executes any maintainer script that exists for real,
+// inside a plain Linux container with no iOS-specific tools (`launchctl`
+// etc.) available at all. `prebake_package_blacklist.txt` is for scripts
+// that do real, stateful, runtime-dependent, or otherwise-uninspectable
+// (a compiled binary, not a shell script) work and must run on the real
+// device instead — anything eligible (i.e. not blacklisted, directly or
+// transitively) that STILL happens to have a postinst or preinst is, by
+// construction, one nobody has flagged as needing that: confirmed safe to
+// run for real, just not inside this bootstrap container specifically.
+// `outStripPostinstPackages`/`outStripPreinstFilenames` collect exactly
+// those, by real inspection of each .deb's own control archive (not a
+// maintained list) — stagePreinstalledPackages() deletes each such
+// package's postinst between unpacking and configuring (safe: postinst
+// only ever runs at --configure time, well after that), and rebuilds a
+// preinst-stripped copy of each such package's own .deb before ever
+// handing it to dpkg at all (not safe to do after the fact: preinst runs
+// unconditionally DURING --unpack itself) — either way it configures as a
+// genuine no-op instead of failing on a missing command/wrong
+// architecture.
+static std::set<std::string> computePreinstallEligibleFilenames(const std::vector<std::string>& resolvedFilenames,
+                                                                  const std::string& debsRoot,
+                                                                  std::set<std::string>& outStripPostinstPackages,
+                                                                  std::set<std::string>& outStripPreinstFilenames) {
+    std::map<std::string, DebControlInfo> infoByPackage;
+    std::map<std::string, std::string> filenameByPackage;
+    for (const auto& filename : resolvedFilenames) {
+        DebControlInfo info;
+        if (!readDebControlInfo(debsRoot + "/" + filename, info)) {
+            fprintf(stderr,
+                    "bakeRamdisk: WARNING: cannot read control info for %s — excluding from bake-time preinstall\n",
+                    filename.c_str());
+            continue;
+        }
+        infoByPackage[info.package] = info;
+        filenameByPackage[info.package] = filename;
+    }
+
+    std::set<std::string> resolvedNames;
+    for (const auto& [name, filename] : filenameByPackage) resolvedNames.insert(name);
+
+    std::set<std::string> blacklist = readPrebakeBlacklist();
+    std::set<std::string> excluded;
+    for (const auto& name : resolvedNames) {
+        if (blacklist.count(name)) excluded.insert(name);
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& name : resolvedNames) {
+            if (excluded.count(name)) continue;
+            const DebControlInfo& info = infoByPackage[name];
+            bool unsatisfiable = false;
+            for (const auto& field : {info.preDepends, info.depends}) {
+                for (const auto& group : parseDependencyGroups(field)) {
+                    bool groupHasResolvedAlt = false;
+                    bool groupSatisfied = false;
+                    for (const auto& alt : group) {
+                        if (resolvedNames.count(alt)) {
+                            groupHasResolvedAlt = true;
+                            if (!excluded.count(alt)) groupSatisfied = true;
+                        }
+                    }
+                    if (groupHasResolvedAlt && !groupSatisfied) {
+                        unsatisfiable = true;
+                        break;
+                    }
+                }
+                if (unsatisfiable) break;
+            }
+            if (unsatisfiable) {
+                excluded.insert(name);
+                changed = true;
+            }
+        }
+    }
+
+    std::set<std::string> eligibleFilenames;
+    int excludedByBlacklist = 0, excludedByPropagation = 0;
+    for (const auto& name : resolvedNames) {
+        if (excluded.count(name)) {
+            if (blacklist.count(name)) {
+                excludedByBlacklist++;
+            } else {
+                excludedByPropagation++;
+                fprintf(stderr,
+                        "bakeRamdisk: %s not bake-time preinstalled — depends on a blacklisted package "
+                        "(transitively)\n",
+                        name.c_str());
+            }
+        } else {
+            const DebControlInfo& info = infoByPackage[name];
+            const std::string& filename = filenameByPackage[name];
+            eligibleFilenames.insert(filename);
+            if (info.hasPostinst) {
+                outStripPostinstPackages.insert(name);
+                fprintf(stderr,
+                        "bakeRamdisk: %s is bake-time eligible but has a real postinst — stripping it before "
+                        "--configure (see computePreinstallEligibleFilenames()'s own comment)\n",
+                        name.c_str());
+            }
+            if (info.hasPreinst) {
+                outStripPreinstFilenames.insert(filename);
+                fprintf(stderr,
+                        "bakeRamdisk: %s is bake-time eligible but has a real preinst — rebuilding its .deb "
+                        "without it before --unpack (see computePreinstallEligibleFilenames()'s own comment)\n",
+                        name.c_str());
+            }
+        }
+    }
+    fprintf(stderr,
+            "bakeRamdisk: bake-time preinstall: %zu eligible, %d blacklisted directly, %d excluded via dependency "
+            "propagation, out of %zu resolved packages\n",
+            eligibleFilenames.size(), excludedByBlacklist, excludedByPropagation, resolvedNames.size());
+
+    return eligibleFilenames;
+}
+
+// Recursively merges a real, ordinary filesystem directory (`hostSrcDir`)
+// into `<blackb0xRoot>/<destRelDir>`, preserving each entry's own real
+// owner/mode (or symlink target) read directly via lstat()/readlink() —
+// unlike stageFile()/stageDir()'s single caller-supplied (uid, gid, mode)
+// triple, this is for merging a tree whose correct metadata is already ON
+// the files themselves (the real unpacked dpkg preinstall root below),
+// not something this program's own call site knows ahead of time.
+// Destination directories that already exist are left with their own
+// metadata untouched (same "don't clobber" rule as ensureParentDirs()) —
+// only freshly-created ones get this tree's metadata applied.
+static bool mergeRealFilesystemTree(const fs::path& blackb0xRoot, const std::string& destRelDir,
+                                     const fs::path& hostSrcDir) {
+    bool ok = true;
+    std::error_code dirEc;
+    for (const auto& entry : fs::directory_iterator(hostSrcDir, dirEc)) {
+        std::string name = entry.path().filename().string();
+        std::string destRel = destRelDir.empty() ? name : destRelDir + "/" + name;
+        struct stat st;
+        if (lstat(entry.path().c_str(), &st) != 0) {
+            ok = false;
+            continue;
+        }
+        if (S_ISLNK(st.st_mode)) {
+            char buf[4096];
+            ssize_t n = readlink(entry.path().c_str(), buf, sizeof(buf) - 1);
+            if (n < 0) {
+                ok = false;
+                continue;
+            }
+            buf[n] = '\0';
+            ok &= stageSymlink(blackb0xRoot, destRel, std::string(buf));
+        } else if (S_ISDIR(st.st_mode)) {
+            fs::path destPath = blackb0xRoot / destRel;
+            ensureParentDirs(blackb0xRoot, destPath);
+            std::error_code cdEc;
+            if (fs::create_directory(destPath, cdEc)) {
+                chmod(destPath.c_str(), st.st_mode & 07777);
+                chown(destPath.c_str(), st.st_uid, st.st_gid);
+            }
+            ok &= mergeRealFilesystemTree(blackb0xRoot, destRel, entry.path());
+        } else if (S_ISREG(st.st_mode)) {
+            ok &= stageFile(blackb0xRoot, destRel, entry.path().string(), st.st_uid, st.st_gid,
+                             st.st_mode & 07777);
+        }
+    }
+    return ok;
+}
+
+// The container script that does the actual work: the standard real-
+// debootstrap two-phase bootstrap pattern, not a per-package retry loop.
+// Confirmed directly, the hard way, that a retry loop cannot work here:
+// this ecosystem has a genuine, unbreakable CYCLE right at the root of
+// its own bootstrap chain — dpkg Pre-Depends: on tar, tar Depends: on
+// gzip/lzma, gzip/lzma Depend: on sed, and sed Pre-Depends: right back on
+// dpkg. No sequential processing order, retried or not, can ever resolve
+// that; something in the cycle has to go first with a knowingly-unmet
+// dependency. Real debootstrap solves exactly this by (1) force-unpacking
+// every package first, with all dependency checking disabled, so every
+// file is physically on disk regardless of ordering, then (2) running one
+// real, forced `--configure -a`, which uses dpkg's own internal
+// processing order across the whole set and — since forcing is still in
+// effect — pushes straight through the cycle instead of refusing. This is
+// safe specifically because prebake_package_blacklist.txt's own
+// transitive-closure computation already proved every package reaching
+// this point has no postinst/prerm anywhere in its own dependency chain:
+// there's no maintainer script for `--force-depends` to let run despite
+// an unmet dependency, only real status/trigger bookkeeping, which is
+// what actually satisfies downstream Pre-Depends: checks correctly.
+// era-appropriate dpkg: debian:stretch ships 1.18.26, confirmed via
+// `podman run debian:stretch dpkg --version`, right next to this
+// project's own vendored on-device dpkg 1.18.10-12. Two REAL, independent
+// consistency checks — dpkg --audit and apt-get check — run afterward,
+// confirmed by direct testing to (a) both report clean/empty on a
+// genuinely-consistent root and (b) both actually catch a real broken
+// case (tested by unpacking a package whose Pre-Depends: was deliberately
+// left unsatisfied). Either one failing aborts the whole step.
+static const char* kPreinstallInnerScript = R"SCRIPT(#!/bin/sh
+set -e
+export DEBIAN_FRONTEND=noninteractive
+mkdir -p /preinstall/var/lib/dpkg/info /preinstall/var/lib/dpkg/updates /preinstall/var/lib/dpkg/triggers
+touch /preinstall/var/lib/dpkg/status /preinstall/var/lib/dpkg/available
+mkdir -p /preinstall/etc/apt/preferences.d /preinstall/etc/apt/sources.list.d
+touch /preinstall/etc/apt/sources.list
+dpkg --root=/preinstall --add-architecture iphoneos-arm
+
+# The same synthetic "firmware" package scripts/build_deb_cache.py's own
+# apt sandbox declares (see that script's own comment for why) — several
+# packages here have a plain Depends: firmware (>= X), and without this
+# declared in THIS dpkg root too (not just the outer one that decided
+# these packages were resolvable in the first place), the real dpkg
+# --audit/apt-get check below would report every one of them as a false-
+# positive "unmet dependency" and abort the whole step over nothing.
+cat >> /preinstall/var/lib/dpkg/status <<'EOF'
+Package: firmware
+Status: install ok installed
+Priority: required
+Section: base
+Installed-Size: 0
+Maintainer: Blackb0x BakeRamdisk.cpp <noreply@regulad.xyz>
+Architecture: iphoneos-arm
+Version: 8.4.2
+Description: Synthetic package matching scripts/build_deb_cache.py's own
+ declaration, so this bootstrap root's dpkg agrees with the outer apt
+ resolution that already decided firmware-version-gated Depends: lines
+ here are satisfied.
+
+EOF
+# dpkg --audit demands every installed package have a .list/.md5sums in
+# dpkg/info — normally written by a real `dpkg --unpack`, which this
+# synthetic package never goes through since it's hand-inserted straight
+# into status. Empty files satisfy the audit (it only checks for their
+# existence, not content) — firmware has no real files of its own to list.
+touch /preinstall/var/lib/dpkg/info/firmware.list /preinstall/var/lib/dpkg/info/firmware.md5sums
+
+: > /work/out/unpack.log
+while IFS= read -r filename; do
+    [ -z "$filename" ] && continue
+    src="/debs-override/$filename"
+    [ -f "$src" ] || src="/debs/$filename"
+    dpkg --root=/preinstall --force-architecture --force-depends --unpack "$src" >>/work/out/unpack.log 2>&1 || true
+done < /work/preinstall_filenames.txt
+
+while IFS= read -r pkgname; do
+    [ -z "$pkgname" ] && continue
+    rm -f "/preinstall/var/lib/dpkg/info/$pkgname.postinst"
+done < /work/strip_postinst_packages.txt
+
+dpkg --root=/preinstall --force-depends --configure -a > /work/out/configure.log 2>&1 || true
+if grep -q "^Status: install ok unpacked$\|^Status: install ok half-configured$" /preinstall/var/lib/dpkg/status; then
+    echo "FATAL: some packages never reached 'installed' even after a forced --configure -a:" >&2
+    grep -B2 "^Status: install ok unpacked$\|^Status: install ok half-configured$" /preinstall/var/lib/dpkg/status >&2
+    cat /work/out/configure.log >&2
+    exit 1
+fi
+
+dpkg --root=/preinstall --force-architecture --audit > /work/out/audit.txt 2>/work/out/audit-warnings.log
+if [ -s /work/out/audit-warnings.log ]; then
+    echo "dpkg --audit: non-fatal parse warnings (stderr, not actual audit findings):" >&2
+    cat /work/out/audit-warnings.log >&2
+fi
+if [ -s /work/out/audit.txt ]; then
+    echo "FATAL: dpkg --audit reported a problem:" >&2
+    cat /work/out/audit.txt >&2
+    exit 1
+fi
+
+apt-get -o Dir=/preinstall -o APT::Architecture=iphoneos-arm -o APT::Architectures::=iphoneos-arm check > /work/out/check.txt 2>&1
+if grep -qiE "broken|unmet" /work/out/check.txt; then
+    echo "FATAL: apt-get check reported broken/unmet dependencies:" >&2
+    cat /work/out/check.txt >&2
+    exit 1
+fi
+
+mkdir -p /out/dpkg-state/info
+cp /preinstall/var/lib/dpkg/status /out/dpkg-state/status
+cp -a /preinstall/var/lib/dpkg/info/. /out/dpkg-state/info/
+rm -rf /preinstall/var/lib/dpkg /preinstall/etc/apt
+)SCRIPT";
+
+// Runs the real dpkg preinstall for `eligibleFilenames` into fresh temp
+// directories and leaves them in place (caller owns cleanup — or, in
+// practice, never cleans them up at all: see computeGlobalDebcacheOnce(),
+// which keeps these alive for the whole process so every firmware this
+// run bakes can merge from the same result). Deliberately invoked via
+// plain runCommand(), NOT runAsInvokingUser() like every other podman call
+// in this file: bakeRamdisk() itself already runs as real root (needed
+// for the HFS+ mount anyway), and this specific step needs that — rootless
+// podman running AS the invoking user maps container-root to that user's
+// own host uid, not real root (confirmed directly: an unpack test through
+// that path came back host-side owned by the invoking user, not root),
+// which would make every ownership value this function reads back from
+// the bind-mounted output wrong. Root's own podman storage pulling
+// debian:stretch fresh on first use is a one-time cost, same category as
+// every other one-time podman setup step this project already has.
+static bool computePreinstalledPackages(const std::set<std::string>& eligibleFilenames,
+                                         const std::set<std::string>& stripPostinstPackages,
+                                         const std::set<std::string>& stripPreinstFilenames,
+                                         std::string& outPreinstallDir, std::string& outDpkgStateDir) {
+    std::string preinstallDir = makeTempDir("blackb0x-preinstall-root-");
+    std::string outDir = makeTempDir("blackb0x-preinstall-out-");
+    if (preinstallDir.empty() || outDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create preinstall temp dirs\n");
+        return false;
+    }
+    std::error_code mkEc;
+    fs::create_directories(fs::path(outDir) / "dpkg-state" / "info", mkEc);
+    outPreinstallDir = preinstallDir;
+    outDpkgStateDir = outDir + "/dpkg-state";
+
+    if (eligibleFilenames.empty()) {
+        fprintf(stderr, "bakeRamdisk: no packages eligible for bake-time preinstall this run\n");
+        return true;
+    }
+
+    std::string workDir = makeTempDir("blackb0x-preinstall-work-");
+    std::string debsOverrideDir = makeTempDir("blackb0x-preinstall-debs-override-");
+    if (workDir.empty() || debsOverrideDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create preinstall work dir\n");
+        return false;
+    }
+    fs::create_directories(fs::path(workDir) / "out", mkEc);
+    {
+        std::ofstream f(workDir + "/preinstall_filenames.txt");
+        for (const auto& fn : eligibleFilenames) f << fn << "\n";
+    }
+    {
+        std::ofstream f(workDir + "/strip_postinst_packages.txt");
+        for (const auto& name : stripPostinstPackages) f << name << "\n";
+    }
+    {
+        std::ofstream f(workDir + "/inner.sh");
+        f << kPreinstallInnerScript;
+    }
+    std::string debsRoot = resolveDebsPath();
+    bool stripOk = true;
+    for (const auto& filename : stripPreinstFilenames) {
+        stripOk &= stripPreinstFromDeb(debsRoot + "/" + filename, debsOverrideDir + "/" + filename);
+    }
+    if (!stripOk) {
+        fprintf(stderr, "bakeRamdisk: failed to rebuild a preinst-stripped .deb\n");
+        return false;
+    }
+
+    bool ok = runCommand({
+        "/usr/bin/podman", "run", "--rm", "--security-opt", "label=disable",
+        "-v", workDir + ":/work",
+        "-v", fs::absolute(resolveDebsPath()).string() + ":/debs:ro",
+        "-v", debsOverrideDir + ":/debs-override:ro",
+        "-v", preinstallDir + ":/preinstall",
+        "-v", outDir + ":/out",
+        "debian:stretch", "sh", "/work/inner.sh",
+    });
+    if (!ok) {
+        fprintf(stderr, "bakeRamdisk: bake-time dpkg preinstall failed (see podman output above)\n");
+        return false;
+    }
+    return true;
+}
+
+// The fast, per-bake half of the mechanism above: merges an already-
+// computed preinstall payload + dpkg state into `blackb0xRoot`. No
+// network, no container, no dpkg invocation — just local file copies —
+// which is exactly why the expensive computation above is worth caching
+// across every firmware a single bake-all-ramdisks run bakes (see
+// computeGlobalDebcacheOnce()) while this part still runs once per
+// firmware, into that firmware's own /blackb0x.
+static bool mergePreinstalledPackages(const fs::path& blackb0xRoot, const std::string& preinstallDir,
+                                       const std::string& dpkgStateDir) {
+    bool ok = true;
+    ok &= mergeRealFilesystemTree(blackb0xRoot, "", preinstallDir);
+    if (fs::exists(dpkgStateDir + "/status")) {
+        ok &= stageFile(blackb0xRoot, "private/var/lib/dpkg/status", dpkgStateDir + "/status", 0, 0, 0644);
+    }
+    if (fs::exists(dpkgStateDir + "/info")) {
+        ok &= mergeRealFilesystemTree(blackb0xRoot, "private/var/lib/dpkg/info", dpkgStateDir + "/info");
+    }
+    return ok;
+}
+
+// Everything scripts/build_deb_cache.py resolves, plus the bake-time
+// preinstall computed from it, cached for the lifetime of this process.
+struct GlobalDebcacheResult {
+    bool ok = false;
+    std::vector<std::string> allFilenames;
+    std::set<std::string> preinstallFilenames;
+    std::vector<std::string> resolvedPackages;
+    std::string aptListsDir;
+    std::string preinstallPayloadDir;
+    std::string dpkgStateDir;
+    // build_deb_cache.py's local_only_debs.txt output (a real
+    // dpkg-scanpackages Packages index + the loose .debs it describes) —
+    // empty string if that run had no local-only entries to build one
+    // for. See Blackb0x/Misc/apt/local.list's own comment for why this
+    // needs a real generated index, not just cached .deb bytes.
+    std::string localRepoDir;
+};
+
+// Runs scripts/build_deb_cache.py and the bake-time dpkg preinstall
+// mechanism exactly ONCE per process, no matter how many firmwares this
+// run bakes. Blackb0x/Misc/packages.txt's own resolution (and the real
+// dpkg unpack/audit it feeds) is entirely firmware-independent — the same
+// apt repos, the same package set, regardless of which device/firmware
+// bakeRamdisk() happens to be building right now — so re-running the
+// whole apt-resolution + real-dpkg-container pipeline once per firmware
+// (bake-all-ramdisks bakes dozens in a full run) would just repeat
+// identical network fetches, GPG verification, and container work for no
+// reason, and risks a genuinely different result on different bakes in
+// the same run if an upstream repo happens to change mid-run. A plain
+// function-local `static` cache is exactly the right lifetime here: it
+// persists for as long as this one process runs (one bake-all-ramdisks
+// invocation), and a fresh process (the next run) correctly recomputes
+// from scratch. stageDebcache() calls this once per firmware and merges
+// the same cached result into each bake's own /blackb0x.
+static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
+    static bool computed = false;
+    static GlobalDebcacheResult cached;
+    if (computed) {
+        outResult = cached;
+        return cached.ok;
+    }
+    computed = true;
+
+    std::string tempDir = makeTempDir("blackb0x-debcache-");
+    if (tempDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create debcache temp dir\n");
+        outResult = cached;
+        return false;
+    }
+    chownToInvokingUserIfSudo(tempDir);
+    bool ok = runAsInvokingUser({"python3", "scripts/build_deb_cache.py", "--output-dir", tempDir});
+    if (!ok) {
+        fprintf(stderr, "bakeRamdisk: scripts/build_deb_cache.py failed\n");
+        outResult = cached;
+        return false;
+    }
+    std::ifstream picklist(tempDir + "/picklist.txt");
+    if (!picklist) {
+        fprintf(stderr, "bakeRamdisk: build_deb_cache.py did not produce picklist.txt\n");
+        outResult = cached;
+        return false;
+    }
+    std::string debsRoot = resolveDebsPath();
+    std::string line;
+    while (std::getline(picklist, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        cached.allFilenames.push_back(line);
+    }
+
+    // Which of these get unpacked + marked installed at bake time (real
+    // dpkg state) vs. left as a plain cached .deb for postinstall.sh's own
+    // apt-get to install for real — see computePreinstallEligibleFilenames()
+    // and computePreinstalledPackages()'s own comments for the full
+    // mechanism (prebake_package_blacklist.txt + its real dependency-graph
+    // closure, then real era-appropriate dpkg + a dpkg/apt consistency
+    // audit).
+    std::set<std::string> stripPostinstPackages;
+    std::set<std::string> stripPreinstFilenames;
+    cached.preinstallFilenames = computePreinstallEligibleFilenames(cached.allFilenames, debsRoot,
+                                                                      stripPostinstPackages, stripPreinstFilenames);
+
+    if (!computePreinstalledPackages(cached.preinstallFilenames, stripPostinstPackages, stripPreinstFilenames,
+                                      cached.preinstallPayloadDir, cached.dpkgStateDir)) {
+        outResult = cached;
+        return false;
+    }
+
+    std::ifstream resolvedPackages(tempDir + "/resolved_packages.txt");
+    if (!resolvedPackages) {
+        fprintf(stderr, "bakeRamdisk: build_deb_cache.py did not produce resolved_packages.txt\n");
+        outResult = cached;
+        return false;
+    }
+    while (std::getline(resolvedPackages, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        cached.resolvedPackages.push_back(line);
+    }
+
+    cached.aptListsDir = tempDir + "/apt-lists";
+    // Only present if local_only_debs.txt had entries this run — see that
+    // file and Blackb0x/Misc/apt/local.list's own comments.
+    if (fs::exists(tempDir + "/local-repo")) {
+        cached.localRepoDir = tempDir + "/local-repo";
+    }
+    cached.ok = true;
+    outResult = cached;
+    return true;
+}
+
+// Stages this firmware's share of the (process-wide cached) debcache
+// result into `blackb0xRoot`: the non-preinstalled .deb set (minus
+// kNeverStageDebs) into the real apt cache directory
+// (private/var/cache/apt/archives/) — apt finds these itself via its
+// normal cache-before-download check, no local file:// source or
+// synthetic Packages index needed at all anymore (see
+// scripts/build_deb_cache.py's own module docstring for why that whole
+// mechanism is gone) — plus the preinstalled-package payload/dpkg-state
+// and the apt lists cache. Returns the real, apt-resolved package NAMES
+// (not .deb filenames) via `outResolvedPackages` for
+// stagePostinstallScript() to bake into postinstall.sh's install array.
+// Real failure (the underlying computation failing, or producing no
+// picklist) is treated as fatal for the whole bake, unlike a single
+// missing loose asset elsewhere: a ramdisk with no packages to install
+// can't actually finish the jailbreak.
+static bool stageDebcache(const fs::path& blackb0xRoot, std::vector<std::string>& outResolvedPackages) {
+    GlobalDebcacheResult result;
+    if (!computeGlobalDebcacheOnce(result)) {
+        return false;
+    }
+
+    std::string debsRoot = resolveDebsPath();
+    bool allOk = true;
+    for (const auto& filename : result.allFilenames) {
+        if (result.preinstallFilenames.count(filename)) continue;  // handled by mergePreinstalledPackages() instead
+        if (shouldSkipStagingDeb(filename)) {
+            fprintf(stderr, "bakeRamdisk: not staging %s locally (too big for this ramdisk — network-only)\n",
+                    filename.c_str());
+            continue;
+        }
+        allOk &= stageFile(blackb0xRoot, "private/var/cache/apt/archives/" + filename, debsRoot + "/" + filename, 0,
+                            0, 0644);
+    }
+
+    allOk &= mergePreinstalledPackages(blackb0xRoot, result.preinstallPayloadDir, result.dpkgStateDir);
+    allOk &= stageAptListsCache(blackb0xRoot, result.aptListsDir);
+
+    // local_only_debs.txt's real apt repo (Packages index + the .debs it
+    // describes) — staged at the exact path Blackb0x/Misc/apt/local.list's
+    // `deb file:///var/mobile/.blackb0x/local-debs ./` source expects, so
+    // the real device's own apt-get can resolve these by name too.
+    if (!result.localRepoDir.empty()) {
+        allOk &= stageDirectoryTree(blackb0xRoot, "var/mobile/.blackb0x/local-debs", result.localRepoDir, kUidMobile,
+                                     kGidStaff, 0644);
+    }
+
+    outResolvedPackages = result.resolvedPackages;
+    return allOk;
+}
+
+// iOS 8.4 branch — tihmstar's EtasonATV untether (see Blackb0x/Misc/README.md's
+// "etasonATV / tihmstar-untether provenance" for the jsc/rtbuddyd/--early-boot
+// mechanism this stages). uid 1000 / gid 985 on the /untether directory
+// itself is ported verbatim from the original disassembly (FUN_00003b44) —
+// an intentional, specific non-mobile/non-root ownership, not the same
+// 755-decimal-literal bug the directory *mode* values elsewhere in this
+// branch had (fixed to real 0755 here rather than propagated).
+static bool stageEtasonatv(const fs::path& blackb0xRoot) {
+    std::string tarPath = resolveMiscPath("tihmstar-untether.tar");
+    std::string tempDir = makeTempDir("blackb0x-etasonatv-");
+    if (tempDir.empty()) return false;
+    if (!fs::exists(tarPath) || !runCommand({"tar", "-xf", fs::absolute(tarPath).string()}, tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s — 8.4 untether payload not staged\n",
+                tarPath.c_str());
+        std::error_code rmEc;
+        fs::remove_all(tempDir, rmEc);
+        return false;
+    }
+    bool ok = true;
+    ok &= stageFile(blackb0xRoot, "private/etc/rc.d/daemonload", tempDir + "/etc/rc.d/daemonload", 0, 0, 0755);
+    ok &= stageFile(blackb0xRoot, "usr/bin/orphan_commander", tempDir + "/usr/bin/orphan_commander", 0, 0, 0755);
+    stageDir(blackb0xRoot, "untether", 1000, 985, 0755);
+    ok &= stageFile(blackb0xRoot, "untether/untether.bin", tempDir + "/untether/untether.bin", 0, 0, 0644);
+    ok &= stageFile(blackb0xRoot, "untether/expl.js", tempDir + "/untether/expl.js", 0, 0, 0644);
+    stageSymlink(blackb0xRoot, "usr/libexec/rtbuddyd", "/System/Library/Frameworks/JavaScriptCore.framework/Resources/jsc");
+    stageSymlink(blackb0xRoot, "--early-boot", "/untether/expl.js");
+    ok &= stageFile(blackb0xRoot, "Library/LaunchDaemons/xyz.regulad.blackb0x.postinstall.plist",
+                     resolveMiscPath("xyz.regulad.blackb0x.postinstall.plist"), 0, 0, 0644);
+    std::error_code rmEc;
+    fs::remove_all(tempDir, rmEc);
+    return ok;
+}
+
+// iOS 7.x/8.x (non-8.4) branch — swaps a custom replacement binary into
+// /usr/libexec/dirhelper, the persistence exploit itself: real Apple/Cydia
+// code never touches this path at all (see Misc/README.md's own
+// "dirhelper here IS the file..." note for why this specific file, not
+// p0sixspwn's differently-sourced same-named binary below, and Misc/
+// dirhelper's own provenance writeup for what it actually is).
+static bool stageIos7Tether(const fs::path& blackb0xRoot) {
+    bool ok = stageFile(blackb0xRoot, "usr/libexec/dirhelper", resolveMiscPath("dirhelper"), kUidMobile,
+                         kGidStaff, 0755);
+    ok &= stageFile(blackb0xRoot, "System/Library/LaunchDaemons/xyz.regulad.blackb0x.postinstall.plist",
+                     resolveMiscPath("xyz.regulad.blackb0x.postinstall.plist"), 0, 0, 0644);
+    return ok;
+}
+
+// 6.1.4 branch — p0sixspwn's own untether payload, extracted directly from
+// the real .deb rather than loose files (superseding the old, deleted
+// p0sixspwn.tgz — see Misc/README.md's "Dropped entirely" section). Only
+// the three files p0sixspwn's persistence exploit itself needs in place
+// before reboot are staged here; the package's dpkg-info bookkeeping
+// files and its own /etc/launchd.conf are deliberately not — the real
+// .deb (already in packages.txt) registers all of that properly
+// once postinstall.sh actually installs it through apt, which fstab.atv's
+// removal already established as this project's intent for this package.
+static bool stageP0sixspwn(const fs::path& blackb0xRoot) {
+    std::string debPath = fs::absolute(resolveDebsPath() + "/com.ih8sn0w-squiffy-winocm.p0sixspwn_1.4-1_iphoneos-arm.deb").string();
+    std::string tempDir = makeTempDir("blackb0x-p0sixspwn-");
+    if (tempDir.empty()) return false;
+    if (!fs::exists(debPath) || !runCommand({"ar", "x", debPath}, tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s — 6.1.4 untether payload not staged\n",
+                debPath.c_str());
+        std::error_code rmEc;
+        fs::remove_all(tempDir, rmEc);
+        return false;
+    }
+    std::string dataTar;
+    std::error_code dirEc;
+    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
+        if (e.path().filename().string().rfind("data.tar", 0) == 0) {
+            dataTar = e.path().string();
+            break;
+        }
+    }
+    if (dataTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", dataTar}, tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's data.tar.* — 6.1.4 untether payload not staged\n",
+                debPath.c_str());
+        std::error_code rmEc;
+        fs::remove_all(tempDir, rmEc);
+        return false;
+    }
+    bool ok = true;
+    ok &= stageFile(blackb0xRoot, "usr/libexec/dirhelper", tempDir + "/usr/libexec/dirhelper", 0, 0, 0755);
+    stageDir(blackb0xRoot, "private/var/untether", 0, 0, 0755);
+    ok &= stageFile(blackb0xRoot, "private/var/untether/_.dylib", tempDir + "/var/untether/_.dylib", 0, 0, 0644);
+    ok &= stageFile(blackb0xRoot, "private/var/untether/untether", tempDir + "/var/untether/untether", 0, 0, 0755);
+    ok &= stageFile(blackb0xRoot, "System/Library/LaunchDaemons/xyz.regulad.blackb0x.postinstall.plist",
+                     resolveMiscPath("xyz.regulad.blackb0x.postinstall.plist"), 0, 0, 0644);
+    std::error_code rmEc;
+    fs::remove_all(tempDir, rmEc);
+    return ok;
+}
+
+// Picks exactly one of the three known persistence payloads based on this
+// firmware's own ProductVersion — replicates entrypoint.c's old runtime
+// version[0]/version[2]/version[4] checks exactly (see docs/HISTORY.md),
+// just evaluated once here against a real ProductVersion string instead of
+// on-device against a hand-rolled plist scan. A version matching none of
+// the three is not fatal — the common content (Cydia dirs, apt sources,
+// debcache) staged by stageBlackb0xTree() below is still produced, just
+// with no device-specific persistence payload on top, so this only warns.
+static bool stageVersionBranch(const fs::path& blackb0xRoot, const std::string& productVersion) {
+    if (productVersion.rfind("8.4", 0) == 0) {
+        return stageEtasonatv(blackb0xRoot);
+    }
+    if (!productVersion.empty() && (productVersion[0] == '8' || productVersion[0] == '7')) {
+        return stageIos7Tether(blackb0xRoot);
+    }
+    if (productVersion.rfind("6.1.4", 0) == 0) {
+        return stageP0sixspwn(blackb0xRoot);
+    }
+    fprintf(stderr,
+            "bakeRamdisk: WARNING: ProductVersion '%s' matches no known persistence payload — staging common "
+            "content only\n",
+            productVersion.c_str());
+    return true;
+}
+
+// Templates Misc/postinstall.sh's one placeholder, __BLACKB0X_PACKAGES__,
+// with the real, apt-resolved package names stageDebcache() just handed
+// back (everything except "cydia", which postinstall.sh already installs
+// separately, first, on its own — see that script's own comment for why).
+// Not a plain stageFile() copy like everything else staged here — this is
+// the one asset whose content actually depends on what this specific bake
+// resolved, not just a static checked-in file.
+static bool stagePostinstallScript(const fs::path& blackb0xRoot, const std::vector<std::string>& resolvedPackages) {
+    std::string srcPath = resolveMiscPath("postinstall.sh");
+    std::ifstream in(srcPath, std::ios::binary);
+    if (!in) {
+        fprintf(stderr, "bakeRamdisk: WARNING: missing source %s — not staging postinstall.sh\n", srcPath.c_str());
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    std::string content = ss.str();
+
+    std::string packagesLiteral;
+    for (const auto& pkg : resolvedPackages) {
+        if (pkg == "cydia") continue;
+        if (!packagesLiteral.empty()) packagesLiteral += " ";
+        packagesLiteral += pkg;
+    }
+
+    const std::string placeholder = "__BLACKB0X_PACKAGES__";
+    size_t pos = content.find(placeholder);
+    if (pos == std::string::npos) {
+        fprintf(stderr, "bakeRamdisk: %s has no %s placeholder\n", srcPath.c_str(), placeholder.c_str());
+        return false;
+    }
+    content.replace(pos, placeholder.size(), packagesLiteral);
+
+    fs::path destPath = blackb0xRoot / "var/mobile/.blackb0x/postinstall.sh";
+    ensureParentDirs(blackb0xRoot, destPath);
+    std::ofstream out(destPath, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        fprintf(stderr, "bakeRamdisk: cannot write %s\n", destPath.c_str());
+        return false;
+    }
+    out << content;
+    out.close();
+    chmod(destPath.c_str(), 0755);
+    chown(destPath.c_str(), kUidMobile, kGidStaff);
+    return true;
+}
+
+// Builds /blackb0x under `parentDir` (a plain host directory — this no
+// longer has to be a mounted HFS+ volume at all; bakeRamdisk() stages this
+// into a host temp dir first specifically so its real size is known
+// before the destination volume gets created, then `cp -a`s the result
+// into place) — everything entrypoint.c's merge_tree() will blindly
+// replicate onto /mnt1 at boot, with every entry already carrying its
+// correct final owner/mode. /blackb0x itself is root:wheel 0755, the same
+// convention every other top-level pristine-ramdisk directory uses.
+static bool stageBlackb0xTree(const std::string& parentDir, const std::string& productVersion) {
+    fs::path blackb0xRoot = fs::path(parentDir) / "blackb0x";
+    std::error_code ec;
+    fs::create_directory(blackb0xRoot, ec);
+    chmod(blackb0xRoot.c_str(), 0755);
+    chown(blackb0xRoot.c_str(), 0, 0);
+
+    bool ok = true;
+
+    stageFile(blackb0xRoot, "private/var/root/.profile", resolveMiscPath("profile"), kUidMobile, kGidStaff, 0755);
+    // dpkg itself has no raw loose-file source in this repo, but it
+    // doesn't need one anymore: "dpkg" is a real, no-postinst entry in
+    // packages.txt, so stageDebcache()'s bake-time preinstall mechanism
+    // (see computePreinstallEligibleFilenames()/stagePreinstalledPackages())
+    // unpacks its real .deb (whose own payload already puts the binary at
+    // ./usr/bin/dpkg) and marks it installed directly — the same real
+    // mechanism now used for coreutils-bin, bash, and everything else with
+    // no postinst, not a special case.
+
+    stageDir(blackb0xRoot, "private/etc/ssh", kUidMobile, kGidStaff, 0700);
+    for (const auto& dir : kCydiaDirs) {
+        stageDir(blackb0xRoot, dir, kUidMobile, kGidStaff, 0755);
+    }
+
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/regulad.list", resolveMiscPath("apt/regulad.list"),
+              kUidMobile, kGidStaff, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/trusted.gpg.d/regulad.gpg", resolveMiscPath("apt/regulad.gpg"), 0, 0,
+              0644);
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/saurik.list", resolveMiscPath("apt/saurik.list"),
+              kUidMobile, kGidStaff, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/trusted.gpg.d/saurik.gpg", resolveMiscPath("apt/saurik.gpg"), 0, 0,
+              0644);
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/awkwardtv.list", resolveMiscPath("apt/awkwardtv.list"),
+              kUidMobile, kGidStaff, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/trusted.gpg.d/awkwardtv.gpg", resolveMiscPath("apt/awkwardtv.gpg"), 0,
+              0, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/bigboss.list", resolveMiscPath("apt/bigboss.list"),
+              kUidMobile, kGidStaff, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/trusted.gpg.d/bigboss.gpg", resolveMiscPath("apt/bigboss.gpg"), 0, 0,
+              0644);
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/xbmc.list", resolveMiscPath("apt/xbmc.list"), kUidMobile,
+              kGidStaff, 0644);
+    // Points at var/mobile/.blackb0x/local-debs, which stageDebcache()
+    // below only actually populates if this bake's debcache run had
+    // local-only entries — an always-present but sometimes-empty source
+    // is harmless (apt just finds nothing there), unlike a source pointing
+    // at a directory that doesn't exist at all.
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/local.list", resolveMiscPath("apt/local.list"),
+              kUidMobile, kGidStaff, 0644);
+
+    std::vector<std::string> resolvedPackages;
+    if (!stageDebcache(blackb0xRoot, resolvedPackages)) ok = false;
+    if (!stagePostinstallScript(blackb0xRoot, resolvedPackages)) ok = false;
+    if (!stageVersionBranch(blackb0xRoot, productVersion)) ok = false;
+
+    return ok;
+}
+
+// patchRamdisk() (as it was, before this file existed) went through three
+// designs before this one. Recording why, since the investigation was
+// expensive and the wrong lesson ("just patch the bug") would be easy for a
+// future reader to draw:
+//
+// 1. In-memory xpwn Volume (add_hfs()/grow_hfs(), no mount at all — this
+//    matched the original port plan's intent exactly, avoiding any
+//    OS-level mount/loopback device). Real-data testing against a
+//    downloaded AppleTV2,1 11D258 RestoreRamdisk got most of the way
+//    through — the full baseline+overlay content set injected correctly,
+//    after separately fixing a UF_COMPRESSED-overwrite crash — before
+//    hitting hfs_panic("BTree inconsistent!") partway through the debs.
+//    Two gdb backtraces confirmed this is a genuine, pre-existing bug in
+//    xpwn's own catalog-B-tree *growth* code: grow_hfs() only resizes the
+//    overall volume bitmap, not the catalog file's own B-tree extents, and
+//    the organic-growth path that kicks in once the catalog needs to grow
+//    past its initial capacity has never been exercised enough by xpwn's
+//    own, much smaller, reference tools to catch this. Not a bug in the
+//    ported code.
+// 2. libhfsp (Debian's `hfsplus`/`libhfsp-dev` package — a from-scratch
+//    userspace HFS+ reader/writer, again no mount). Ruled out even faster:
+//    a single hpmkdir() call, no file copy at all, on a freshly-
+//    mkfs.hfsplus'd volume already corrupted an extent entry into the
+//    reserved alternate-volume-header block, confirmed via fsck.hfsplus and
+//    root-caused in libhfsp's own source (libhfsp/src/volume.c) to a bounds
+//    check against exactly that reserved region existing in the source only
+//    as commented-out dead code, in all three block-allocation functions.
+//    libhfsp's own ChangeLog calls its 1.0.1 release (2000) "a stable,
+//    readonly implementation" and never claims the write path reached that
+//    bar through its final 1.0.4 release (2002).
+// 3. The Linux kernel's own, actively-maintained, in-tree `hfsplus` driver
+//    (fs/hfsplus/) — this DOES require a real loop mount, which the
+//    original port plan explicitly wanted to avoid, but real functional
+//    testing (loop-mounting a blank mkfs.hfsplus volume and copying the
+//    *entire* real payload set onto it) confirmed it handles exactly the
+//    catalog growth that broke both designs above, with a clean
+//    fsck.hfsplus verdict and a byte-for-byte content match against the
+//    source. This is what's actually used below — and is exactly why this
+//    logic lives in its own binary instead of the main blackb0x one: it's
+//    the only piece of this tool that needs CAP_SYS_ADMIN/CAP_CHOWN.
+//
+// GUTTED, then partially rebuilt (see git history for both the original,
+// much larger version and the fully-gutted one in between): this used to
+// grow the volume and merge a whole ramdisk/ overlay + debcache directly
+// onto the final destination paths. That's gone for good — the on-device
+// job stays "just copy files and then die" — but the baking job does two
+// things to the pristine ramdisk: overwrite ONE existing file's content in
+// place (`/sbin/launchd`, real PID-1 on every known firmware — see
+// docs/HISTORY.md's "Entrypoint injection point" entry for why this isn't
+// `/etc/rc.boot`) via spliceFileContentInPlace(), and add one brand new
+// top-level directory, `/blackb0x`, via stageBlackb0xTree() above. Every
+// file the pristine ramdisk already shipped, including launchd's own
+// permissions/ownership/timestamps, is either left completely untouched or
+// has only its content overwritten in place. Since /blackb0x's real size
+// isn't known ahead of time and generally doesn't fit in the pristine
+// volume's own free space, the destination is actually a freshly created,
+// correctly-sized volume (not the original, grown in place — see the
+// "growing HFS+ in place is fundamentally broken on Linux" note further
+// below), populated with the original content via `cp -a` before either of
+// the two changes above are made.
+bool bakeRamdisk(const std::string& path, const std::string& key, const std::string& iv,
+                  const std::string& productVersion, const std::string& outputPath,
+                  const std::string& entrypointBinaryPath, bool& outSizeWarning) {
+    outSizeWarning = false;
+    std::string decDMG = decryptedDMGFor(path);
+    const std::string& patchedDMG = outputPath;
+
+    fprintf(stderr, "Patching ramdisk...\n");
+
+    decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(decDMG.c_str()), const_cast<char*>(key.c_str()),
+            const_cast<char*>(iv.c_str()), (char*)"FALSE", nullptr);
+
+    // NOTE: the original's "AppleTV2,1_4." branch rebuilds the ramdisk from
+    // scratch via `hdiutil create ... -format UDRW` for the oldest ATV2 4.x
+    // firmware — a materially different problem (no pre-existing content at
+    // all) from splicing into an existing one. Flag and bail rather than
+    // silently produce a broken ramdisk.
+    if (path.find("AppleTV2,1_4.") != std::string::npos) {
+        fprintf(stderr, "bakeRamdisk: AppleTV2,1 4.x ramdisk recreation is not implemented in this port\n");
+        return false;
+    }
+
+    // Not every decrypted restore component is UDIF-wrapped: on this old
+    // (A4-era) Apple TV 2/3 hardware, decrypting the RestoreRamDisk yields a
+    // RAW HFS+ image directly (confirmed empirically — "H+" signature right
+    // at the standard offset 0x400, no "koly" UDIF trailer at all), unlike
+    // the UDIF-wrapped root-filesystem images third_party/xpwn's own
+    // ipsw-patch/main.c reference code assumes. Detect which one this is
+    // rather than assuming, and only extractDmg()/buildDmg() when genuinely
+    // needed — the Linux kernel's hfsplus driver only understands raw
+    // partition images, not Apple's UDIF/DMG wrapper, so a genuinely
+    // UDIF-wrapped image still needs unwrapping before it can be mounted.
+    bool isUDIF = false;
+    {
+        std::ifstream probe(decDMG, std::ios::binary);
+        if (probe) {
+            probe.seekg(0, std::ios::end);
+            std::streamoff size = probe.tellg();
+            if (size >= 512) {
+                probe.seekg(size - 512);
+                char magic[4] = {0};
+                probe.read(magic, 4);
+                isUDIF = (memcmp(magic, "koly", 4) == 0);
+            }
+        }
+    }
+
+    std::string rawImgPath = decDMG + ".raw.hfs";
+    if (isUDIF) {
+        FILE* decFile = fopen(decDMG.c_str(), "rb");
+        if (!decFile) {
+            fprintf(stderr, "bakeRamdisk: cannot open %s\n", decDMG.c_str());
+            return false;
+        }
+        void* rawBuffer = nullptr;
+        size_t rawSize = 0;
+        AbstractFile* decryptedAbs = createAbstractFileFromFile(decFile);
+        AbstractFile* rawOut = createAbstractFileFromMemoryFile(&rawBuffer, &rawSize);
+        extractDmg(decryptedAbs, rawOut, -1);
+
+        std::ofstream out(rawImgPath, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            fprintf(stderr, "bakeRamdisk: cannot write %s\n", rawImgPath.c_str());
+            free(rawBuffer);
+            return false;
+        }
+        out.write((const char*)rawBuffer, (std::streamsize)rawSize);
+        free(rawBuffer);
+    } else {
+        std::error_code ec;
+        fs::copy_file(decDMG, rawImgPath, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            fprintf(stderr, "bakeRamdisk: cannot copy %s (%s)\n", decDMG.c_str(), ec.message().c_str());
+            return false;
+        }
+    }
+
+    // /blackb0x is a brand new top-level entry the pristine ramdisk never
+    // had — potentially tens of MB once the debcache/apt-lists/bake-time
+    // preinstall payload are all in it — and this old volume was never
+    // sized to hold anything beyond what Apple originally shipped. Growing
+    // an existing HFS+ volume in place isn't viable on Linux (every tool
+    // tried — in-memory xpwn grow_hfs(), libhfsp, libparted-fs-resize —
+    // turned out broken/unsupported for exactly this operation; see the
+    // design-history comment below patchRamdisk() used to carry, and
+    // docs/HISTORY.md), so instead: build a brand new volume sized to
+    // actually fit.
+    //
+    // "Actually fit" needs a real number, and there isn't a cheap way to
+    // get one ahead of time — `du` on a plain host directory (ext4, tmpfs,
+    // whatever) reports that filesystem's own block-rounded usage, not
+    // HFS+'s, and the gap between the two (per-file allocation-block
+    // rounding across a tree with thousands of small files — terminfo
+    // entries, dpkg's per-package .list/.md5sums, etc. — plus HFS+'s own
+    // catalog/allocation-file overhead) turned out to be large enough in
+    // practice to make that estimate genuinely unreliable: real bakes with
+    // it undercounted by several MB, not a rounding error. So instead of
+    // estimating, this assembles the real final content — original ramdisk
+    // + spliced launchd + /blackb0x — onto a generously oversized scratch
+    // HFS+ volume first, and asks that mounted HFS+ filesystem itself how
+    // much space its own content actually used (`du` against a live HFS+
+    // mount reports real HFS+ block counts via stat(), same as any other
+    // real, already-existing file on it — no guessing involved). That real
+    // number is what actually sizes the final volume; the scratch one is
+    // discarded immediately after.
+    MountGuard origMount;
+    origMount.mountpoint = makeTempDir("blackb0x-origmnt-");
+    if (origMount.mountpoint.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create a temp mountpoint\n");
+        return false;
+    }
+    if (!runCommand({"mount", "-t", "hfsplus", "-o", "loop,ro", rawImgPath, origMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to mount original ramdisk (are we running as root?)\n");
+        return false;
+    }
+    origMount.mounted = true;
+
+    std::string label = readVolumeLabel(rawImgPath);
+
+    std::string blackb0xStagingDir = makeTempDir("blackb0x-payload-");
+    if (blackb0xStagingDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create /blackb0x staging dir\n");
+        return false;
+    }
+    if (!stageBlackb0xTree(blackb0xStagingDir, productVersion)) {
+        fprintf(stderr, "bakeRamdisk: failed to stage /blackb0x\n");
+        return false;
+    }
+
+    // Comfortably larger than kMaxRamdiskSize below on purpose — this
+    // volume is never shipped, just measured and thrown away, so it only
+    // needs enough headroom that real content never fails to fit here
+    // regardless of how big /blackb0x turns out to be. If it doesn't fit
+    // even in this, the `cp -a` calls below fail loudly on their own.
+    constexpr uint64_t kScratchWorkingSize = 256ull * 1024 * 1024;
+    std::string scratchRawImgPath = decDMG + ".scratch-raw.hfs";
+    {
+        std::ofstream create(scratchRawImgPath, std::ios::binary | std::ios::trunc);
+        if (!create) {
+            fprintf(stderr, "bakeRamdisk: cannot create %s\n", scratchRawImgPath.c_str());
+            return false;
+        }
+    }
+    std::error_code scratchSizeEc;
+    fs::resize_file(scratchRawImgPath, kScratchWorkingSize, scratchSizeEc);
+    if (scratchSizeEc) {
+        fprintf(stderr, "bakeRamdisk: cannot size scratch volume (%s)\n", scratchSizeEc.message().c_str());
+        return false;
+    }
+    // -s: case-sensitive filenames, matching the real iOS/tvOS root
+    // filesystem (HFSX, not plain case-insensitive HFS+) — without it,
+    // mkfs.hfsplus defaults to case-insensitive, which broke a real cp -a
+    // here: ncurses' real terminfo database ships sibling first-letter
+    // buckets like `e`/`E` and `a`/`A` (genuinely distinct terminal names
+    // differing only in case), which collide under case-insensitive
+    // lookup ("cannot create directory: File exists") but are exactly what
+    // a case-sensitive volume is required to keep apart.
+    if (!runCommand({"mkfs.hfsplus", "-s", "-v", label, scratchRawImgPath})) {
+        fprintf(stderr, "bakeRamdisk: mkfs.hfsplus failed on %s\n", scratchRawImgPath.c_str());
+        return false;
+    }
+    copyVolumeHeaderMetadata(rawImgPath, scratchRawImgPath);
+
+    MountGuard scratchMount;
+    scratchMount.mountpoint = makeTempDir("blackb0x-scratchmnt-");
+    if (scratchMount.mountpoint.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create a temp mountpoint\n");
+        return false;
+    }
+    if (!runCommand({"mount", "-t", "hfsplus", "-o", "loop", scratchRawImgPath, scratchMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to mount scratch ramdisk\n");
+        return false;
+    }
+    scratchMount.mounted = true;
+
+    // -a preserves permissions/ownership (including setuid bits — this is
+    // a real Unix root filesystem, not just data files) and symlinks-as-
+    // symlinks rather than following them.
+    if (!runCommand({"cp", "-a", origMount.mountpoint + "/.", scratchMount.mountpoint + "/"})) {
+        fprintf(stderr, "bakeRamdisk: failed to copy original ramdisk contents\n");
+        return false;
+    }
+    if (!runCommand({"umount", origMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to unmount original ramdisk\n");
+        return false;
+    }
+    origMount.mounted = false;
+
+    // The one and only content change to anything the pristine ramdisk
+    // already shipped: /sbin/launchd's bytes become the built entrypoint
+    // binary, everything else about that catalog entry (mode/owner/group/
+    // mtime) preserved as-is by spliceFileContentInPlace() — see its own
+    // comment for why a blind overwrite isn't good enough. The `cp -a`
+    // above already carried over launchd's real permissions onto this
+    // scratch volume's copy, so splicing here works exactly the same as
+    // splicing in place on the original would have.
+    if (!spliceFileContentInPlace(scratchMount.mountpoint + "/sbin/launchd", entrypointBinaryPath)) {
+        return false;
+    }
+    if (!runCommand({"cp", "-a", blackb0xStagingDir + "/blackb0x", scratchMount.mountpoint + "/blackb0x"})) {
+        fprintf(stderr, "bakeRamdisk: failed to move staged /blackb0x into place\n");
+        return false;
+    }
+    std::error_code stagingRmEc;
+    fs::remove_all(blackb0xStagingDir, stagingRmEc);
+
+    sync();
+    // The real number: how much space the assembled content actually uses
+    // on an actual HFS+ filesystem, not an estimate.
+    uint64_t realContentSize = directoryContentSize(scratchMount.mountpoint);
+
+    // A flat 2MB margin here (covering just fixed per-volume overhead —
+    // volume header, alternate header, boot blocks, allocation bitmap) was
+    // tried and measured short in practice, real bakes still hit "No space
+    // left on device" partway through the final `cp -a` below. The likely
+    // reason: `realContentSize` is measured on a spacious 256MB scratch
+    // volume with plenty of contiguous free space to allocate into, but
+    // the same files packed onto a destination volume with very little
+    // slack left have much less room to lay out contiguously, so they
+    // fragment into more extents — and each extra extent costs additional
+    // catalog/extents-overflow B-tree records that don't show up in any
+    // per-file byte count. A percentage-of-content margin (not just a
+    // flat one) leaves proportionally more breathing room for that as
+    // content grows. kMaxRamdiskSize below is only a warning, not a hard
+    // ceiling, so there's no reason to cut this margin close.
+    constexpr uint64_t kFlatSizeMargin = 4ull * 1024 * 1024;
+    uint64_t percentSizeMargin = realContentSize / 10;
+    uint64_t newVolumeSize = realContentSize + std::max(kFlatSizeMargin, percentSizeMargin);
+
+    std::string newRawImgPath = decDMG + ".new-raw.hfs";
+    {
+        std::ofstream create(newRawImgPath, std::ios::binary | std::ios::trunc);
+        if (!create) {
+            fprintf(stderr, "bakeRamdisk: cannot create %s\n", newRawImgPath.c_str());
+            return false;
+        }
+    }
+    std::error_code volSizeEc;
+    fs::resize_file(newRawImgPath, newVolumeSize, volSizeEc);
+    if (volSizeEc) {
+        fprintf(stderr, "bakeRamdisk: cannot size new volume (%s)\n", volSizeEc.message().c_str());
+        return false;
+    }
+    // -s: see the scratch volume's mkfs.hfsplus call above for why.
+    if (!runCommand({"mkfs.hfsplus", "-s", "-v", label, newRawImgPath})) {
+        fprintf(stderr, "bakeRamdisk: mkfs.hfsplus failed on %s\n", newRawImgPath.c_str());
+        return false;
+    }
+    copyVolumeHeaderMetadata(rawImgPath, newRawImgPath);
+
+    MountGuard newMount;
+    newMount.mountpoint = makeTempDir("blackb0x-newmnt-");
+    if (newMount.mountpoint.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create a temp mountpoint\n");
+        return false;
+    }
+    if (!runCommand({"mount", "-t", "hfsplus", "-o", "loop", newRawImgPath, newMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to mount new ramdisk\n");
+        return false;
+    }
+    newMount.mounted = true;
+
+    // Single copy of the already-fully-assembled scratch content (original
+    // + spliced launchd + /blackb0x, all in one tree) onto the correctly-
+    // sized final volume — nothing left to splice or merge separately here.
+    if (!runCommand({"cp", "-a", scratchMount.mountpoint + "/.", newMount.mountpoint + "/"})) {
+        fprintf(stderr, "bakeRamdisk: failed to copy assembled content onto the final volume\n");
+        return false;
+    }
+    if (!runCommand({"umount", scratchMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to unmount scratch ramdisk\n");
+        return false;
+    }
+    scratchMount.mounted = false;
+    std::error_code scratchRmEc;
+    fs::remove(scratchRawImgPath, scratchRmEc);
+
+    sync();
+    if (!runCommand({"umount", newMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to unmount ramdisk\n");
+        return false;
+    }
+    newMount.mounted = false;
+
+    std::error_code oldRawRmEc;
+    fs::remove(rawImgPath, oldRawRmEc);
+    rawImgPath = newRawImgPath;
+
+    // Write the modified image back out, overwriting the decrypted file in
+    // place (replaces `hdiutil detach`) — rewrapped into UDIF only if the
+    // source was genuinely UDIF-wrapped to begin with; otherwise the raw
+    // HFS+ bytes are used directly, matching what decrypt() actually handed
+    // us.
+    std::error_code rmEc;
+    if (isUDIF) {
+        std::ifstream rawFile(rawImgPath, std::ios::binary);
+        if (!rawFile) {
+            fprintf(stderr, "bakeRamdisk: cannot open %s\n", rawImgPath.c_str());
+            return false;
+        }
+        std::ostringstream ss;
+        ss << rawFile.rdbuf();
+        std::string contents = ss.str();
+        size_t rawSize = contents.size();
+        void* rawBuffer = malloc(rawSize);
+        memcpy(rawBuffer, contents.data(), rawSize);
+
+        FILE* rebuiltFile = fopen(decDMG.c_str(), "wb");
+        if (!rebuiltFile) {
+            fprintf(stderr, "bakeRamdisk: cannot write %s\n", decDMG.c_str());
+            free(rawBuffer);
+            return false;
+        }
+        AbstractFile* rebuiltOut = createAbstractFileFromFile(rebuiltFile);
+        buildDmg(createAbstractFileFromMemoryFile(&rawBuffer, &rawSize), rebuiltOut, 2048);
+        free(rawBuffer);
+        fs::remove(rawImgPath, rmEc);
+    } else {
+        fs::remove(decDMG, rmEc);
+        fs::rename(rawImgPath, decDMG, rmEc);
+        if (rmEc) {
+            fprintf(stderr, "bakeRamdisk: failed to move the patched image into place (%s)\n", rmEc.message().c_str());
+            return false;
+        }
+    }
+
+    std::error_code outDirEc;
+    fs::create_directories(fs::path(patchedDMG).parent_path(), outDirEc);
+
+    decrypt(const_cast<char*>(decDMG.c_str()), const_cast<char*>(patchedDMG.c_str()), const_cast<char*>(key.c_str()),
+            const_cast<char*>(iv.c_str()), (char*)"FALSE", const_cast<char*>(path.c_str()));
+
+    // Tripwire on the finished, baked ramdisk. 70MB is a rule of thumb, not
+    // a number pulled from any documented, authoritative protocol limit
+    // for this old-era A4 restore process — there's no known spec stating
+    // real hardware/iBoot rejects a RestoreRamdisk component above some
+    // exact byte count. It's here because a ramdisk that's quietly grown
+    // far past every previously-known-working size deserves a loud flag at
+    // bake time, where it's cheap to notice — but since it's a rule of
+    // thumb and not a real protocol ceiling, exceeding it only warns, it
+    // doesn't fail the bake: this output may well work fine on real
+    // hardware, and the tripwire's job is to get someone to look, not to
+    // block a build that has no better alternative.
+    constexpr uint64_t kMaxRamdiskSize = 70ull * 1024 * 1024;
+    std::error_code finalSizeEc;
+    uint64_t finalSize = fs::file_size(patchedDMG, finalSizeEc);
+    if (finalSizeEc) {
+        fprintf(stderr, "bakeRamdisk: cannot stat finished ramdisk %s (%s)\n", patchedDMG.c_str(),
+                finalSizeEc.message().c_str());
+        return false;
+    }
+    if (finalSize > kMaxRamdiskSize) {
+        fprintf(stderr, "bakeRamdisk: WARNING!: finished ramdisk is %llu bytes, past the %llu byte rule-of-thumb "
+                        "tripwire — see kMaxRamdiskSize's own comment\n",
+                (unsigned long long)finalSize, (unsigned long long)kMaxRamdiskSize);
+        outSizeWarning = true;
+    }
+
+    return true;
+}

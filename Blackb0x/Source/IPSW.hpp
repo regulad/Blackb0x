@@ -12,14 +12,36 @@
 #pragma once
 
 #include <map>
+#include <optional>
+#include <set>
 #include <string>
 
 // A firmware component's decryption [iv, key] pair, as stored in
-// Blackb0x/Files/Keys/<device>/<device>_<buildID>.keys.
+// Blackb0x/ImageKeys/<device>/<device>_<buildID>.keys.
 struct FirmwareKeyPair {
     std::string iv;
     std::string key;
 };
+
+// Everything downloadAndPatchComponents() (Cli.cpp) and bake-all-ramdisks
+// (BakeAllRamdisks.cpp) both need out of a BuildManifest.plist — pulled out
+// of Cli.cpp so both can share one parser instead of drifting copies.
+struct ManifestInfo {
+    std::string realBuildID;     // BuildManifest.plist's own ProductBuildVersion
+    std::string productVersion;  // BuildManifest.plist's own ProductVersion (e.g. "6.1.3")
+    std::string iBSSPath;
+    std::string iBECPath;
+    std::string kernelCachePath;
+    std::string deviceTreePath;
+    std::string restoreRamdiskPath;  // empty if onlyBootComponents
+};
+
+// Parses BuildManifest.plist (already downloaded to `manifestPath`) for the
+// component paths and the manifest's own (possibly more specific) build ID
+// string — matching the original's `[dict[@"BuildIdentities"] lastObject]`
+// exactly (the LAST identity, not the first — BuildManifest.plist commonly
+// lists multiple personalization variants).
+std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool onlyBootComponents);
 
 // Plain HTTP GET via libcurl; returns the response body, or "" on failure.
 std::string httpGet(const std::string& url);
@@ -36,3 +58,16 @@ public:
     // [iv, key]) for the given device/build.
     std::map<std::string, FirmwareKeyPair> keysForDevice(const std::string& device, const std::string& buildID);
 };
+
+// GET https://api.ipsw.me/v4/device/<deviceModel>?type=ipsw — returns every
+// build ID Apple is still actively signing for this device right now
+// (per ipsw.me's own "signed" flag), for bake-all-ramdisks' --signed-only.
+// Unlike firmwareURLForDevice()'s v2.1 endpoint, this response IS JSON —
+// deliberately hand-extracted here (regex over the known-flat, no-nested-
+// braces firmware-entry shape) rather than pulling in a real JSON parser:
+// the only vendored libplist build with plist_from_json() (libplist-modern)
+// is a decoy that satisfies libimobiledevice-glue's configure-time version
+// probe and is never actually linked into any binary (see CMakeLists.txt)
+// — linking it for real here would risk exactly the kind of duplicate-
+// symbol ABI conflict this codebase has otherwise been careful to avoid.
+std::set<std::string> signedBuildsForDevice(const std::string& deviceModel);

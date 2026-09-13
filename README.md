@@ -111,12 +111,23 @@ sudo systemctl restart usbmuxd
 ## Steps to jailbreak
 
 0. (3,1 only) PWN with Arduino + [synackuk's fork of checkm8-A5](https://github.com/synackuk/checkm8-a5) first.
-1. Plug in your Apple TV via micro-USB **and** plug in the power cable.
-2. Run `sudo ./build/blackb0x` (root is required — raw USB access and the ramdisk
+1. Bake the ramdisks once, before ever running `blackb0x` itself:
+   `sudo ./build/bake-all-ramdisks --signed-only` (root is required here too — this
+   step loop-mounts a real HFS+ volume to patch it, the same raw-mount access
+   `blackb0x` itself needs for USB). `--signed-only` restricts the run to firmware
+   Apple is currently signing, typically just the latest one or two per device —
+   drop the flag to bake every known combination instead, including older/unsigned
+   ones, if your device is on an older firmware than what's currently signed.
+   `blackb0x` refuses to run at all against an empty `dist/`, and refuses a specific
+   device+firmware with no matching entry there — re-run this (without
+   `--signed-only`, if your device needs an older build) rather than trying to work
+   around either check.
+2. Plug in your Apple TV via micro-USB **and** plug in the power cable.
+3. Run `sudo ./build/blackb0x` (root is required — raw USB access and the ramdisk
    patching step both need it). Add `--dry-run` to preview the exploit/firmware steps
    without actually running the exploit or uploading anything to the device.
-3. Follow the on-screen instructions to enter DFU mode.
-4. Once the jailbreak finishes installing, connect to your TV and wait 5–10 minutes
+4. Follow the on-screen instructions to enter DFU mode.
+5. Once the jailbreak finishes installing, connect to your TV and wait 5–10 minutes
    until Kodi appears (be patient, go have a coffee).
 
 SSH access on the jailbroken device uses your own `~/.ssh/authorized_keys`, not a

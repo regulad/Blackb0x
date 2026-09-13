@@ -2,3 +2,17 @@
 **/.DS_Store
 /build/
 /.scratch/
+__pycache__/
+
+# bake-all-ramdisks' output (see Blackb0x/Source/BakeAllRamdisks.cpp) —
+# locally-produced artifacts, not something to check in.
+/dist/
+
+# entrypoint/'s build assets (Apple's own SDK, etc.) — Apple's copyrighted
+# material, reproducible locally per entrypoint/assets/README.md, not
+# something this project redistributes in its own git history.
+/entrypoint/assets/*
+!/entrypoint/assets/README.md
+# entrypoint/'s compiled output
+/entrypoint/entrypoint
+/entrypoint/obj/

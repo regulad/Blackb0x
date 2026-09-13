@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+      <string>xyz.regulad.blackb0x.postinstall</string>
+    <key>ProgramArguments</key>
+      <array>
+		<string>/bin/bash</string>
+		<string>/var/mobile/.blackb0x/postinstall.sh</string>
+      </array>
+    <key>StandardErrorPath</key>
+      <string>/var/mobile/.blackb0x/postinstall.err.log</string>
+    <key>StandardOutPath</key>
+      <string>/var/mobile/.blackb0x/postinstall.out.log</string>
+    <key>RunAtLoad</key>
+      <true/>
+    <key>UserName</key>
+      <string>root</string>
+</dict>
+</plist>

@@ -54,17 +54,45 @@ original macOS Cocoa/Objective-C app (the `.m`/`.mm`/`.h` files still in
 
 - `Blackb0x/Source/` — the ported C++, and nothing else: `main.cpp`, `Cli.hpp`/`.cpp`,
   `DeviceManager.hpp`/`.cpp`, `IPSW.hpp`/`.cpp`, `IPSWDownloader.hpp`/`.cpp`,
-  `Patcher.hpp`/`.cpp`, `ResourcePath.hpp`/`.cpp`. The original Objective-C
-  (`AppDelegate`, `MainView`, `Blackb0x.h`/`.m`, `TaskManager`, and the old
-  `.h`/`.m`/`.mm` counterparts of the files above) has been fully ported and deleted —
-  check `docs/HISTORY.md`/git history if you need to see what it looked like.
-  `checkm8.h`/`SHAtter.h` are exploit payload byte arrays, `#include`d directly by
-  `DeviceManager.cpp` — not leftover Cocoa, keep these.
+  `Patcher.hpp`/`.cpp`, `ResourcePath.hpp`/`.cpp`, `BakeRamdisk.hpp`/`.cpp`,
+  `BakeAllRamdisks.cpp`. The original Objective-C (`AppDelegate`, `MainView`,
+  `Blackb0x.h`/`.m`, `TaskManager`, and the old `.h`/`.m`/`.mm` counterparts of the
+  files above) has been fully ported and deleted — check `docs/HISTORY.md`/git
+  history if you need to see what it looked like. `checkm8.h`/`SHAtter.h` are exploit
+  payload byte arrays, `#include`d directly by `DeviceManager.cpp` — not leftover
+  Cocoa, keep these.
 - `Blackb0x/Libraries/` — already-portable C kept in-tree and built directly by the
   root `CMakeLists.txt`: `CBPatcher.c`/`libcbpatcher/`, `libiboot32patcher.c`/
   `libiboot32patcher/`, `xpwntool.c`. `libbootkit/` is dead code, linked into nothing.
-- `Blackb0x/Files/` — payload data (Cydia tarball, keys, `setup.sh`) shipped to the
-  jailbroken Apple TV itself; needs no porting.
+- `Blackb0x/ramdisk/` — the ramdisk overlay payload shipped to the jailbroken Apple TV
+  itself, checked in as loose files (no `.tar`/`.tgz`) mirroring their destination
+  paths, merged onto the mounted ramdisk via one `cp -a` (single unconditional
+  tree — no more SSH-only vs full-Cydia split, so no reason to split the tree
+  itself either; it used to be `common/`+`cydia/` subdirectories for exactly that
+  now-gone distinction). Host key generation and SSH access are no longer baked in
+  here at all — see `BakeRamdisk.cpp`/`DeviceManager::pushAuthorizedKeys()`. A
+  large chunk of `ramdisk/files/cydia/` and `ramdisk/files/p0sixspwn/` is actually
+  pre-extracted content that originally came from real Cydia `.deb` packages
+  (identifiable via the dpkg `.list` manifests still present under
+  `private/var/lib/dpkg/info/` in each) — the eventual goal is to source those
+  packages for real and build this tree from them at bake time instead of
+  checking in the already-extracted result (unowned by `mobile`, permissions not
+  representative of a real device). Not done yet. Needs no porting.
+- `Blackb0x/Debs/` — loose `.deb` packages that `setup.sh` `dpkg -i`'s at first
+  boot, merged into `/files/` on the ramdisk alongside (but separately from) the
+  `ramdisk/` tree by `bakeRamdisk()` — kept apart because these are real package
+  archives, not loose files mirroring a destination path. Same eventual goal as
+  `ramdisk/files/cydia/` above: source these from real Cydia repos rather than
+  checking in the `.deb` bytes.
+- `dist/` — bake-all-ramdisks' output (gitignored, not checked in): one
+  `<device>_<buildID>-Ramdisk.dmg` per known firmware, plus a `.sum` sidecar per
+  entry recording a `Blackb0x/ramdisk/` + `Blackb0x/Debs/` content hash at bake
+  time (see `ResourcePath`'s `ramdiskOverlayContentHash()`/`sumFileFor()`) —
+  re-running bake-all-ramdisks after editing either re-bakes anything whose
+  sidecar no longer matches, and `Patcher::patchRamdisk()` refuses a `dist/`
+  entry whose sidecar is stale rather than silently uploading old content.
+- `Blackb0x/ImageKeys/` — per-firmware IPSW decryption `.keys` files, read locally by
+  `IPSW.cpp` only; never shipped to the device.
 - `third_party/` — every vendored dependency (see table below).
 - `docs/HISTORY.md` — the full debugging/decision log.
 
@@ -93,12 +121,34 @@ statically linked. **Forked** means: patched on our own branch, pushed, pointed 
 
 ```
 cmake -S . -B build && cmake --build build -j$(nproc)
+
+# Once, in bulk, for every known firmware — NOT run by blackb0x itself.
+# Writes dist/<device>_<buildID>-Ramdisk.dmg per firmware (gitignored):
+sudo ./build/bake-all-ramdisks [--signed-only]
+
 sudo ./build/blackb0x [--ecid <id> | --udid <id>] [--tether-boot] [--dry-run]
 ```
 
-`blackb0x` **must run as root** — DFU-mode USB access and `patchRamdisk()`'s loop-mount
-(`CAP_SYS_ADMIN`/`CAP_CHOWN`) both need it. No udev rules, no install step — it runs
-from wherever it's built.
+Two binaries, deliberately separated by privilege:
+
+- **`bake-all-ramdisks`** is the only piece of this tool that needs `CAP_SYS_ADMIN`/
+  `CAP_CHOWN` (loop-mounting a real HFS+ image — see `BakeRamdisk.hpp`'s header
+  comment for why an in-process, no-mount approach isn't viable). For every
+  `.keys` file under `Blackb0x/ImageKeys/` (i.e. every known device/firmware
+  combination), it downloads that firmware's `RestoreRamDisk` component and merges
+  the `Blackb0x/ramdisk/` overlay into it, writing each result to
+  `dist/<device>_<buildID>-Ramdisk.dmg`. `--signed-only` restricts this to builds
+  ipsw.me currently reports Apple as still signing (a small fraction of the total —
+  what most real devices are actually on). The overlay is fully static (no
+  per-device secrets get baked in), so each patched output is valid for every
+  device on that firmware; there's no reason to re-derive it on every `blackb0x`
+  run, so `blackb0x` itself never invokes this — `Patcher::patchRamdisk()` just
+  checks whether the `dist/` entry it needs already exists, and tells you to run
+  `bake-all-ramdisks` if not. Re-running is cheap: any `dist/` entry that already
+  exists is skipped.
+- **`blackb0x`** drives everything else (DFU discovery, the exploit, uploads, AFC2)
+  and only needs root for raw DFU-mode USB access. No udev rules, no install step —
+  both binaries run from wherever they're built.
 
 **Build-time system dependencies, verified against a real fresh clone + build (see
 README for the full list)**: a C/C++ toolchain, GNU make, CMake ≥3.16,
@@ -109,19 +159,27 @@ autoconf/automake/libtool/pkg-config (most of the tree is autotools-based), and
 
 **Runtime requirements beyond the build** (not just build-time deps):
 - `mkfs.hfsplus`/`fsck.hfsplus` (`hfsprogs` package) and a kernel with `hfsplus`
-  support (`CONFIG_HFSPLUS_FS`) — needed by `patchRamdisk()`.
-- `mount`/`umount`/`blkid`/`cp`/`tar` (invoked directly as subprocesses, no shell) —
-  also `patchRamdisk()`. Assumed present on any mainstream distro, not called out as
-  a separate install step.
+  support (`CONFIG_HFSPLUS_FS`) — needed by `bake-ramdisk`, not `blackb0x` itself.
+- `mount`/`umount`/`blkid`/`cp` (invoked directly as subprocesses, no shell) — also
+  `bake-ramdisk` only. Assumed present on any mainstream distro, not called out as a
+  separate install step.
+- `python3` and `podman` — `bake-all-ramdisks` shells out to
+  `scripts/build_deb_cache.py` (via `python3`, which shells out to `podman`
+  itself) to resolve the debcache picklist fresh on every bake; see
+  `BakeRamdisk.cpp`'s `buildPicklist()`. Same `$SUDO_USER`/`runuser`
+  re-invocation as the existing `entrypoint/` podman calls, for the same
+  reason (podman's own rootless storage belongs to the real invoking user,
+  not root's).
 - `usbmuxd` itself must be installed (a separate requirement from the point below —
   most distros package it separately, e.g. `usbmuxd`), and **must run with
   `--no-preflight`** (a systemd drop-in — `/etc/systemd/system/usbmuxd.service.d/
   override.conf` — is the documented way; see `docs/HISTORY.md` for exactly why) or
   Normal-mode device discovery silently never fires. Both of these have to ship in
   the end-user README.
-- The invoking user's own `~/.ssh/authorized_keys` must exist — `patchRamdisk()`
-  refuses to proceed without it (no shared default key is ever baked into the
-  ramdisk).
+- The invoking user's own `~/.ssh/authorized_keys`, if SSH access is wanted —
+  `blackb0x` pushes it over AFC2 once the jailbreak is confirmed running (see
+  `DeviceManager::pushAuthorizedKeys()`); missing is a warning, not a hard failure,
+  since (unlike the old ramdisk-baked path) nothing else depends on it.
 - `stdbuf` (GNU coreutils) — **required**, not optional: `runGaster()`
   (`DeviceManager.cpp`) checks for it on `PATH` before ever forking `gaster` and
   refuses to run the exploit at all if it's missing, rather than silently falling
@@ -133,6 +191,14 @@ autoconf/automake/libtool/pkg-config (most of the tree is autotools-based), and
   `gaster` for the DFU-mode device mid-exploit; see `docs/HISTORY.md` for exactly
   why. Same pattern as `usbmuxd --no-preflight` above: a documented one-time manual
   step, not something `blackb0x` checks or fixes for you at runtime.
+
+## External references
+
+- [ATV3 jailbreak writeup PDF](https://elhacker.info/Books/BOOKS%20PART%206/atv3_jb-.pdf)
+  — potentially explains the `jsc` (JavaScriptCore) framework reference and the
+  `/mnt/--early-boot` symlink found in the `etasonATV` branch of `entrypoint/`'s
+  reverse-engineered install logic (see `Blackb0x/Misc/README.md`) — both were
+  flagged there as "we replicate the action, not the underlying mechanism."
 
 ## Current status
 

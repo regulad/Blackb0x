@@ -2251,3 +2251,31 @@ model (`checkm8`, the wolfSSL/SSLv3 lockdownd handshake, the real-usbmuxd/
 external Arduino hardware, see `checkExploit()` in `Cli.cpp`) are implemented from
 source/protocol analysis and the original app's own logic, not from a real device —
 treat those two paths as unverified until someone tests on the actual hardware.
+
+## Entrypoint injection point: backstepped from `/etc/rc.boot` to `/sbin/launchd`
+
+The original (pre-rewrite) tool always spliced its PID-1 replacement into
+`/sbin/launchd` (see `.claude/LEGACY_FLOW.md`'s Stage 1). Mid-rewrite, real
+disassembly of an AppleTV2,1 10B809 `RestoreRamdisk` showed `/etc/rc.boot`
+itself is LC_MAIN-entered directly by the kernel on that firmware — not
+merely a preamble before `launchd` — so `bakeRamdisk()`'s
+`spliceFileContentInPlace()` call was switched to target `/etc/rc.boot`
+instead, on the theory that injecting at the true first entry point is
+strictly better than injecting at `launchd`.
+
+That assumption didn't generalize. A real bake against AppleTV3,1/AppleTV3,2
+12H606 failed with `/etc/rc.boot does not exist on the mounted volume`.
+Mounting that firmware's actual ramdisk and inspecting it directly (not
+guessing) showed `/etc/` on that build is nearly empty (just empty `group`
+and `master.passwd` files) — no `rc.boot` at all — while `/sbin/launchd`
+does exist. So the 10B809 finding was real but firmware-specific, not a
+property of these restore ramdisks in general: at least one later firmware
+generation dropped `rc.boot` as a kernel-invoked stage entirely.
+
+Reverted to always targeting `/sbin/launchd` universally — the same choice
+the original tool made, and the one thing guaranteed to exist and be real
+PID-1 across every firmware generation, rather than trying to detect or
+special-case which injection point a given firmware uses. The ad-hoc
+signing identity changed to match: `com.apple.launchd` (was `com.apple.rc`,
+matching `/etc/rc.boot`'s own CodeDirectory identifier — no longer
+applicable now that the splice target is `launchd` again).

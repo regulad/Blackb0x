@@ -1,0 +1,111 @@
+# Package names (the real `Package:` control field, not the .deb filename)
+# whose postinst does genuine, non-trivial, stateful, or runtime-dependent
+# work — conditional edits to shared files based on their existing content,
+# runtime firmware/binary detection, binary patching, migration logic, etc.
+# — audited directly by extracting every currently-vendored .deb's control
+# archive and reading every postinst script found (62 of 69 packages had
+# none at all).
+#
+# BakeRamdisk.cpp's bake-time preinstall mechanism (see
+# computePreinstallEligibleFilenames()/stagePreinstalledPackages()) skips
+# any resolved package whose name appears here: it stays a real .deb in
+# postinstall.sh's own apt-driven install instead of being unpacked +
+# marked installed at bake time. Everything else that DOES have a real
+# postinst but ISN'T listed here (currently just
+# com.firecore.freemem-watcher — its whole postinst is a bare `launchctl
+# load` of its own bundled plist, redundant with what a fresh boot already
+# does automatically for any RunAtLoad LaunchDaemon) gets a real `dpkg
+# --configure` at bake time same as everything else, just with that one
+# script deleted first so it configures as a genuine no-op instead of
+# actually running inside the bootstrap container (which has no
+# iOS-specific tools like `launchctl` at all) — see
+# computePreinstallEligibleFilenames()'s own comment for why running real
+# --configure (not a hand-rolled status-file edit) is what's actually
+# needed here: this ecosystem has a genuine circular Pre-Depends: chain
+# right at its bootstrap root (dpkg -> tar -> gzip/lzma -> sed -> dpkg)
+# that only a real, forced debootstrap-style unpack-then-configure pass
+# can resolve correctly.
+#
+# com.ih8sn0w-squiffy-winocm.p0sixspwn also never actually resolves through
+# real apt at all today (its Depends: firmware range doesn't match this
+# project's sandboxed resolution — see Blackb0x/Misc/README.md), so this
+# entry is belt-and-suspenders: it belongs here on its own postinst's
+# merits regardless of whether that separate exclusion ever changes.
+com.ih8sn0w-squiffy-winocm.p0sixspwn
+org.xbmc.kodi-seatbeltunlock
+com.nito.nitotv
+org.xbmc.kodi-atv2
+cydia
+
+# --- unmet real Depends:, not a postinst/preinst issue -------------------
+#
+# essential has neither a postinst nor a preinst (confirmed by extracting
+# its control/data archives directly — both are empty beyond the top-level
+# directory entry) — it's excluded for a completely different reason: its
+# one real Depends: (`cydia | com.ripdev.icy`) can never be satisfied at
+# bake time, since cydia is deliberately never bake-time-preinstalled
+# (it's on the postinst list above, for real reasons of its own). Without
+# this exclusion, computePreinstallEligibleFilenames() would mark essential
+# eligible anyway (its Depends: group doesn't trigger the normal
+# transitive-blacklist-propagation check, since "cydia" the package name
+# never appears in packages.txt's own resolved set at all — it's installed
+# by a separate, hardcoded postinstall.sh line, not through apt resolution)
+# — and stagePreinstalledPackages()'s real `apt-get check` would then
+# correctly flag that unmet Depends: as broken, exactly like the
+# `Depends: firmware (>= X)` false positive documented elsewhere (see
+# kPreinstallInnerScript's own synthetic "firmware" package comment) —
+# except there's no safe synthetic stand-in for "cydia" the way there is
+# for "firmware": cydia's own postinst has to actually run for real
+# exactly once, and a fake "already installed" stub risks apt/dpkg never
+# giving it that real, one-time chance later. essential's .deb still gets
+# staged into the real on-device apt cache like anything else (see
+# Blackb0x/Misc/local_only_debs.txt) — Blackb0x/Misc/postinstall.sh just
+# `dpkg -i`s it directly, after cydia has genuinely been installed for
+# real, instead of asking apt to resolve it by name (which it can't do —
+# see local_only_debs.txt for why) or bake-time-preinstalling it (which
+# this entry prevents).
+essential
+
+# --- preinst, a separate audit from the above ---------------------------
+#
+# preinst runs unconditionally DURING `dpkg --unpack` itself, before a
+# plain post-hoc file delete could intervene the way stripping a trivial
+# postinst works — so a package with a genuinely non-trivial preinst has
+# no safe "strip and continue" option at all, unlike postinst. These four
+# ARE real, enforced blacklist entries (not just documentation the way the
+# preinst section used to claim before actually reading every one of
+# them): being on this list is the only thing that excludes them.
+#
+# Found by the same method as the postinst audit (extract every
+# currently-vendored .deb's control archive, check for a preinst member,
+# read every one found) — five candidates turned up, not four:
+#   - firmware-sbin: backs up real device system binaries (/sbin/fsck,
+#     /sbin/fstyp_hfs, /sbin/mount, /sbin/mount_hfs, /sbin/newfs_hfs,
+#     /usr/sbin/nvram) to .sbin-suffixed copies on install/upgrade — none
+#     of these paths exist in a bootstrap sandbox at all.
+#   - rtadvd: same pattern, backs up /usr/sbin/rtadvd if present.
+#   - pam, pam-modules: both call /usr/libexec/cydia/move.sh (Cydia's own
+#     stash-relocation helper) on install/upgrade — real Cydia
+#     infrastructure that doesn't exist until Cydia itself is actually
+#     installed and has run its own first-boot setup.
+#   - ncurses was the fifth candidate, and looked just as disqualifying at
+#     first — preinst is a real compiled ARM Mach-O executable, not a
+#     script, so it couldn't be read the same way. Disassembled it
+#     directly instead (real capstone-based decompilation of the actual
+#     binary, not a guess) rather than assuming "can't read it" meant
+#     "must exclude it": the whole thing is `if (argv[1] == "install" ||
+#     (argv[1] == "upgrade" && strncmp(argv[2], "5.6-", 4) == 0)) {
+#     unlink("/usr/lib/_ncurses"); symlink("/usr/lib", "/usr/lib/_ncurses");
+#     }` — a harmless compatibility-symlink migration, identical on any
+#     platform, no device state involved at all. Excluding it anyway would
+#     have cascaded hard: dpkg itself Depends: ncurses, and nearly every
+#     other package here Pre-Depends: dpkg, so losing ncurses would have
+#     collapsed the eligible set down to almost nothing. Left OFF this
+#     list on the strength of that finding — computePreinstallEligibleFilenames()
+#     rebuilds its .deb with the (confirmed-trivial) preinst stripped
+#     before unpacking, the same real-inspection treatment postinst
+#     already gets, rather than a blanket "any preinst = exclude" rule.
+firmware-sbin
+rtadvd
+pam
+pam-modules

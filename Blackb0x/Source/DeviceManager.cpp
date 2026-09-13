@@ -732,6 +732,53 @@ int isJailbreakRunning(const std::string& udid) {
     return 1;
 }
 
+bool pushAuthorizedKeys(const std::string& udid, const std::string& authorizedKeysContents) {
+    idevice_t device = nullptr;
+    if (idevice_new(&device, udid.c_str()) != IDEVICE_E_SUCCESS) {
+        return false;
+    }
+
+    lockdownd_client_t lockdown_client = nullptr;
+    if (lockdownd_client_new_with_handshake(device, &lockdown_client, "blackb0x") != LOCKDOWN_E_SUCCESS) {
+        idevice_free(device);
+        return false;
+    }
+
+    lockdownd_service_descriptor_t port = nullptr;
+    if (lockdownd_start_service(lockdown_client, "com.apple.afc2", &port) != LOCKDOWN_E_SUCCESS) {
+        lockdownd_client_free(lockdown_client);
+        idevice_free(device);
+        return false;
+    }
+
+    afc_client_t afc_client = nullptr;
+    if (afc_client_new(device, port, &afc_client) != AFC_E_SUCCESS) {
+        lockdownd_client_free(lockdown_client);
+        idevice_free(device);
+        return false;
+    }
+
+    // May already exist (harmless — afc_make_directory just fails EEXIST-ish
+    // in that case); either way afc_file_open below is what actually matters.
+    afc_make_directory(afc_client, "/private/var/root/.ssh");
+
+    bool ok = false;
+    uint64_t handle = 0;
+    if (afc_file_open(afc_client, "/private/var/root/.ssh/authorized_keys", AFC_FOPEN_WRONLY, &handle) ==
+        AFC_E_SUCCESS) {
+        uint32_t written = 0;
+        ok = afc_file_write(afc_client, handle, authorizedKeysContents.data(),
+                             (uint32_t)authorizedKeysContents.size(), &written) == AFC_E_SUCCESS &&
+             written == authorizedKeysContents.size();
+        afc_file_close(afc_client, handle);
+    }
+
+    afc_client_free(afc_client);
+    lockdownd_client_free(lockdown_client);
+    idevice_free(device);
+    return ok;
+}
+
 // waitForAFC2's original recursive NSThread-sleep retry, now a plain
 // blocking loop — safe because it always runs on a detached background
 // thread (see DeviceManager::checkJailbreak).

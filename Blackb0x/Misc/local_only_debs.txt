@@ -1,0 +1,21 @@
+# .deb filenames (not package names — matches Blackb0x/Debs/'s own naming)
+# that scripts/build_deb_cache.py includes directly from Blackb0x/Debs/
+# without ever attempting real apt resolution for them at all — for
+# packages that are genuinely dead upstream (no configured repo's Packages
+# index carries them anymore, confirmed via a real "E: Unable to locate
+# package" from apt itself, not assumed) but that this project already has
+# a real, previously-recovered .deb for.
+#
+# This is NOT the same situation as com.ih8sn0w-squiffy-winocm.p0sixspwn
+# (which DOES have a real Packages stanza — apt finds it fine — it just
+# genuinely doesn't satisfy its own Depends: firmware constraint against
+# this project's synthetic firmware version, which is correct, expected
+# behavior for a firmware-version-gated package, not a dead-upstream one).
+# That distinction is why this is a separate list from the ordinary
+# packages.txt resolution flow, rather than one more tolerated warning.
+#
+# Entries here are still checked against Blackb0x/Misc/prebake_package_blacklist.txt
+# like anything else in picklist.txt — see that file for why "essential"
+# is listed there too (real, unmet Depends: on cydia, which is
+# deliberately never bake-time-preinstalled).
+essential_0-1_iphoneos-arm.deb

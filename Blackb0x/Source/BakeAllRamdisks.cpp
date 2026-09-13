@@ -1,0 +1,254 @@
+//
+//  BakeAllRamdisks.cpp
+//  bake-all-ramdisks
+//
+//  Batch driver for bakeRamdisk() (BakeRamdisk.hpp/.cpp) — the only binary
+//  that actually calls it. Walks every .keys file under Blackb0x/ImageKeys/
+//  (i.e. every (device model, firmware build) combination this port has
+//  decryption keys for), downloads that firmware's RestoreRamdisk component
+//  and bakes it, writing results to dist/<device>_<buildID>-Ramdisk.dmg.
+//
+//  This is the one-time-per-firmware step described in BakeRamdisk.hpp's
+//  header comment, done for every known firmware at once rather than one
+//  at a time — blackb0x itself never runs this; Patcher::patchRamdisk()
+//  just checks whether the dist/ entry it needs already exists.
+//
+//  Each dist/ entry gets a sidecar dist/<...>-Ramdisk.dmg.sum (see
+//  ResourcePath's sumFileFor()/ramdiskOverlayContentHash()) recording a
+//  fingerprint of Blackb0x/ramdisk/ at bake time — re-running this after
+//  editing ramdisk/ re-bakes anything whose sidecar no longer matches,
+//  instead of trusting a stale already-baked file. Patcher::patchRamdisk()
+//  checks the same sidecar before trusting a dist/ entry for the same
+//  reason.
+//
+//  Usage: sudo ./bake-all-ramdisks [--signed-only]
+//  (needs CAP_SYS_ADMIN/CAP_CHOWN, same as bakeRamdisk() itself — see its
+//  header comment for why)
+//
+//  --signed-only restricts the run to builds ipsw.me still reports Apple as
+//  actively signing for that device right now — typically just the latest
+//  one or two per device (7 out of 92 known builds, checked live 2026-09-11),
+//  which is what the vast majority of real devices will actually be on.
+//
+
+#include "BakeRamdisk.hpp"
+#include "IPSW.hpp"
+#include "IPSWDownloader.hpp"
+#include "ResourcePath.hpp"
+
+extern "C" {
+#include <xpwn/libxpwn.h>
+}
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <utility>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+// Every (device, buildID) pair this port has a .keys file for — read
+// straight from the directory structure (Blackb0x/ImageKeys/<device>/
+// <device>_<buildID>.keys), not some separate hardcoded list, so this
+// tracks ImageKeys/ automatically as devices/builds are added or removed.
+static std::vector<std::pair<std::string, std::string>> knownFirmwareTargets() {
+    std::vector<std::pair<std::string, std::string>> targets;
+    std::string keysRoot = resolveImageKeyPath("");
+
+    std::error_code deviceEc;
+    for (const auto& deviceDir : fs::directory_iterator(keysRoot, deviceEc)) {
+        if (deviceEc || !deviceDir.is_directory()) continue;
+        std::string device = deviceDir.path().filename().string();
+        std::string prefix = device + "_";
+
+        std::error_code fileEc;
+        for (const auto& entry : fs::directory_iterator(deviceDir.path(), fileEc)) {
+            if (fileEc || entry.path().extension() != ".keys") continue;
+            std::string stem = entry.path().stem().string();  // "<device>_<buildID>"
+            if (stem.rfind(prefix, 0) != 0) continue;
+            targets.emplace_back(device, stem.substr(prefix.size()));
+        }
+    }
+    std::sort(targets.begin(), targets.end());
+    return targets;
+}
+
+int main(int argc, char** argv) {
+    bool signedOnly = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--signed-only") == 0) {
+            signedOnly = true;
+        } else {
+            fprintf(stderr, "bake-all-ramdisks: unrecognized argument %s\n", argv[i]);
+            fprintf(stderr, "usage: bake-all-ramdisks [--signed-only]\n");
+            return 2;
+        }
+    }
+
+    TestByteOrder();
+
+    auto targets = knownFirmwareTargets();
+    if (targets.empty()) {
+        fprintf(stderr, "bake-all-ramdisks: no .keys files found under %s\n", resolveImageKeyPath("").c_str());
+        return 1;
+    }
+
+    if (signedOnly) {
+        size_t before = targets.size();
+        // One ipsw.me lookup per unique device, not per (device, buildID)
+        // pair — every build of the same device shares one signed-set query.
+        std::map<std::string, std::set<std::string>> signedByDevice;
+        std::vector<std::pair<std::string, std::string>> filtered;
+        for (auto& [device, buildID] : targets) {
+            auto found = signedByDevice.find(device);
+            if (found == signedByDevice.end()) {
+                found = signedByDevice.emplace(device, signedBuildsForDevice(device)).first;
+            }
+            if (found->second.count(buildID)) filtered.push_back({device, buildID});
+        }
+        targets = std::move(filtered);
+        printf("--signed-only: %zu of %zu known combinations are currently signed by Apple.\n", targets.size(),
+               before);
+        if (targets.empty()) {
+            fprintf(stderr, "bake-all-ramdisks: nothing to do (ipsw.me reports nothing currently signed)\n");
+            return 1;
+        }
+    }
+
+    fs::create_directories("dist");
+    printf("Found %zu known (device, firmware) combinations.\n", targets.size());
+
+    // Computed once — identical for every firmware in this run. Compared
+    // against each dist/ entry's .sum sidecar (see ResourcePath.hpp) so
+    // editing ramdisk/ and re-running this picks up the change instead of
+    // trusting a stale already-baked file.
+    std::string overlayHash = ramdiskOverlayContentHash();
+
+    // Built once — same binary gets spliced into every firmware's ramdisk
+    // (see BakeRamdisk.hpp's bakeRamdisk() comment), so there's no reason
+    // to pay for the podman build again per target.
+    std::string entrypointBinaryPath = buildEntrypointBinary();
+    if (entrypointBinaryPath.empty()) {
+        fprintf(stderr, "bake-all-ramdisks: failed to build entrypoint/ — see stderr above\n");
+        return 1;
+    }
+
+    // Fail-fast, deliberately: computeGlobalDebcacheOnce() (BakeRamdisk.cpp)
+    // caches its result across every firmware target in this run, so a real
+    // failure in it (a broken dpkg/apt state, a bad .deb, etc.) isn't "this
+    // one target had a problem" — every remaining target shares the exact
+    // same cached failure and would fail identically. Continuing the loop
+    // after any failure here just re-demonstrates the same root cause
+    // several more times before reporting it; dying immediately on the
+    // first one gets to the real error faster.
+    size_t succeeded = 0;
+    size_t warned = 0;
+
+    for (size_t i = 0; i < targets.size(); i++) {
+        const std::string& device = targets[i].first;
+        const std::string& buildID = targets[i].second;
+        std::string label = device + " " + buildID;
+        std::string outputPath = "dist/" + device + "_" + buildID + "-Ramdisk.dmg";
+        std::string sumPath = sumFileFor(outputPath);
+
+        printf("[%zu/%zu] %s: ", i + 1, targets.size(), label.c_str());
+        fflush(stdout);
+
+        if (fs::exists(outputPath)) {
+            std::string storedHash;
+            std::ifstream sumIn(sumPath);
+            if (sumIn) std::getline(sumIn, storedHash);
+            if (storedHash == overlayHash) {
+                printf("already baked, overlay unchanged, skipping\n");
+                succeeded++;
+                continue;
+            }
+            printf("overlay changed since last bake, re-bakeing...\n");
+        }
+
+        IpswFetch fetcher;
+        std::string firmwareURL = fetcher.firmwareURLForDevice(device, buildID);
+        if (firmwareURL.empty()) {
+            printf("FAILED (no firmware URL)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: no firmware URL from ipsw.me\n", label.c_str());
+            return 1;
+        }
+
+        FragmentDownloader downloader(firmwareURL);
+        if (!downloader.open()) {
+            printf("FAILED (could not open remote IPSW)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: could not open remote IPSW\n", label.c_str());
+            return 1;
+        }
+
+        std::string workDir = ipswDataRoot() + "/" + device + "/" + buildID;
+        fs::create_directories(workDir);
+
+        std::string manifestPath = workDir + "/BuildManifest.plist";
+        if (!downloader.downloadComponent("BuildManifest.plist", manifestPath, nullptr)) {
+            printf("FAILED (BuildManifest.plist download)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: failed to download BuildManifest.plist\n", label.c_str());
+            return 1;
+        }
+
+        auto manifest = parseManifest(manifestPath, /*onlyBootComponents=*/false);
+        if (!manifest || manifest->restoreRamdiskPath.empty()) {
+            printf("FAILED (no RestoreRamDisk in manifest)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: no RestoreRamDisk component in BuildManifest.plist\n",
+                    label.c_str());
+            return 1;
+        }
+
+        std::string localRamdiskPath = workDir + "/" + fs::path(manifest->restoreRamdiskPath).filename().string();
+        if (!downloader.downloadComponent(manifest->restoreRamdiskPath, localRamdiskPath, nullptr)) {
+            printf("FAILED (RestoreRamDisk download)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: failed to download RestoreRamDisk\n", label.c_str());
+            return 1;
+        }
+
+        // Deliberately keyed by the buildID from the .keys filename we're
+        // already processing, not manifest->realBuildID — they usually
+        // agree, but if they ever don't, re-deriving the lookup from
+        // realBuildID risks asking keysForDevice() for a .keys file other
+        // than the one we started from.
+        auto keys = fetcher.keysForDevice(device, buildID);
+        auto it = keys.find("RestoreRamdisk");
+        if (it == keys.end()) {
+            printf("FAILED (no RestoreRamdisk key)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: no RestoreRamdisk entry in .keys file\n", label.c_str());
+            return 1;
+        }
+
+        bool sizeWarning = false;
+        if (!bakeRamdisk(localRamdiskPath, it->second.key, it->second.iv, manifest->productVersion, outputPath,
+                          entrypointBinaryPath, sizeWarning)) {
+            printf("FAILED (bake)\n");
+            fprintf(stderr, "bake-all-ramdisks: %s: bakeRamdisk() failed — see stderr above\n", label.c_str());
+            return 1;
+        }
+
+        std::ofstream sumOut(sumPath, std::ios::trunc);
+        sumOut << overlayHash << "\n";
+
+        if (sizeWarning) {
+            printf("OK (with size warning, see stderr) -> %s\n", outputPath.c_str());
+            warned++;
+        } else {
+            printf("OK -> %s\n", outputPath.c_str());
+        }
+        succeeded++;
+    }
+
+    printf("\n%zu/%zu succeeded", succeeded, targets.size());
+    if (warned > 0) {
+        printf(" (%zu with a size warning, see stderr above)", warned);
+    }
+    printf(".\n");
+
+    return 0;
+}

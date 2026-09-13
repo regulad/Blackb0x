@@ -70,7 +70,7 @@ public:
     bool patchiBSS(const std::string& path);
     bool patchiBEC(const std::string& path, const std::string& flags = "", bool ticket = true);
     bool patchKernel(const std::string& path, const std::string& productVersion);
-    bool patchRamdisk(const std::string& path, bool ssh = false);
+    bool patchRamdisk(const std::string& path);
 
     void setDeviceTreePath(const std::string& path);
 
@@ -85,6 +85,11 @@ private:
     IpswFetch fetcher_;
     std::map<std::string, FirmwareKeyPair> keys_;
     PatchedComponents outputs_;
+    // Set by loadKeysForDevice() — patchRamdisk() needs these to compute
+    // which dist/<device>_<buildID>-Ramdisk.dmg bake-all-ramdisks should
+    // already have produced.
+    std::string deviceModel_;
+    std::string buildID_;
 
     std::string getRealVersion(const std::string& version) const;
     void checkPatching();

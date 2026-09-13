@@ -85,6 +85,17 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid);
 int isJailbroken(const std::string& udid);
 int isJailbreakRunning(const std::string& udid);
 
+// Pushes `authorizedKeysContents` to /private/var/root/.ssh/authorized_keys
+// over AFC2 (com.saurik.afc2d's full-filesystem AFC service — the same one
+// isJailbreakRunning() already probes for). Runs post-boot, once the
+// jailbreak is confirmed running; the ramdisk itself no longer bakes in any
+// authorized_keys (or a host key — see Cydia's own sshd-keygen-wrapper),
+// so this is the only place SSH access actually gets granted now. Returns
+// false on any failure (device unreachable, afc2 not up yet, write failed);
+// callers should treat that as non-fatal — the jailbreak itself already
+// succeeded by the time this runs.
+bool pushAuthorizedKeys(const std::string& udid, const std::string& authorizedKeysContents);
+
 class DeviceManager {
 public:
     DeviceManager();

@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+enable_testing()
+
 find_package(PkgConfig REQUIRED)
 # ZLIB used to be the one system/Homebrew-provided dependency left
 # un-vendored (find_package(ZLIB), forced to its static archive) — it's a
@@ -1014,4 +1016,58 @@ add_dependencies(blackb0x
     libplist_ext libusbmuxd_ext libimobiledevice_ext
     libirecovery_ext libimobiledevice_glue_ext libgeneral_ext libfragmentzip_ext
     wolfssl_ext libusb_ext libzip_ext curl_ext bzip2_ext libpng_ext zlib_ext)
+
+# ---------------------------------------------------------------------------
+# Tests
+#
+# patchRamdisk() itself needs a real root-owned loop mount, so it isn't
+# exercised here — see the comment atop RamdiskOverlayTests.cpp. This covers
+# what doesn't need root: path resolution, and the checked-in ramdisk/
+# overlay trees actually containing what patchRamdisk() expects (and not
+# what it doesn't, e.g. the dead `dirhelper` duplicate or macOS packaging
+# junk that were cleaned up when Files/ became ramdisk/).
+# ---------------------------------------------------------------------------
+
+add_executable(blackb0x_tests
+    Blackb0x/Tests/RamdiskOverlayTests.cpp
+    Blackb0x/Source/ResourcePath.cpp)
+
+add_test(NAME RamdiskOverlayTests
+         COMMAND blackb0x_tests
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# ---------------------------------------------------------------------------
+# bake-all-ramdisks
+#
+# The one piece of blackb0x that needs CAP_SYS_ADMIN/CAP_CHOWN (loop-
+# mounting a real HFS+ image) — split into its own binary, run as a separate
+# manual step, not invoked by blackb0x itself (see BakeRamdisk.hpp's header
+# comment and Patcher::patchRamdisk()). Batches bakeRamdisk() over every
+# (device, firmware) combination under Blackb0x/ImageKeys/ in one run,
+# writing results to dist/ — so it needs the HFS+/DMG patching stack AND the
+# IPSW download stack (IPSW.cpp/IPSWDownloader.cpp), but none of the
+# USB/device-communication libraries the main blackb0x binary needs.
+# ---------------------------------------------------------------------------
+
+add_executable(bake-all-ramdisks
+    Blackb0x/Source/BakeAllRamdisks.cpp
+    Blackb0x/Source/BakeRamdisk.cpp
+    Blackb0x/Source/IPSW.cpp
+    Blackb0x/Source/IPSWDownloader.cpp
+    Blackb0x/Source/ResourcePath.cpp)
+
+target_include_directories(bake-all-ramdisks PRIVATE third_party/xpwn/includes)
+
+target_link_libraries(bake-all-ramdisks PRIVATE
+    blackb0x_xpwntool
+    xpwn
+    deps::plist
+    deps::fragmentzip
+    deps::general
+    deps::curl
+    ZLIB::ZLIB)
+
+add_dependencies(bake-all-ramdisks
+    libplist_ext libfragmentzip_ext libgeneral_ext
+    wolfssl_ext curl_ext bzip2_ext libpng_ext zlib_ext)
 

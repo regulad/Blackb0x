@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <regex>
 #include <sstream>
 
 static const char* kBaseUrl = "https://api.ipsw.me/v2.1/";
@@ -53,7 +54,7 @@ std::map<std::string, FirmwareKeyPair> IpswFetch::keysForDevice(const std::strin
                                                                   const std::string& buildID) {
     std::map<std::string, FirmwareKeyPair> result;
 
-    std::string path = resolveResourcePath("Keys/" + device + "/" + device + "_" + buildID + ".keys");
+    std::string path = resolveImageKeyPath(device + "/" + device + "_" + buildID + ".keys");
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         fprintf(stderr, "keysForDevice: cannot open %s\n", path.c_str());
@@ -105,5 +106,83 @@ std::map<std::string, FirmwareKeyPair> IpswFetch::keysForDevice(const std::strin
     free(it);
     plist_free(root);
 
+    return result;
+}
+
+static std::string plistDictString(plist_t dict, const char* key) {
+    plist_t node = plist_dict_get_item(dict, key);
+    if (!node) return "";
+    char* val = nullptr;
+    plist_get_string_val(node, &val);
+    std::string result = val ? val : "";
+    free(val);
+    return result;
+}
+
+std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool onlyBootComponents) {
+    std::ifstream f(manifestPath, std::ios::binary);
+    if (!f) return std::nullopt;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string contents = ss.str();
+
+    plist_t root = nullptr;
+    if (contents.size() >= 6 && contents.compare(0, 6, "bplist") == 0) {
+        plist_from_bin(contents.data(), (uint32_t)contents.size(), &root);
+    } else {
+        plist_from_xml(contents.data(), (uint32_t)contents.size(), &root);
+    }
+    if (!root) return std::nullopt;
+
+    ManifestInfo info;
+    info.realBuildID = plistDictString(root, "ProductBuildVersion");
+    info.productVersion = plistDictString(root, "ProductVersion");
+
+    plist_t identities = plist_dict_get_item(root, "BuildIdentities");
+    uint32_t count = identities ? plist_array_get_size(identities) : 0;
+    if (count == 0) {
+        plist_free(root);
+        return std::nullopt;
+    }
+    plist_t identity = plist_array_get_item(identities, count - 1);
+    plist_t manifest = plist_dict_get_item(identity, "Manifest");
+
+    auto componentPath = [&](const char* component) -> std::string {
+        plist_t comp = plist_dict_get_item(manifest, component);
+        plist_t info_ = comp ? plist_dict_get_item(comp, "Info") : nullptr;
+        return info_ ? plistDictString(info_, "Path") : "";
+    };
+
+    info.iBSSPath = componentPath("iBSS");
+    info.iBECPath = componentPath("iBEC");
+    info.kernelCachePath = componentPath("KernelCache");
+    info.deviceTreePath = componentPath("DeviceTree");
+    if (!onlyBootComponents) info.restoreRamdiskPath = componentPath("RestoreRamDisk");
+
+    plist_free(root);
+    return info;
+}
+
+std::set<std::string> signedBuildsForDevice(const std::string& deviceModel) {
+    std::set<std::string> result;
+    std::string json = httpGet("https://api.ipsw.me/v4/device/" + deviceModel + "?type=ipsw");
+    if (json.empty()) return result;
+
+    // Each firmware entry is a flat object (no nested {}), e.g.:
+    //   {"identifier":"AppleTV2,1", ..., "buildid":"11D258", ..., "signed":true}
+    // so matching non-nested {...} spans is a safe, simple way to isolate
+    // one entry at a time without a real JSON parser (see IPSW.hpp).
+    std::regex entryRe(R"RE(\{[^{}]*\})RE");
+    std::regex buildidRe(R"RE("buildid"\s*:\s*"([^"]*)")RE");
+    std::regex signedRe(R"RE("signed"\s*:\s*true)RE");
+
+    for (auto it = std::sregex_iterator(json.begin(), json.end(), entryRe); it != std::sregex_iterator(); ++it) {
+        std::string entry = it->str();
+        std::smatch buildidMatch;
+        if (!std::regex_search(entry, buildidMatch, buildidRe)) continue;
+        if (std::regex_search(entry, signedRe)) {
+            result.insert(buildidMatch[1].str());
+        }
+    }
     return result;
 }

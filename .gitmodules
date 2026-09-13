@@ -53,3 +53,6 @@
 	path = third_party/gaster
 	url = https://github.com/regulad/gaster.git
 	branch = linux-reset-race
+[submodule "third_party/p0sixspwn"]
+	path = third_party/p0sixspwn
+	url = https://github.com/beiyexertz/p0sixspwn.git

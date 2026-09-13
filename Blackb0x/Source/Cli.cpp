@@ -20,6 +20,7 @@
 #include "IPSW.hpp"
 #include "IPSWDownloader.hpp"
 #include "Patcher.hpp"
+#include "ResourcePath.hpp"
 
 extern "C" {
 #include <plist/plist.h>
@@ -32,6 +33,7 @@ extern "C" {
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unistd.h>
@@ -226,74 +228,10 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
 // Firmware download + patch
 // ---------------------------------------------------------------------------
 
-struct ManifestInfo {
-    std::string realBuildID;     // BuildManifest.plist's own ProductBuildVersion
-    std::string productVersion;  // BuildManifest.plist's own ProductVersion (e.g. "6.1.3")
-    std::string iBSSPath;
-    std::string iBECPath;
-    std::string kernelCachePath;
-    std::string deviceTreePath;
-    std::string restoreRamdiskPath;  // empty if onlyBootComponents
-};
-
-std::string plistDictString(plist_t dict, const char* key) {
-    plist_t node = plist_dict_get_item(dict, key);
-    if (!node) return "";
-    char* val = nullptr;
-    plist_get_string_val(node, &val);
-    std::string result = val ? val : "";
-    free(val);
-    return result;
-}
-
-// Parses BuildManifest.plist for the component paths and the manifest's own
-// (possibly more specific) build ID string — matching the original's
-// `[dict[@"BuildIdentities"] lastObject]` exactly (the LAST identity, not
-// the first — BuildManifest.plist commonly lists multiple personalization
-// variants).
-std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool onlyBootComponents) {
-    std::ifstream f(manifestPath, std::ios::binary);
-    if (!f) return std::nullopt;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string contents = ss.str();
-
-    plist_t root = nullptr;
-    if (contents.size() >= 6 && contents.compare(0, 6, "bplist") == 0) {
-        plist_from_bin(contents.data(), (uint32_t)contents.size(), &root);
-    } else {
-        plist_from_xml(contents.data(), (uint32_t)contents.size(), &root);
-    }
-    if (!root) return std::nullopt;
-
-    ManifestInfo info;
-    info.realBuildID = plistDictString(root, "ProductBuildVersion");
-    info.productVersion = plistDictString(root, "ProductVersion");
-
-    plist_t identities = plist_dict_get_item(root, "BuildIdentities");
-    uint32_t count = identities ? plist_array_get_size(identities) : 0;
-    if (count == 0) {
-        plist_free(root);
-        return std::nullopt;
-    }
-    plist_t identity = plist_array_get_item(identities, count - 1);
-    plist_t manifest = plist_dict_get_item(identity, "Manifest");
-
-    auto componentPath = [&](const char* component) -> std::string {
-        plist_t comp = plist_dict_get_item(manifest, component);
-        plist_t info_ = comp ? plist_dict_get_item(comp, "Info") : nullptr;
-        return info_ ? plistDictString(info_, "Path") : "";
-    };
-
-    info.iBSSPath = componentPath("iBSS");
-    info.iBECPath = componentPath("iBEC");
-    info.kernelCachePath = componentPath("KernelCache");
-    info.deviceTreePath = componentPath("DeviceTree");
-    if (!onlyBootComponents) info.restoreRamdiskPath = componentPath("RestoreRamDisk");
-
-    plist_free(root);
-    return info;
-}
+// ManifestInfo / parseManifest() now live in IPSW.hpp/.cpp — shared with
+// bake-all-ramdisks (BakeAllRamdisks.cpp), which needs the exact same
+// BuildManifest.plist parsing to locate RestoreRamDisk across every known
+// firmware, not just the one connected device this CLI flow targets.
 
 // Replaces MainView's downloadComponentsForBuildID: — downloads every
 // component sequentially (see the note in Cli.hpp/this file's header
@@ -385,7 +323,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 
     if (!onlyBootComponents) {
         downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath,
-                          [&](const std::string& path) { patcher.patchRamdisk(path, /*ssh=*/false); });
+                          [&](const std::string& path) { patcher.patchRamdisk(path); });
     }
 
     if (!result) {
@@ -478,7 +416,26 @@ int runCli(const CliOptions& options) {
     }
 
     printf("blackb0x (regulad's linux port) — Apple TV 2/3 jailbreak tool\n");
-    printf("SSH access will be granted using your own ~/.ssh/authorized_keys.\n\n");
+
+    // Read once, up front — pushed over AFC2 once the jailbreak is confirmed
+    // running (see the onDeviceUpdated sink below), not baked into the
+    // ramdisk. Missing is a warning, not a hard failure: unlike the old
+    // ramdisk-baked path, the jailbreak itself doesn't depend on this.
+    std::string authorizedKeysContents;
+    if (auto authorizedKeysPath = findUserAuthorizedKeysPath()) {
+        std::ifstream f(*authorizedKeysPath, std::ios::binary);
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        authorizedKeysContents = ss.str();
+        printf("SSH access will be granted from %s once the jailbreak finishes booting.\n\n",
+               authorizedKeysPath->c_str());
+    } else {
+        printf(
+            "No ~/.ssh/authorized_keys found — SSH access will not be granted automatically.\n"
+            "Generate one first (e.g. `ssh-keygen`) and add your public key there if you want\n"
+            "the jailbroken device reachable over SSH.\n\n");
+    }
+
     if (options.dryRun) {
         printf("(dry run) Discovery, DFU wait, download, and patch all happen for real.\n");
         printf("(dry run) Only the exploit and the USB upload are skipped.\n\n");
@@ -486,9 +443,35 @@ int runCli(const CliOptions& options) {
     fflush(stdout);
 
     if (geteuid() != 0) {
-        fprintf(stderr, "blackb0x must run as root (raw USB access, and patchRamdisk() needs\n");
-        fprintf(stderr, "CAP_SYS_ADMIN/CAP_CHOWN for loop-mounting). Re-run with sudo.\n");
+        fprintf(stderr, "blackb0x must run as root (raw USB access). Re-run with sudo.\n");
         return 1;
+    }
+
+    // Nothing this tool can ever do succeeds without at least one baked
+    // ramdisk sitting in dist/ — patchRamdisk() (Patcher.cpp) checks for a
+    // specific device+firmware's own entry once a device is actually
+    // connected, but an entirely empty dist/ means bake-all-ramdisks was
+    // simply never run at all, which is worth failing on immediately
+    // rather than waiting for a device to show up first.
+    {
+        bool haveAnyRamdisk = false;
+        std::error_code ec;
+        if (fs::exists("dist", ec) && fs::is_directory("dist", ec)) {
+            for (const auto& entry : fs::directory_iterator("dist", ec)) {
+                if (ec) break;
+                if (entry.path().extension() == ".dmg") {
+                    haveAnyRamdisk = true;
+                    break;
+                }
+            }
+        }
+        if (!haveAnyRamdisk) {
+            fprintf(stderr,
+                    "blackb0x: dist/ has no baked ramdisks at all. Run this once (as root) before using\n"
+                    "blackb0x against any device:\n"
+                    "  sudo ./bake-all-ramdisks\n");
+            return 1;
+        }
     }
 
     // Collapses the original Blackb0x.h/.m singleton (which just held one
@@ -511,9 +494,18 @@ int runCli(const CliOptions& options) {
         printf("Disconnected (%llu)\n", (unsigned long long)ecid);
     };
     sink.onStatus = [](const std::string& status) { printf("%s\n", status.c_str()); };
-    sink.onDeviceUpdated = [](const AppleTVDevice& d) {
+    std::set<std::string> authorizedKeysPushedFor;
+    sink.onDeviceUpdated = [&authorizedKeysContents, &authorizedKeysPushedFor](const AppleTVDevice& d) {
         if (d.jailbroken) {
             printf("%s is jailbroken%s\n", d.deviceModel.c_str(), d.jailbreakRunning == 1 ? " and running" : "");
+        }
+        if (d.jailbreakRunning == 1 && !authorizedKeysContents.empty() &&
+            authorizedKeysPushedFor.insert(d.udid).second) {
+            if (pushAuthorizedKeys(d.udid, authorizedKeysContents)) {
+                printf("SSH access granted on %s\n", d.deviceModel.c_str());
+            } else {
+                fprintf(stderr, "Failed to push authorized_keys to %s over AFC2\n", d.deviceModel.c_str());
+            }
         }
     };
     deviceManager.setEventSink(sink);
