@@ -11,6 +11,11 @@ Devices supported:
   to pwn DFU mode first; `blackb0x` picks up from there
 - Apple TV 2,1 (A1378) (tvOS 7.1.2 tethered, tvOS 6.1.4 untethered)
 
+**Tested hardware:** this Linux port — **blackb0x--** — has only ever been
+verified against a real AppleTV3,2 running tvOS 7.9. Every other
+device/firmware combination listed above is implemented from protocol
+analysis and disassembly, not confirmed on real hardware.
+
 IMPORTANT: make sure your device is connected to the internet for the first boot. Do
 not turn it off during first boot until Kodi appears.
 

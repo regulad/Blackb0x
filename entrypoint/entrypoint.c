@@ -432,6 +432,128 @@ static void panic(const char *msg) {
     for (;;) busy_wait(60);
 }
 
+/* Hand-rolled memmem() — no libc here. Linear substring search; fine for
+ * the one-shot, small-needle use below (dpkg status files this project's
+ * own package set produces are not large). */
+static const char *my_memmem(const char *hay, int haylen, const char *needle, int needlelen) {
+    if (needlelen <= 0 || haylen < needlelen) return 0;
+    for (int i = 0; i <= haylen - needlelen; i++) {
+        int j = 0;
+        while (j < needlelen && hay[i + j] == needle[j]) j++;
+        if (j == needlelen) return hay + i;
+    }
+    return 0;
+}
+
+/* Whether /mnt1/private/var/lib/dpkg/status (already written onto the real
+ * target volume by the merge_tree() call in do_install() below, staged at
+ * bake time by BakeRamdisk.cpp's stageManualDpkgInstall()/
+ * stageEtasonatv()) has a real `Package: <pkgName>` stanza — a plain
+ * substring search on the stanza header line is enough here: this
+ * project's own bake-time writer only ever appends a stanza for a package
+ * name once it's decided that package is genuinely installed (see
+ * BakeRamdisk.cpp's stageManualDpkgInstall() — every stanza it writes
+ * always carries `Status: install ok installed`), so presence of the
+ * header line alone is an unambiguous signal, no real stanza-boundary
+ * parsing needed.
+ *
+ * Reads into a fixed, generously-sized static (BSS, not stack — this
+ * entrypoint runs with a small, freestanding stack) buffer rather than
+ * streaming, since a plain substring search across a read-buffer boundary
+ * would need real overlap-handling logic this one-shot check doesn't
+ * justify. If the real status file ever somehow exceeds this buffer, this
+ * fails closed (reports "not found", so fixup_etasonuntether_rtbuddyd()
+ * below just does nothing) rather than searching a truncated/wrong window
+ * and risking a false answer. */
+#define DPKG_STATUS_SCAN_BUF_SIZE (256 * 1024)
+static char g_dpkgStatusScanBuf[DPKG_STATUS_SCAN_BUF_SIZE];
+
+static int dpkg_status_has_installed_package(const char *statusPath, const char *pkgName) {
+    int fd = sys_open(statusPath, O_RDONLY, 0);
+    if (fd < 0) return 0;
+
+    int total = 0;
+    ssize_t_ n;
+    while (total < DPKG_STATUS_SCAN_BUF_SIZE &&
+           (n = sys_read(fd, g_dpkgStatusScanBuf + total, DPKG_STATUS_SCAN_BUF_SIZE - total)) > 0) {
+        total += (int)n;
+    }
+    sys_close(fd);
+    if (total >= DPKG_STATUS_SCAN_BUF_SIZE) {
+        log_to_file("dpkg status file larger than expected — package-state check skipped\n");
+        return 0;
+    }
+
+    char needle[192];
+    needle[0] = '\0';
+    my_strcat(needle, "Package: ");
+    my_strcat(needle, pkgName);
+    my_strcat(needle, "\n");
+    return my_memmem(g_dpkgStatusScanBuf, total, needle, my_strlen(needle)) != 0;
+}
+
+/* Copies `src` to `dst`, preserving `src`'s own real owner/mode (read via
+ * stat()) rather than a caller-supplied triple — the same idiom
+ * merge_tree() itself uses for regular files, reused here via the
+ * existing install_file() primitive. */
+static int copy_preserving(const char *src, const char *dst) {
+    struct { char pad[96]; } st;
+    if (sys_stat(src, &st) != 0) return -1;
+    int mode = stat_mode(&st) & 07777;
+    int uid = (int)stat_uid(&st);
+    int gid = (int)stat_gid(&st);
+    return install_file(src, dst, uid, gid, mode);
+}
+
+/* net.tihmstar.etasonuntether's own real postinst (see Blackb0x/Misc/
+ * README.md's "etasonATV / tihmstar-untether provenance" section, and the
+ * postinst itself, extracted directly from the real .deb) swaps
+ * /usr/libexec/rtbuddyd for a symlink to jsc, backing up any real rtbuddyd
+ * it finds first: `if [ -e rtbuddyd ]; then [ ! -e rtbuddyd.orig ] && mv
+ * rtbuddyd rtbuddyd.orig; fi; ln -s jsc rtbuddyd` (roughly). That postinst
+ * never actually runs anywhere in this project — see BakeRamdisk.cpp's
+ * stageEtasonatv() for why (its own live jsc self-test can't run against
+ * an unbooted image) — so this reproduces just that specific swap here,
+ * against the real target volume, once BakeRamdisk.cpp's bake-time dpkg
+ * status stanza (stageManualDpkgInstall()) says the package is genuinely
+ * installed. This intentionally runs from the entrypoint rather than being
+ * baked directly into /blackb0x at bake time: bake time only ever sees a
+ * pristine, not-yet-patched restore ramdisk with no access to this
+ * specific device's actual /mnt1/usr/libexec/rtbuddyd content, so
+ * "back up whatever's really there first" can only be decided here,
+ * against the real mounted target volume, not baked as a static symlink
+ * ahead of time.
+ *
+ * rtbuddyd.orig's own presence is the idempotency gate, matching the real
+ * postinst's own `[ ! -e rtbuddyd.orig ]` check — this only ever needs to
+ * run once (do_install() itself already refuses to run a second time at
+ * all once install-done exists, but this check is what the real postinst
+ * itself also relies on, kept here to mirror it exactly rather than lean
+ * solely on the caller's own one-shot guarantee). */
+static void fixup_etasonuntether_rtbuddyd(void) {
+    if (!dpkg_status_has_installed_package("/mnt1/private/var/lib/dpkg/status", "net.tihmstar.etasonuntether")) {
+        return;
+    }
+    if (sys_access("/mnt1/usr/libexec/rtbuddyd.orig", F_OK) == 0) {
+        return; /* already backed up on a prior run */
+    }
+    if (sys_access("/mnt1/usr/libexec/rtbuddyd", F_OK) == 0) {
+        if (copy_preserving("/mnt1/usr/libexec/rtbuddyd", "/mnt1/usr/libexec/rtbuddyd.orig") != 0) {
+            log_to_file("failed to back up rtbuddyd before etasonuntether symlink\n");
+            return;
+        }
+        sys_unlink("/mnt1/usr/libexec/rtbuddyd");
+    }
+    /* Either rtbuddyd was just backed up and removed above, or there was
+     * never a real one to back up in the first place — the real postinst
+     * symlinks unconditionally in that second case too (its own `else`
+     * branch). */
+    if (sys_symlink("/System/Library/Frameworks/JavaScriptCore.framework/Resources/jsc",
+                     "/mnt1/usr/libexec/rtbuddyd") != 0) {
+        log_to_file("failed to symlink rtbuddyd -> jsc for etasonuntether\n");
+    }
+}
+
 /* NEO_FLOW: no version/first-install branching left at all. Which
  * firmware this ramdisk targets was already resolved once, at bake time,
  * into exactly what's staged under /blackb0x (see BakeRamdisk.cpp's
@@ -470,6 +592,7 @@ static int do_install(void) {
 
     log_to_file("Merging blackb0x payload\n");
     merge_tree("/blackb0x", "/mnt1");
+    fixup_etasonuntether_rtbuddyd();
     log_to_file("Finished install\n");
 
     return 0;

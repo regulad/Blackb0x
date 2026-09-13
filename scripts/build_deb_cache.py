@@ -58,13 +58,16 @@ for the already-documented pinned-filename mismatches — see Misc/README.md's
 that don't already exist.
 
 Package names in packages.txt that don't resolve to a real package in any
-configured repo are FATAL for the whole run, with one deliberate exception
-(KNOWN_EXPECTED_UNRESOLVABLE below): com.ih8sn0w-squiffy-winocm.p0sixspwn,
-which has a real Packages stanza but genuinely doesn't satisfy its own
-Depends: firmware constraint against this sandbox's synthetic firmware
-version — expected, not a bug (see INNER_SCRIPT's own comment). Anything
-else failing to resolve is exactly the kind of silent breakage this used
-to just warn-and-skip past — real packages this project actually needs
+configured repo are FATAL for the whole run, with a deliberate exception
+(KNOWN_EXPECTED_UNRESOLVABLE below): com.ih8sn0w-squiffy-winocm.p0sixspwn
+has a real Packages stanza but genuinely doesn't satisfy its own Depends:
+firmware constraint against this sandbox's synthetic firmware version —
+expected, not a bug (see INNER_SCRIPT's own comment). net.tihmstar.etasonuntether
+used to be a second exception here for the same reason, but isn't
+apt-attempted at all anymore — see local_only_debs.txt's own comment on
+why. Anything else failing to resolve is exactly
+the kind of silent breakage this used to just warn-and-skip past — real
+packages this project actually needs
 (see the "essential" incident: it turned out to be genuinely gone from
 every configured repo's live Packages index, and nothing noticed for a
 while because the warning was easy to miss in a long build log) — so it
@@ -169,8 +172,21 @@ LOCAL_ONLY_LIST = MISC_DIR / "local_only_debs.txt"
 
 # See this script's own module docstring and local_only_debs.txt's comment
 # for why p0sixspwn specifically is a tolerated, expected resolution
-# failure rather than the fatal one everything else now is.
-KNOWN_EXPECTED_UNRESOLVABLE = {"com.ih8sn0w-squiffy-winocm.p0sixspwn"}
+# failure rather than the fatal one everything else now is — a real
+# firmware-version-gated persistence payload (6.1.4) that BakeRamdisk.cpp's
+# stageP0sixspwn() extracts straight out of its real .deb in
+# Blackb0x/Debs/ instead of going through apt resolution.
+#
+# net.tihmstar.etasonuntether used to be here too (same firmware-gated
+# reasoning — Depends: firmware (= 8.4.1) doesn't satisfy this sandbox's
+# synthetic 8.4.2 pin below), but it's not apt-attempted at all anymore:
+# it moved to Blackb0x/Misc/local_only_debs.txt once repo.tihmstar.net (the
+# only repo that ever carried its Packages stanza) turned out to be an
+# unreliable live dependency — see Blackb0x/Misc/apt/net.tihmstar.list.disabled
+# and local_only_debs.txt's own comment on it.
+KNOWN_EXPECTED_UNRESOLVABLE = {
+    "com.ih8sn0w-squiffy-winocm.p0sixspwn",
+}
 
 # The one and only architecture every repo this project uses actually
 # ships — not a "foreign" arch needing multiarch juggling, just the
@@ -220,7 +236,7 @@ cp /work/sources.list /sandbox/etc/apt/sources.list
 # supported target, and the version-era saurik.list's own "ios/8.0" dist
 # choice already targets) rather than trying to satisfy every firmware
 # range this ecosystem has ever used at once — some packages are
-# genuinely gated to an OLDER range only (com.ih8sn0w-squiffy-winocm.p0sixspwn
+# genuinely gated to a DIFFERENT range only (com.ih8sn0w-squiffy-winocm.p0sixspwn
 # needs firmware < 7.0, since it's a 6.1.4-only untether payload) and will
 # correctly fail resolution here rather than silently resolving as if they
 # applied to every firmware. That's accurate, not a bug: this project's own

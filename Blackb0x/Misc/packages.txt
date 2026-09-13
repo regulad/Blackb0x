@@ -39,6 +39,7 @@ less
 lzma
 mobilesubstrate
 ncurses
+net.tihmstar.etasonuntether
 network-cmds
 odcctools
 openssh

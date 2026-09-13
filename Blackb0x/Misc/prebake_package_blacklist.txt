@@ -26,12 +26,20 @@
 # that only a real, forced debootstrap-style unpack-then-configure pass
 # can resolve correctly.
 #
-# com.ih8sn0w-squiffy-winocm.p0sixspwn also never actually resolves through
-# real apt at all today (its Depends: firmware range doesn't match this
-# project's sandboxed resolution — see Blackb0x/Misc/README.md), so this
-# entry is belt-and-suspenders: it belongs here on its own postinst's
-# merits regardless of whether that separate exclusion ever changes.
+# com.ih8sn0w-squiffy-winocm.p0sixspwn never actually resolves through real
+# apt at all today (its Depends: firmware constraint doesn't match this
+# project's sandboxed resolution — see Blackb0x/Misc/README.md and
+# scripts/build_deb_cache.py's KNOWN_EXPECTED_UNRESOLVABLE).
+# net.tihmstar.etasonuntether isn't even apt-attempted anymore at all (see
+# Blackb0x/Misc/local_only_debs.txt — it now reaches the device through a
+# local file:// repo instead of a live one), so it WILL show up as
+# "resolved" for postinstall.sh's own real `apt-get install` purposes.
+# Both entries are belt-and-suspenders regardless: they belong here on
+# their own postinst's merits (etasonuntether's tests the live jsc stage1
+# exploit and can't run in a bootstrap sandbox at all) independent of
+# whichever apt-resolution path each one takes.
 com.ih8sn0w-squiffy-winocm.p0sixspwn
+net.tihmstar.etasonuntether
 org.xbmc.kodi-seatbeltunlock
 com.nito.nitotv
 org.xbmc.kodi-atv2

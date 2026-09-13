@@ -2,11 +2,14 @@
 
 Now that `Blackb0x/ramdisk/` has been deleted outright (see
 `.claude/LEGACY_FLOW.md`/`.claude/NEO_FLOW.md`), this directory is where
-everything from it worth keeping for provenance/reference lives instead —
-plus the one original source tarball still needed going forward
-(`tihmstar-untether.tar`; every other original tarball was dropped — see
-"Original tarballs" below, including `RamdiskBins.tar`, now unpacked into
-`bin/`).
+everything from it worth keeping for provenance/reference lives instead.
+No original source tarball is needed going forward anymore — see
+"Original tarballs" below: every one, including `tihmstar-untether.tar`
+(now superseded by the real `net.tihmstar.etasonuntether-1.3.1.deb` in
+`Blackb0x/Debs/` — see "etasonATV / tihmstar-untether provenance" below)
+and `RamdiskBins.tar` (unpacked into `bin/`), has been dropped — with one
+exception: `untether.bin` itself, kept standalone (see below), since it's
+an open forensic question in its own right, not just install-time payload.
 
 - `rc.boot` — **deleted**. This was the restore ramdisk's early-boot
   script (behavior doc in `.claude/LEGACY_FLOW.md`), kept here on the
@@ -65,20 +68,33 @@ through real `apt` dependency resolution against this project's own
 `files/debs/` — not the whole (append-only, never-pruned) `Blackb0x/Debs/`
 directory, which accumulates every version ever fetched.
 
-Running it against the current `packages.txt` resolves all but two names.
-`com.ih8sn0w-squiffy-winocm.p0sixspwn` genuinely can't resolve through apt
-at all — its `Depends: firmware (>= 6.1.3), firmware (< 7.0)` only matches
-a 6.1.4 device, and this project's sandboxed resolution declares its
-synthetic "firmware" version as `8.4.2` (see the script's own comment for
-why: it can't satisfy every firmware range this ecosystem has ever used in
-one resolution pass, so it picks this project's newest/most-capable
-supported target). This isn't a bug — per `.claude/NEO_FLOW.md`, per-branch
-persistence payloads like this one are meant to be installed as direct
-loose-file copies, not resolved through apt at all, so dropping out of this
-list here is the correct signal, not a gap to fix. `essential` also still
-doesn't resolve, genuinely not found in any of the five configured repos
-today, despite `Blackb0x/Debs/essential_0-1_iphoneos-arm.deb` already
-existing here from some earlier, no-longer-reachable source.
+Running it against the current `packages.txt` resolves all but one name
+through live apt attempts: `com.ih8sn0w-squiffy-winocm.p0sixspwn`
+genuinely can't resolve at all — its `Depends: firmware (>= 6.1.3),
+firmware (< 7.0)` only matches a 6.1.4 device, and this project's
+sandboxed resolution declares its synthetic "firmware" version as `8.4.2`
+(see the script's own comment for why: it can't satisfy every firmware
+range this ecosystem has ever used in one resolution pass, so it picks
+this project's newest/most-capable supported target). This isn't a bug —
+per `.claude/NEO_FLOW.md`, per-branch persistence payloads like this are
+meant to be installed as direct loose-file copies (extracted straight out
+of their real `.deb` — see `BakeRamdisk.cpp`'s `stageP0sixspwn()`), not
+resolved through apt at all, so dropping out of this list here is the
+correct signal, not a gap to fix.
+
+Two more names never even attempt live apt resolution at all —
+`Blackb0x/Misc/local_only_debs.txt`'s own mechanism, a real local
+`file://` repo built from `.deb`s this project already has:
+`essential`, genuinely not found in any of the five configured repos
+today despite `Blackb0x/Debs/essential_0-1_iphoneos-arm.deb` already
+existing here from some earlier, no-longer-reachable source; and
+`net.tihmstar.etasonuntether`, whose real Packages stanza on
+`repo.tihmstar.net` *does* exist (it would genuinely resolve there,
+firmware-gate aside) but which moved to this same local mechanism once
+that repo's live index turned out to be an unreliable dependency (see
+`Blackb0x/Misc/apt/net.tihmstar.list.disabled`) — same end state as
+`essential` (a local file:// repo, not a live one), different reason for
+getting there.
 
 `bigboss`, `modmyifone`, `saurik`, `zodttd` used to be in `packages.txt`
 too, and used to show up in every single resolution run as "no
@@ -89,15 +105,11 @@ the original dependency-graph scrape (see `docs/HISTORY.md`), not
 temporarily-unavailable packages. Removed outright rather than left to
 warn on every future build forever.
 
-## Original tarballs kept for provenance
+## Original tarballs — none kept anymore, all dropped (bar one loose file)
 
-- `tihmstar-untether.tar` — tihmstar's EtasonATV untether payload (see
-  "etasonATV / tihmstar-untether provenance" below). No independently
-  re-downloadable copy exists anywhere; kept as-is.
-
-Dropped entirely (`ssh.tar`, `p0sixspwn.tgz`, `Debs.tar`, `ATV-Cydia.tgz`,
-`RamdiskBins.tar`) — each one's only still-relevant content is already
-preserved elsewhere, individually, below or in `Blackb0x/Debs/`:
+`ssh.tar`, `p0sixspwn.tgz`, `tihmstar-untether.tar`, `Debs.tar`,
+`ATV-Cydia.tgz`, `RamdiskBins.tar` — each one's only still-relevant content
+is already preserved elsewhere, individually, below or in `Blackb0x/Debs/`:
 
 - `ssh.tar` — its only known content was static SSH host keys, already
   deleted for real (not just here) as a security fix: shipping identical
@@ -107,6 +119,23 @@ preserved elsewhere, individually, below or in `Blackb0x/Debs/`:
 - `p0sixspwn.tgz` — its persistence payload is superseded by the real
   `com.ih8sn0w-squiffy-winocm.p0sixspwn_1.4-1_iphoneos-arm.deb` in
   `Blackb0x/Debs/`.
+- `tihmstar-untether.tar` — tihmstar's EtasonATV untether payload (see
+  "etasonATV / tihmstar-untether provenance" below), long believed to have
+  no independently re-downloadable source. Superseded once the real,
+  long-lost `net.tihmstar.etasonuntether-1.3.1.deb` itself turned up (now
+  in `Blackb0x/Debs/`) — `BakeRamdisk.cpp`'s `stageEtasonatv()` extracts the
+  same four files straight out of that `.deb` instead of this tarball now.
+  One file from it — `untether/untether.bin` — is kept as a standalone copy
+  at `Blackb0x/Misc/untether.bin` even though nothing installs it anymore:
+  it's not a byte-for-byte match of either of tihmstar's own two published
+  `untether.bin` builds (`etasonuntether-1.3.1`'s or
+  `untetherhomedepot`'s — see "etasonATV / tihmstar-untether provenance"
+  below), and where this specific 43,680-byte compiled build actually came
+  from is still an open question (`.claude/TODO.md` item 1) — worth having
+  the real bytes on hand for, independent of the now-retired tarball.
+  `orig_untether.bin` (its unpatched 2021-04-17 predecessor, differing in
+  15 branch-immediate bytes) is not duplicated here — recoverable from this
+  same tarball via git history (`git show <pre-removal commit>:Blackb0x/Files/tihmstar-untether.tar`) if that comparison needs re-running.
 - `Debs.tar` — originally seeded `Blackb0x/Debs/`'s `.deb` set; that
   directory is the real, current source of truth now, not the tarball.
 - `ATV-Cydia.tgz` — its only content still in use by anything (4 files) is
@@ -366,6 +395,25 @@ listing that also holds unrelated payloads.
   `gpg --show-keys` (`uid: Parker Wahle (iOS apt repository)
   <regulad@regulad.xyz>`).
 - `apt/xbmc.list` — Kodi's official ATV2 repo mirror.
+- `apt/net.tihmstar.list` — `deb http://repo.tihmstar.net/ ./`, tihmstar's
+  own beta repo (see `### Direct provenance, found via the "Home Depot"
+  lead` above — this is the exact repo `net.tihmstar.etasonuntether`/
+  `net.tihmstar.daemonloader`/`net.tihmstar.untetherhomedepot` were pulled
+  from directly, and it's still live). Flat, `./`-style layout, exactly the
+  `deb` line the repo's own homepage instructs (`repo.tihmstar.net/`'s HTML
+  literally says to `echo` this exact line into
+  `/etc/apt/sources.list.d/net.tihmstar.list`).
+- `apt/net.tihmstar.gpg.key` — tihmstar's real signing key. Not guessed:
+  `Release.gpg` is a real detached signature (issuer fingerprint `6A8A C255
+  F7E1 43F8 95C2 8427 D036 3332 8074 6A0D`); fetched the matching public key
+  from `keyserver.ubuntu.com` by that fingerprint (`uid: tihmstar
+  <tihmstar@gmail.com>`, primary fingerprint `3F72 1DB6 4D54 CFA2 AE9F D4B7
+  EE5A 76FA 6F6E 76D7`) and confirmed with a real `gpg --verify` of
+  `Release` against `Release.gpg` — "Good signature from \"tihmstar
+  <tihmstar@gmail.com>\"" (the key itself expired 2018-10-01, well after
+  this 2017-10-01 signature was made, so `gpgv`/apt will flag it as expired
+  rather than reject it outright — same "genuinely valid, just dated"
+  situation as `saurik.gpg.key`/`bigboss.gpg.key`).
 - `apt/bigboss.list` — `deb http://apt.thebigboss.org/repofiles/cydia/ stable
   main`, TheBigBoss's own real, live Cydia repo. Verified live, not assumed:
   `dists/stable/Release`/`Release.gpg` both return `200` with real content
@@ -482,12 +530,171 @@ live infrastructure and failed:
   screenshots (`images/instructions/step1.JPG`, etc.) 404 — the page itself
   admits "a few images are missing."
 
-Conclusion: there is no live, independently-downloadable copy of this
-payload anywhere. It was only ever distributed in-band during a live
-exploit run, never hosted as a static artifact. The copy checked into this
-repo (originally `Blackb0x/Files/tihmstar-untether.tar`, byte-identical
-across every Blackb0x fork we checked) is almost certainly one of the only
-surviving standalone copies, and is kept as-is rather than re-derived.
+Conclusion (superseded below): there is no live, independently-downloadable
+copy of this payload anywhere via `etasonatv.tihmstar.net`'s own DNS-hijack
+delivery chain specifically. It was only ever distributed in-band during a
+live exploit run through that one vector — but see below, since tihmstar
+also shipped (and still serves) essentially the same payload as a normal
+Cydia package.
+
+### Direct provenance, found via the "Home Depot" lead
+
+The `/var/logs/untetherhomedepot.log` /
+`/var/logs/untetherhomedepotLoopProtection.txt` strings burned into
+`untether/untether.bin` are not a coincidence or a mislabeled file — they
+pointed straight at the real answer. tihmstar's own Cydia repo,
+**`repo.tihmstar.net`, is still live today** (`nginx/1.24.0`, `Packages.gz`
+still serves a real, current index) and hosts exactly the sibling packages
+this file's strings reference:
+
+| package | version | source |
+|---|---|---|
+| `net.tihmstar.etasonuntether` | 1.3.1 | `repo.tihmstar.net/debs/net.tihmstar.etasonuntether-1.3.1.deb` — "Untether for 8.4.1 32bit... bootstraps Etason jailbreak" |
+| `net.tihmstar.untetherhomedepot` | 1.4.2 | `repo.tihmstar.net/debs/net.tihmstar.untetherhomedepot.deb` — "Untether for 9.1-9.3.4 32bit... bootstraps HomeDepot jailbreak" |
+| `net.tihmstar.daemonloader` | 1.0.0 | `repo.tihmstar.net/debs/net.tihmstar.daemonloader-1.0.0.deb` — the `orphan_commander`/`etc/rc.d/daemonload` mechanism, shared by both untethers per its own package description ("Use this to have openssh loaded with etasonuntether or untetherhomedepot") |
+
+Downloaded all three directly (MD5-verified against the repo's own
+`Packages` index) and diffed against what's checked into this repo:
+
+- **`untether/expl.js`, `usr/bin/orphan_commander`, `etc/rc.d/daemonload`
+  are byte-identical (`cmp`-verified)** to the files inside
+  `net.tihmstar.etasonuntether-1.3.1.deb`, straight from tihmstar's own,
+  still-live repo. This is about as direct a provenance confirmation as
+  this project has for anything: 3 of the 4 real payload files are
+  confirmed straight from the author's own current distribution.
+- **`untether/untether.bin` (and its `orig_untether.bin` backup copy) do
+  NOT match.** The real `net.tihmstar.etasonuntether-1.3.1.deb`'s
+  `untether.bin` is 35,677 bytes (dated 2021-04-04 in that package). The
+  real `net.tihmstar.untetherhomedepot.deb`'s `untether.bin` (2017) is
+  33,600 bytes. Ours is 43,680 bytes — bigger than both, and its very first
+  divergent instruction from either real binary is 4 bytes into the file
+  (all three share the same 2-instruction Thumb prologue, `push {r7,lr}; mov
+  r7,sp`, then diverge immediately), so it's a genuinely different compiled
+  build, not a small patch of either published one.
+- Our own `untether.bin` vs. our own `orig_untether.bin` (both 43,680
+  bytes) differ in exactly 15 bytes — **corrected**: these are NOT
+  conditional-branch immediates (an earlier pass here misread them as
+  that). Direct disassembly/diff of both files shows 14 of the 15 bytes
+  (file offset `0x9865`-`0x9893`) are an in-place ASCII string edit, not
+  code: the patch swaps one of the binary's four embedded `Darwin Kernel
+  Version` banner strings from `...xnu-2784.40.6~50/RELEASE_ARM` (Fri Nov
+  11 2016) to `...xnu-2784.40.6~93/RELEASE_ARM` (Fri Jan 29 2021) — both
+  strings exactly the same length, which is *why* an in-place same-size
+  patch was even possible without relinking. The other three banner slots
+  (`~86`/Sep 2019, `~87`/Feb 2020, `~92`/Nov 2020 — see the kernel-banner
+  table below) are untouched in both files. Net effect: drop the oldest
+  recognized kernel build, add the newest known one, keeping the table's
+  total size fixed at 4 entries — consistent with hand-editing a compiled
+  fixed-size array, not recompiling with a 5th slot. The remaining 1 byte
+  (offset `0x3301`) is a real code change, `ADDS r6, #0x28` → `ADDS r6,
+  #0x45` (40 → 69 decimal), elsewhere in the binary — not tied to the
+  banner table, and what it actually does is still unexplained. This is
+  the same "keep an `orig_` backup, ship a patched copy" pattern this
+  project itself uses elsewhere (see `spliceFileContentInPlace()` in
+  `BakeRamdisk.cpp`). The tar's own internal file timestamps line up with
+  this: `orig_untether.bin` is 2021-04-17, `untether.bin` is 2021-04-28 —
+  both shortly after tihmstar's own 2021-04-04 `etasonuntether-1.3.1`
+  release, and just 8-19 days after Apple's real `12H923` tvOS 8.4.x
+  security update (2021-04-09, per theapplewiki.com) — whoever patched
+  this was tracking Apple's still-ongoing tvOS 8.4.x point releases in
+  close to real time.
+- Our `untether.bin`'s embedded kernel-banner table (four `Darwin Kernel
+  Version`/`xnu-2784.40.6~NN` strings, all SoC `S5L8947X` — the Apple TV
+  3's real SoC) is itself a sharp contrast with the *officially packaged*
+  `1.3.1` deb: that build's own table has five entries, all dated the same
+  day (Aug 5 2015), all `xnu-2784.40.6~18`, for five *other* SoCs
+  (`S5L8940X`/`8942X`/`8945X`/`8950X`/`8955X` — iPhone4S/iPad2/iPad3/
+  iPod5/iPhone5-class devices) and **never once mentions `S5L8947X`**,
+  despite being nominally the Apple TV 3 untether. That lines up with the
+  deb's own control file: `Description: Untether for 8.4.1 32bit`,
+  changelogged for "v1.2 adds support for iPhone5", "v1.3 adds support for
+  iPad4" — it's a generic multi-device payload, hard-pinned via `Depends:
+  firmware (= 8.4.1)`, not something ever actually verified/built against
+  a real Apple TV 3 kernel banner. Our `untether.bin`, by contrast, checks
+  against several real, sequential tvOS 8.4.x point-release kernels
+  specifically. Wayback Machine's crawl of `repo.tihmstar.net` confirms
+  only two `etasonuntether` releases ever existed (`1.3.0`, first crawled
+  2020-09-16 but internally dated 2017-09-25, and `1.3.1`, 2021-04-04) —
+  and their `untether.bin` files are byte-identical to each other
+  (`sha256` match), so there was never a third, official release matching
+  our 43,680-byte build either.
+- `strings` on `untether.bin` reads like a classic 32-bit kernel-exploit
+  harness — `patching cs_enforcement_disable_amfi`, `patching
+  amfi_substrate`, `patching proc_enforce`, a literal `"Marijuan"` 8-byte
+  watermark string written over the kernel's own `RELEASE_ARM` osrelease
+  string. **That exact function set and that exact `"Marijuan"` watermark
+  also appear, as real C source, in tihmstar's own public GitHub repo**
+  ([`tihmstar/jelbrekTime`](https://github.com/tihmstar/jelbrekTime), the
+  `jelbrekT1m3 WatchKit Extension/jailbreak.m` file — a *different* jailbreak
+  entirely, for watchOS 4.1 on the Apple Watch Series 3):
+  ```c
+  //  jailbreak.m
+  //  v0rtex
+  //  Created by tihmstar on 14.12.17.
+  ...
+  uint32_t marijuanoff = (uint32_t)memmem(kdata+i_can_has_debugger_dst-kernel_base, ksize, "RELEASE_ARM", sizeof("RELEASE_ARM")-1)-kdata;
+  kern_return_t kr=vm_write(taskHacked, marijuanoff+kernel_base, "Marijuan", 8);
+  ```
+  This is tihmstar's own reusable kernel-jailbreak harness, internally
+  codenamed **"v0rtex"** per that file's own header comment — one generic
+  C source he's compiled into at least three different deliverables over
+  the years: EtasonUntether (AppleTV/iOS 8.4.1), UntetherHomeDepot (iOS
+  9.1-9.3.4), and jelbrekTime (watchOS 4.1, the one whose source he
+  actually published). The watermark isn't a one-off either — it's a
+  standing signature technique across tihmstar's whole toolchain: his
+  real, currently-maintained [`tihmstar/libpatchfinder`](https://github.com/tihmstar/libpatchfinder)
+  has a dedicated, reusable `get_MarijuanARM_patch()` used for both
+  32-bit and 64-bit targets, including a 32-bit iOS 8 kernel-patchfinder
+  file (`kernelpatchfinder32_iOS8.cpp`) whose own header comment reads
+  "Created by tihmstar on 13.08.21" — about 3.5 months after this
+  tarball's own timestamps. Circumstantial, not proof, but consistent with
+  our `untether.bin` being a snapshot of tihmstar's own private,
+  actively-developed 2021-era tooling that was never packaged into a
+  public `.deb`, rather than a third party's build.
+
+**Conclusion:** this repo's `tihmstar-untether.tar` is real, author-sourced
+material, not a mystery artifact — `expl.js`/`orphan_commander`/`daemonload`
+are confirmed byte-identical to tihmstar's own still-live Cydia package, and
+`untether.bin` is a hand-patched build of his own publicly-acknowledged
+"v0rtex" kernel-harness lineage (source partially public via `jelbrekTime`,
+even though this exact compiled variant isn't). The 15-byte patch itself is
+now fully characterized (see above: 14 bytes are a same-length kernel-banner
+string swap, 1 byte is an unexplained code-immediate tweak elsewhere), and
+an intermediate-official-release hypothesis for the base build is ruled out
+(Wayback Machine shows only two `etasonuntether` releases ever existed,
+`1.3.0`/`1.3.1`, with byte-identical `untether.bin`s). What's still
+genuinely open: the actual origin of the *unpatched* `orig_untether.bin`
+base build itself — bigger than, and only ~33-35% opcode-similar to, either
+currently-published `etasonuntether`/`untetherhomedepot` release, so not a
+recompile of either — and who applied the 15-byte patch (no name/signature/
+commit trail recovered anywhere). See `.claude/TODO.md`.
+
+### Full snapshot of `repo.tihmstar.net`, archived while it's still up
+
+Once `repo.tihmstar.net` turned out to still be live (see above), we pulled
+every package it currently lists, not just the four this project actually
+uses — since finding it alive at all this many years on was already a
+surprise, there's no telling how long that stays true. All 35 entries in
+its `Packages`/`Packages.gz` index returned a real `200` (nothing 40x'd),
+and every one MD5- and size-verified against the index's own manifest
+before being added to `Blackb0x/Debs/`. Beyond the four already documented
+above (`net.tihmstar.etasonuntether-1.3.1.deb`,
+`net.tihmstar.daemonloader-1.0.0.deb`, `net.tihmstar.untetherhomedepot.deb`,
+`net.tihmstar.untetherhomedepotoffsets.deb`), this pulled in tihmstar's
+other exploit-scene tooling (`kloader-1.0.0.deb`, `libcrippy-1.0.0.deb`,
+`libpartialzip-1.0.0.deb`), a handful of third-party tweaks hosted on the
+same repo (`com.56klabs.fuzzyduck`/`fuzzypie`, `com.compilingentropy.
+fuzzycactus`, `com.nexuist.webzzuf`, `com.uroboro.tools`), and a long tail
+of tihmstar's own small `org.tihmstar.*` jailbreak-detection-bypass/tweak
+packages (`NoJBDetect`, `hideMyBadge`, `CGFix`, `secretLauncher`,
+`sneakySelfie`, etc. — mostly unrelated to this project's own jailbreak
+chain, kept purely for archival reasons since the repo itself might not
+stay up).
+
+**None of this is wired into `packages.txt`** — these are a pure archival
+snapshot, not something `bake-all-ramdisks` installs. Curating which (if
+any) are worth actually shipping is a separate decision from preserving
+them before the repo disappears.
 
 ### The `jsc`/`rtbuddyd`/`--early-boot` mechanism, resolved
 

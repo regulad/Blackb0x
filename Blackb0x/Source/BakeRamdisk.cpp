@@ -1418,34 +1418,243 @@ static bool stageDebcache(const fs::path& blackb0xRoot, std::vector<std::string>
     return allOk;
 }
 
+// Hand-writes a real dpkg `status` stanza for a package whose persistence
+// files stageEtasonatv()/stageP0sixspwn() below extract directly from its
+// real .deb instead of running a genuine `dpkg --unpack`/`--configure` —
+// merged (appended) into the exact same private/var/lib/dpkg/status
+// stageDebcache()'s mergePreinstalledPackages() already staged earlier in
+// stageBlackb0xTree() (see that function's own call ordering), not a
+// separate/competing status file. Both callers' packages are firmware-
+// version-gated (see scripts/build_deb_cache.py's
+// KNOWN_EXPECTED_UNRESOLVABLE) and never reach computePreinstallEligibleFilenames()'s
+// real `dpkg --unpack`+`--configure` pass at all, so without this dpkg has
+// zero record either package exists — this is the "install it for real
+// rather than a dpkg stub" fix for that gap.
+//
+// Deliberately does NOT carry over the real .deb's own Depends:/Conflicts:/
+// Provides: fields. This project's own synthetic "firmware" version (see
+// kPreinstallInnerScript's own comment) is exactly what makes these two
+// packages' real Depends: firmware lines unsatisfiable — copying that field
+// into a stanza that otherwise unconditionally claims "installed" would
+// make the on-device dpkg/apt genuinely believe it has a broken package.
+// postinstall.sh's own `apt-get install -f`/`upgrade`/`autoremove` run for
+// real against this exact status file on a real device (under `set -e`):
+// apt trying to "fix" a broken dependency by removing the package would hit
+// each package's own prerm, which explicitly refuses removal (`exit 1`) —
+// turning a cosmetic dependency mismatch into a hard postinstall.sh
+// failure. Omitting Depends:/Conflicts:/Provides: avoids ever triggering
+// that path; nothing in packages.txt's own closure references either
+// package by name anyway, so nothing downstream needed those relationship
+// fields to resolve correctly in the first place.
+//
+// `stanza` itself is expected to come from buildStatusStanzaFromControl()
+// below — the real .deb's own control fields (Version, Architecture,
+// Maintainer, Section, Installed-Size if the real control has one,
+// Description, ...) copied verbatim, not hand-typed here, so this can't
+// silently drift from whatever .deb actually ships. The empty `.md5sums`
+// matches the "firmware" synthetic package's own precedent in
+// kPreinstallInnerScript (dpkg --audit only checks a `.md5sums` file
+// exists, never its content) — but `.list` here is real and non-empty
+// (unlike firmware's, which has no files of its own), so `dpkg -S`/`-L`
+// correctly attributes these real on-disk paths to their real package name
+// once merge_tree() has written them onto the actual device (entrypoint.c,
+// not this bake-time staging, creates usr/libexec/rtbuddyd for
+// net.tihmstar.etasonuntether specifically — see that file's
+// fixup_etasonuntether_rtbuddyd() — so it's listed here as an owned path
+// even though it isn't one of the files this function itself stages).
+static bool stageManualDpkgInstall(const fs::path& blackb0xRoot, const std::string& stanza,
+                                    const std::string& pkgName, const std::vector<std::string>& ownedPaths) {
+    fs::path statusPath = blackb0xRoot / "private/var/lib/dpkg/status";
+    std::ofstream status(statusPath, std::ios::app);
+    if (!status) {
+        fprintf(stderr, "bakeRamdisk: cannot append dpkg status for %s at %s\n", pkgName.c_str(),
+                statusPath.c_str());
+        return false;
+    }
+    status << stanza << "\n";
+    status.close();
+
+    fs::path listPath = blackb0xRoot / ("private/var/lib/dpkg/info/" + pkgName + ".list");
+    ensureParentDirs(blackb0xRoot, listPath);
+    std::ofstream list(listPath, std::ios::trunc);
+    if (!list) {
+        fprintf(stderr, "bakeRamdisk: cannot write %s\n", listPath.c_str());
+        return false;
+    }
+    for (const auto& p : ownedPaths) list << p << "\n";
+    list.close();
+    chmod(listPath.c_str(), 0644);
+    chown(listPath.c_str(), 0, 0);
+
+    fs::path md5Path = blackb0xRoot / ("private/var/lib/dpkg/info/" + pkgName + ".md5sums");
+    std::ofstream md5(md5Path, std::ios::trunc);
+    if (!md5) {
+        fprintf(stderr, "bakeRamdisk: cannot write %s\n", md5Path.c_str());
+        return false;
+    }
+    md5.close();
+    chmod(md5Path.c_str(), 0644);
+    chown(md5Path.c_str(), 0, 0);
+    return true;
+}
+
+// Turns a real .deb's own extracted `control` file into a dpkg status
+// stanza for stageManualDpkgInstall() above: injects `Status: install ok
+// installed` (or, with `hold` set, `Status: hold ok installed`) right after
+// the `Package:` line, and drops Depends:/Conflicts:/Provides: (plus their
+// RFC822 continuation lines — anything starting with a space/tab
+// immediately following a dropped field) per stageManualDpkgInstall()'s own
+// comment on why those three specifically aren't safe to carry over
+// verbatim. Every other real field (Version, Architecture, Maintainer,
+// Section, Description, ...) is copied exactly as the real .deb's own
+// control file has it, so this stanza can't silently drift from whatever
+// .deb is actually sitting in Blackb0x/Debs/ the way a hand-typed literal
+// duplicating those same fields could.
+//
+// `hold`'s "hold ok installed" is exactly the on-disk effect a real
+// `apt-mark hold`/`dpkg --set-selections` run would produce (only the
+// status file's `want` field — the first of its three space-separated
+// words — changes; `apt-mark hold` doesn't touch anything else) — dpkg
+// doesn't care how that word got there, so precomputing it here at bake
+// time is equivalent to running the real tool, without needing a live
+// device to actually run it against (apt-mark is a real ARM binary, see
+// Blackb0x/Debs/apt7_*.deb — nothing on this Linux build host can execute
+// it). stageEtasonatv() passes true: this project's own untether.bin
+// deliberately differs from the real .deb's own payload (see that
+// function's own comment), so letting postinstall.sh's later `apt-get
+// upgrade`/`autoremove` ever silently "fix" this package back to a real
+// resolved install would overwrite it with the wrong one.
+static std::string buildStatusStanzaFromControl(const std::string& controlPath, bool hold = false) {
+    std::ifstream in(controlPath, std::ios::binary);
+    if (!in) return std::string();
+
+    static const std::vector<std::string> kDropFields = {"Depends:", "Conflicts:", "Provides:"};
+
+    std::string out;
+    std::string line;
+    bool statusInjected = false;
+    bool dropping = false;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF control files, just in case
+        if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
+            if (dropping) continue;  // continuation of a dropped field
+            out += line + "\n";
+            continue;
+        }
+        dropping = false;
+        for (const auto& field : kDropFields) {
+            if (line.rfind(field, 0) == 0) {
+                dropping = true;
+                break;
+            }
+        }
+        if (dropping) continue;
+        out += line + "\n";
+        if (!statusInjected && line.rfind("Package:", 0) == 0) {
+            out += hold ? "Status: hold ok installed\n" : "Status: install ok installed\n";
+            statusInjected = true;
+        }
+    }
+    if (!statusInjected) return std::string();  // no Package: field — not a real control file
+    return out;
+}
+
 // iOS 8.4 branch — tihmstar's EtasonATV untether (see Blackb0x/Misc/README.md's
 // "etasonATV / tihmstar-untether provenance" for the jsc/rtbuddyd/--early-boot
-// mechanism this stages). uid 1000 / gid 985 on the /untether directory
-// itself is ported verbatim from the original disassembly (FUN_00003b44) —
-// an intentional, specific non-mobile/non-root ownership, not the same
-// 755-decimal-literal bug the directory *mode* values elsewhere in this
-// branch had (fixed to real 0755 here rather than propagated).
+// mechanism this stages), extracted directly from the real
+// net.tihmstar.etasonuntether .deb (Depends: firmware = 8.4.1, and its one
+// real repo — repo.tihmstar.net — turned out to be an unreliable live apt
+// dependency besides; see Blackb0x/Misc/apt/net.tihmstar.list.disabled and
+// Blackb0x/Misc/local_only_debs.txt) rather than the old, hand-assembled
+// tihmstar-untether.tar. Its real postinst never runs either way — see
+// stageManualDpkgInstall() below. Only the four loose payload
+// files plus the real dpkg state (stageManualDpkgInstall() above) are
+// staged here — the package's own postinst does real, live work (testing
+// the jsc stage1 exploit against a real device, then swapping
+// usr/libexec/rtbuddyd for a jsc symlink) that can't run at bake time
+// against a mounted-but-not-booted image, so it's never run through real
+// apt/dpkg (see prebake_package_blacklist.txt). The `--early-boot` symlink
+// below is the one piece of that postinst safe to replicate directly at
+// bake time (no live device state involved, unconditional either way in
+// the real postinst too). The rtbuddyd swap is NOT done here anymore —
+// see entrypoint.c's fixup_etasonuntether_rtbuddyd(), which needs to run
+// against the real target volume at install time, after this stanza's
+// dpkg state has already told it this package is installed, not against
+// this bake-time staging tree. uid 1000 / gid 985 on the /untether
+// directory itself is ported verbatim from the original disassembly
+// (FUN_00003b44) — an intentional, specific non-mobile/non-root ownership,
+// not the same 755-decimal-literal bug the directory *mode* values
+// elsewhere in this branch had (fixed to real 0755 here rather than
+// propagated).
 static bool stageEtasonatv(const fs::path& blackb0xRoot) {
-    std::string tarPath = resolveMiscPath("tihmstar-untether.tar");
+    std::string debPath = fs::absolute(resolveDebsPath() + "/net.tihmstar.etasonuntether-1.3.1.deb").string();
     std::string tempDir = makeTempDir("blackb0x-etasonatv-");
     if (tempDir.empty()) return false;
-    if (!fs::exists(tarPath) || !runCommand({"tar", "-xf", fs::absolute(tarPath).string()}, tempDir)) {
+    if (!fs::exists(debPath) || !runCommand({"ar", "x", debPath}, tempDir)) {
         fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s — 8.4 untether payload not staged\n",
-                tarPath.c_str());
+                debPath.c_str());
         std::error_code rmEc;
         fs::remove_all(tempDir, rmEc);
         return false;
+    }
+    std::string dataTar;
+    std::error_code dirEc;
+    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
+        if (e.path().filename().string().rfind("data.tar", 0) == 0) {
+            dataTar = e.path().string();
+            break;
+        }
+    }
+    if (dataTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", dataTar}, tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's data.tar.* — 8.4 untether payload not staged\n",
+                debPath.c_str());
+        std::error_code rmEc;
+        fs::remove_all(tempDir, rmEc);
+        return false;
+    }
+    std::string controlTar;
+    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
+        if (e.path().filename().string().rfind("control.tar", 0) == 0) {
+            controlTar = e.path().string();
+            break;
+        }
+    }
+    std::string stanza;
+    if (controlTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", controlTar}, tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's control.tar.* — dpkg state not staged\n",
+                debPath.c_str());
+    } else {
+        stanza = buildStatusStanzaFromControl(tempDir + "/control", /*hold=*/true);
+        if (stanza.empty()) {
+            fprintf(stderr, "bakeRamdisk: WARNING: %s's control.tar.* has no usable control file — dpkg state not staged\n",
+                    debPath.c_str());
+        }
     }
     bool ok = true;
     ok &= stageFile(blackb0xRoot, "private/etc/rc.d/daemonload", tempDir + "/etc/rc.d/daemonload", 0, 0, 0755);
     ok &= stageFile(blackb0xRoot, "usr/bin/orphan_commander", tempDir + "/usr/bin/orphan_commander", 0, 0, 0755);
     stageDir(blackb0xRoot, "untether", 1000, 985, 0755);
-    ok &= stageFile(blackb0xRoot, "untether/untether.bin", tempDir + "/untether/untether.bin", 0, 0, 0644);
+    // The real .deb's own untether.bin is NOT staged here — see
+    // Blackb0x/Misc/README.md's "etasonATV / tihmstar-untether provenance"
+    // section: this project's own untether.bin (kept standalone at
+    // Blackb0x/Misc/untether.bin once the original tarball that bundled it
+    // was retired) checks against real AppleTV3 (S5L8947X) kernel banners
+    // across several tvOS 8.4.x point releases, while the .deb's own build
+    // never references that SoC at all — it's a generic multi-device
+    // (iPhone4S/iPad2/iPad3/iPod5/iPhone5/iPad4) payload pinned to exactly
+    // firmware 8.4.1. Using ours instead is deliberate, not a bug.
+    ok &= stageFile(blackb0xRoot, "untether/untether.bin", resolveMiscPath("untether.bin"), 0, 0, 0644);
     ok &= stageFile(blackb0xRoot, "untether/expl.js", tempDir + "/untether/expl.js", 0, 0, 0644);
-    stageSymlink(blackb0xRoot, "usr/libexec/rtbuddyd", "/System/Library/Frameworks/JavaScriptCore.framework/Resources/jsc");
     stageSymlink(blackb0xRoot, "--early-boot", "/untether/expl.js");
     ok &= stageFile(blackb0xRoot, "Library/LaunchDaemons/xyz.regulad.blackb0x.postinstall.plist",
                      resolveMiscPath("xyz.regulad.blackb0x.postinstall.plist"), 0, 0, 0644);
+    if (!stanza.empty()) {
+        ok &= stageManualDpkgInstall(blackb0xRoot, stanza, "net.tihmstar.etasonuntether",
+                                      {"/etc/rc.d/daemonload", "/usr/bin/orphan_commander", "/untether/untether.bin",
+                                       "/untether/expl.js", "/--early-boot", "/usr/libexec/rtbuddyd"});
+    } else {
+        ok = false;
+    }
     std::error_code rmEc;
     fs::remove_all(tempDir, rmEc);
     return ok;
@@ -1467,13 +1676,32 @@ static bool stageIos7Tether(const fs::path& blackb0xRoot) {
 
 // 6.1.4 branch — p0sixspwn's own untether payload, extracted directly from
 // the real .deb rather than loose files (superseding the old, deleted
-// p0sixspwn.tgz — see Misc/README.md's "Dropped entirely" section). Only
-// the three files p0sixspwn's persistence exploit itself needs in place
-// before reboot are staged here; the package's dpkg-info bookkeeping
-// files and its own /etc/launchd.conf are deliberately not — the real
-// .deb (already in packages.txt) registers all of that properly
-// once postinstall.sh actually installs it through apt, which fstab.atv's
-// removal already established as this project's intent for this package.
+// p0sixspwn.tgz — see Misc/README.md's "Dropped entirely" section). The
+// three payload files p0sixspwn's persistence exploit itself needs in
+// place before reboot are staged here, plus the real dpkg state
+// (stageManualDpkgInstall() above) — this package never actually resolves
+// through real apt (see scripts/build_deb_cache.py's
+// KNOWN_EXPECTED_UNRESOLVABLE), so without that call dpkg would have zero
+// record it's installed at all, same gap net.tihmstar.etasonuntether had.
+//
+// Its own /etc/launchd.conf — the real, load-bearing mechanism (`unload
+// MobileFileIntegrity` -> remount rw -> `DYLD_INSERT_LIBRARIES=_.dylib` ->
+// `bsexec untether` -> reload) that actually makes these staged files run
+// at every boot — is still NOT staged anywhere in this codebase. An
+// earlier version of this comment claimed the real .deb "registers all of
+// that properly once postinstall.sh actually installs it through apt,"
+// but that's not what happens: this package is firmware-gated (see
+// scripts/build_deb_cache.py's KNOWN_EXPECTED_UNRESOLVABLE), so it's never
+// even in postinstall.sh's own install array, and its postinst never runs
+// as a result — a different mechanism than net.tihmstar.etasonuntether
+// above (which DOES reach that array now, via local_only_debs.txt, but
+// whose postinst still never runs either, since apt finds it already at
+// the exact held Status/Version stageManualDpkgInstall() wrote and treats
+// the real install as a no-op). Reimplementing that
+// /etc/launchd.conf write is tracked as an open TODO (see .claude/TODO.md)
+// rather than attempted blind here — nobody on this project currently has
+// the 6.1.3/6.1.4-era AppleTV2,1 hardware this branch targets to verify
+// against.
 static bool stageP0sixspwn(const fs::path& blackb0xRoot) {
     std::string debPath = fs::absolute(resolveDebsPath() + "/com.ih8sn0w-squiffy-winocm.p0sixspwn_1.4-1_iphoneos-arm.deb").string();
     std::string tempDir = makeTempDir("blackb0x-p0sixspwn-");
@@ -1500,6 +1728,24 @@ static bool stageP0sixspwn(const fs::path& blackb0xRoot) {
         fs::remove_all(tempDir, rmEc);
         return false;
     }
+    std::string controlTar;
+    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
+        if (e.path().filename().string().rfind("control.tar", 0) == 0) {
+            controlTar = e.path().string();
+            break;
+        }
+    }
+    std::string stanza;
+    if (controlTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", controlTar}, tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's control.tar.* — dpkg state not staged\n",
+                debPath.c_str());
+    } else {
+        stanza = buildStatusStanzaFromControl(tempDir + "/control");
+        if (stanza.empty()) {
+            fprintf(stderr, "bakeRamdisk: WARNING: %s's control.tar.* has no usable control file — dpkg state not staged\n",
+                    debPath.c_str());
+        }
+    }
     bool ok = true;
     ok &= stageFile(blackb0xRoot, "usr/libexec/dirhelper", tempDir + "/usr/libexec/dirhelper", 0, 0, 0755);
     stageDir(blackb0xRoot, "private/var/untether", 0, 0, 0755);
@@ -1507,6 +1753,12 @@ static bool stageP0sixspwn(const fs::path& blackb0xRoot) {
     ok &= stageFile(blackb0xRoot, "private/var/untether/untether", tempDir + "/var/untether/untether", 0, 0, 0755);
     ok &= stageFile(blackb0xRoot, "System/Library/LaunchDaemons/xyz.regulad.blackb0x.postinstall.plist",
                      resolveMiscPath("xyz.regulad.blackb0x.postinstall.plist"), 0, 0, 0644);
+    if (!stanza.empty()) {
+        ok &= stageManualDpkgInstall(blackb0xRoot, stanza, "com.ih8sn0w-squiffy-winocm.p0sixspwn",
+                                      {"/usr/libexec/dirhelper", "/var/untether/_.dylib", "/var/untether/untether"});
+    } else {
+        ok = false;
+    }
     std::error_code rmEc;
     fs::remove_all(tempDir, rmEc);
     return ok;
@@ -1634,6 +1886,10 @@ static bool stageBlackb0xTree(const std::string& parentDir, const std::string& p
               0644);
     stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/xbmc.list", resolveMiscPath("apt/xbmc.list"), kUidMobile,
               kGidStaff, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/sources.list.d/net.tihmstar.list",
+              resolveMiscPath("apt/net.tihmstar.list"), kUidMobile, kGidStaff, 0644);
+    stageFile(blackb0xRoot, "private/etc/apt/trusted.gpg.d/net.tihmstar.gpg", resolveMiscPath("apt/net.tihmstar.gpg"),
+              0, 0, 0644);
     // Points at var/mobile/.blackb0x/local-debs, which stageDebcache()
     // below only actually populates if this bake's debcache run had
     // local-only entries — an always-present but sometimes-empty source
