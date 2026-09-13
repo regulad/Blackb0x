@@ -133,3 +133,95 @@ history shows this kind of change can look correct on paper and still be
 wrong in a way only real hardware would catch. See `BakeRamdisk.cpp`'s
 `stageP0sixspwn()` for the specifics of what's currently staged vs. what
 the real package's postinst does that isn't replicated anywhere yet.
+
+## 4. Bring back macOS support for `blackb0x` (and, eventually, ramdisk baking too)
+
+`AGENTS.md` currently states "CLI-only, Linux-only... dropped, not
+dual-maintained" as a "don't re-litigate without asking" convention — this
+entry reopens that by explicit request.
+
+First cut is scoped to the `blackb0x`/`gaster` CLI path only — ramdisk
+baking (`bake-all-ramdisks`, `BakeRamdisk.cpp`) can stay Linux-only in the
+interim (real loop-mounted HFS+, `CAP_SYS_ADMIN`), with a macOS build of
+`blackb0x` consuming `dist/` output baked elsewhere in the meantime. But
+macOS support for the ramdisk baker itself is also wanted eventually, not
+permanently deferred — see its own subsection below.
+
+Real blockers, in the code today:
+
+- `target_link_options(blackb0x PRIVATE -Wl,--allow-multiple-definition)`
+  (`CMakeLists.txt:1007`) — papers over a real `common/collection.c` symbol
+  collision between statically-linked `libusbmuxd`/`libimobiledevice-glue`.
+  GNU-ld-only flag; Apple's linker has no equivalent (the old
+  `-multiply_defined suppress` synonym is gone from Xcode 15+'s new
+  linker). Needs an actual fix on macOS — drop one archive's copy of the
+  symbol, or rename — not another flag.
+- `ResourcePath.cpp`'s `resolveGasterPath()` reads `/proc/self/exe` to find
+  the sibling `gaster` binary — no `/proc` on Darwin. Needs
+  `_NSGetExecutablePath()` (`<mach-o/dyld.h>`) behind `#ifdef __APPLE__`.
+- `DeviceManager.cpp`'s `isUninterruptible()` reads `/proc/<pid>/status`
+  for the D-state kill diagnostic — no Darwin equivalent via `/proc`.
+  Needs a `libproc.h`- or `ps -o stat=`-based check (BSD `ps` reports `U`
+  for uninterruptible wait), or a generic fallback message on that
+  platform.
+- `runGaster()`'s hard requirement on GNU `stdbuf` (to force line-buffered
+  stdio over a pipe) — not present on macOS by default. Either also probe
+  for Homebrew coreutils' `gstdbuf`, or replace the whole pipe+`stdbuf`
+  mechanism with a `forkpty()`-backed child so stdio is naturally
+  line-buffered on both platforms without an external binary at all (the
+  more robust fix).
+
+Needs real macOS hardware to verify, not just code review:
+
+- Whether libusb's Darwin backend can claim a checkm8/DFU-mode Apple TV
+  without the system's own `usbmuxd`/`MobileDevice` stack interfering —
+  `gaster` here is built with `HAVE_LIBUSB` (not its own native IOKit
+  path), so it inherits whatever libusb's Darwin backend does. Likely
+  fine, unverified in this repo.
+- Whether the `--no-preflight` usbmuxd workaround this repo needs on Linux
+  is even relevant against macOS's built-in `usbmuxd` (probably not, since
+  it's Apple's own reference daemon) — a docs question, not code.
+
+Low-risk, expected to already work: `libusb_ext`'s `--disable-udev` is a
+no-op on Darwin (that configure branch is Linux-only, backend is
+autodetected); no other GNU-ld-only flags exist in the vendored
+`ExternalProject_Add` blocks; the autotools-based vendored deps
+(`libimobiledevice`, `libirecovery`, `wolfssl`, `curl`, `libzip`,
+`libpng`, `bzip2`, `zlib`) all build on Darwin routinely elsewhere, given
+Xcode CLT + Homebrew's autoconf/automake/libtool/pkg-config in place of
+the Linux build-deps list. `Cli.cpp`'s udev/sudo help text and
+`IPSWDownloader.hpp`'s `ipswDataRoot()` XDG-only fallback are both
+cosmetically Linux-flavored but not blockers.
+
+### 4a. macOS support for the ramdisk baker (`bake-all-ramdisks`/`BakeRamdisk.cpp`)
+
+Not started. Unlike the `blackb0x` CLI path above, this one plausibly gets
+*simpler* on macOS rather than harder, since HFS+ and DMG tooling are
+native there instead of a bolted-on Linux kernel driver:
+
+- `BakeRamdisk.cpp`'s whole reason for existing as a privileged,
+  `CAP_SYS_ADMIN`/`CAP_CHOWN`-requiring step is that Linux has no
+  in-process way to grow/write a real HFS+ volume — it has to loop-mount
+  one via the kernel's `hfsplus` driver and shell out to
+  `mkfs.hfsplus`/`fsck.hfsplus` (see `Patcher.hpp`'s and
+  `BakeRamdisk.cpp`'s own long comments on this). macOS has first-party
+  `hdiutil`/`diskutil` for creating, resizing, and attaching HFS+ `.dmg`
+  images, and attaching a user-owned image doesn't require root at all —
+  the whole loop-mount/`CAP_SYS_ADMIN` mechanism this file exists to work
+  around may not be needed on macOS in the first place. Worth designing
+  fresh against `hdiutil attach`/`hdiutil create` rather than porting the
+  Linux mount-based flow as-is.
+- `mount`/`umount`/`blkid` subprocess calls in `BakeRamdisk.cpp` would need
+  a `hdiutil attach -mountpoint ...`/`hdiutil detach` equivalent path.
+- `scripts/build_deb_cache.py`'s `podman` dependency (`BakeRamdisk.cpp`'s
+  `buildPicklist()`) — Podman does run on macOS, but always through a
+  Linux VM (`podman machine`), not natively; needs verifying the picklist
+  resolution flow still works through that indirection, or an alternative.
+- The `$SUDO_USER`/`runuser` re-invocation dance (for podman's rootless
+  storage) is Linux/systemd-flavored and likely doesn't apply to macOS at
+  all if the `hdiutil`-based rewrite above removes the root requirement
+  entirely.
+- Same `xxd`/autotools/toolchain build-time deps as the `blackb0x` side.
+
+No code started here — this is scoping notes only, to pick up whenever
+this is prioritized.
