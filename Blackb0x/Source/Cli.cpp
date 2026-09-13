@@ -20,7 +20,6 @@
 #include "IPSW.hpp"
 #include "IPSWDownloader.hpp"
 #include "Patcher.hpp"
-#include "ResourcePath.hpp"
 
 extern "C" {
 #include <plist/plist.h>
@@ -31,12 +30,9 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <thread>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -55,10 +51,10 @@ void printCliUsage(const char* argv0) {
     printf("                            prints what would run/be sent instead\n");
     printf("  --help                    Show this message\n");
     printf("\n");
-    printf("blackb0x must be run as root: patching the restore ramdisk loop-mounts a\n");
-    printf("real HFS+ image (needs CAP_SYS_ADMIN) and preserves file ownership via\n");
-    printf("`cp -a` (needs CAP_CHOWN), and talking to a DFU-mode device needs raw USB\n");
-    printf("access. Run it via `sudo blackb0x ...`.\n");
+    printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
+    printf("raw USB access, which the kernel restricts to root unless a udev rule grants\n");
+    printf("it to your own user (see the README's own setup section). Run it via\n");
+    printf("`sudo blackb0x ...` if you haven't set that up.\n");
 }
 
 CliOptions parseCliOptions(int argc, char** argv) {
@@ -417,35 +413,19 @@ int runCli(const CliOptions& options) {
 
     printf("blackb0x (regulad's linux port) — Apple TV 2/3 jailbreak tool\n");
 
-    // Read once, up front — pushed over AFC2 once the jailbreak is confirmed
-    // running (see the onDeviceUpdated sink below), not baked into the
-    // ramdisk. Missing is a warning, not a hard failure: unlike the old
-    // ramdisk-baked path, the jailbreak itself doesn't depend on this.
-    std::string authorizedKeysContents;
-    if (auto authorizedKeysPath = findUserAuthorizedKeysPath()) {
-        std::ifstream f(*authorizedKeysPath, std::ios::binary);
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        authorizedKeysContents = ss.str();
-        printf("SSH access will be granted from %s once the jailbreak finishes booting.\n\n",
-               authorizedKeysPath->c_str());
-    } else {
-        printf(
-            "No ~/.ssh/authorized_keys found — SSH access will not be granted automatically.\n"
-            "Generate one first (e.g. `ssh-keygen`) and add your public key there if you want\n"
-            "the jailbroken device reachable over SSH.\n\n");
-    }
-
     if (options.dryRun) {
         printf("(dry run) Discovery, DFU wait, download, and patch all happen for real.\n");
         printf("(dry run) Only the exploit and the USB upload are skipped.\n\n");
     }
     fflush(stdout);
 
-    if (geteuid() != 0) {
-        fprintf(stderr, "blackb0x must run as root (raw USB access). Re-run with sudo.\n");
-        return 1;
-    }
+    // No hard root requirement: raw DFU/Recovery-mode USB access is a kernel
+    // device-node permission, not something this process can determine in
+    // advance for every possible udev/group setup. Running as root always
+    // works; running as a normal user works too, given the right udev rule
+    // (see README's own setup section) — either way, gaster/libirecovery's
+    // own device-open calls are what actually surface a real permission
+    // error, with a real errno behind it, if access genuinely isn't there.
 
     // Nothing this tool can ever do succeeds without at least one baked
     // ramdisk sitting in dist/ — patchRamdisk() (Patcher.cpp) checks for a
@@ -494,18 +474,13 @@ int runCli(const CliOptions& options) {
         printf("Disconnected (%llu)\n", (unsigned long long)ecid);
     };
     sink.onStatus = [](const std::string& status) { printf("%s\n", status.c_str()); };
-    std::set<std::string> authorizedKeysPushedFor;
-    sink.onDeviceUpdated = [&authorizedKeysContents, &authorizedKeysPushedFor](const AppleTVDevice& d) {
+    std::set<std::string> jailbreakRunningAnnouncedFor;
+    sink.onDeviceUpdated = [&jailbreakRunningAnnouncedFor](const AppleTVDevice& d) {
         if (d.jailbroken) {
             printf("%s is jailbroken%s\n", d.deviceModel.c_str(), d.jailbreakRunning == 1 ? " and running" : "");
         }
-        if (d.jailbreakRunning == 1 && !authorizedKeysContents.empty() &&
-            authorizedKeysPushedFor.insert(d.udid).second) {
-            if (pushAuthorizedKeys(d.udid, authorizedKeysContents)) {
-                printf("SSH access granted on %s\n", d.deviceModel.c_str());
-            } else {
-                fprintf(stderr, "Failed to push authorized_keys to %s over AFC2\n", d.deviceModel.c_str());
-            }
+        if (d.jailbreakRunning == 1 && jailbreakRunningAnnouncedFor.insert(d.udid).second) {
+            printf("Run scripts/push_authorized_keys.sh if you want SSH access to %s.\n", d.deviceModel.c_str());
         }
     };
     deviceManager.setEventSink(sink);

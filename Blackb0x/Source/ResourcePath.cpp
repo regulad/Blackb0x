@@ -14,7 +14,6 @@
 #include <climits>
 #include <cstdlib>
 
-#include <pwd.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -164,26 +163,3 @@ std::string ramdiskOverlayContentHash() {
 }
 
 std::string sumFileFor(const std::string& outputPath) { return outputPath + ".sum"; }
-
-std::optional<std::string> findUserAuthorizedKeysPath() {
-    std::string homeDir;
-
-    if (const char* sudoUser = getenv("SUDO_USER"); sudoUser && *sudoUser) {
-        if (struct passwd* pw = getpwnam(sudoUser)) {
-            if (pw->pw_dir) homeDir = pw->pw_dir;
-        }
-    }
-    if (homeDir.empty()) {
-        if (const char* home = getenv("HOME"); home && *home) {
-            homeDir = home;
-        } else if (struct passwd* pw = getpwuid(getuid())) {
-            if (pw->pw_dir) homeDir = pw->pw_dir;
-        }
-    }
-    if (homeDir.empty()) return std::nullopt;
-
-    std::string path = homeDir + "/.ssh/authorized_keys";
-    std::error_code ec;
-    if (!fs::exists(path, ec) || ec) return std::nullopt;
-    return path;
-}

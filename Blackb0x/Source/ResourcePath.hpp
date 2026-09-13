@@ -13,7 +13,6 @@
 
 #pragma once
 
-#include <optional>
 #include <string>
 
 // Resolves the ramdisk overlay root: $BLACKB0X_RAMDISK_DIR if set,
@@ -87,13 +86,3 @@ std::string ramdiskOverlayContentHash();
 // before trusting it — catches "someone edited ramdisk/ and forgot to
 // re-run bake-all-ramdisks" instead of silently shipping stale content.
 std::string sumFileFor(const std::string& outputPath);
-
-// Locates the invoking human's own SSH authorized_keys, so the jailbroken
-// device ends up reachable with keys the user already controls (pushed over
-// AFC2 post-boot — see DeviceManager::pushAuthorizedKeys()). blackb0x runs
-// as root, so plain $HOME resolves to root's home, not the actual person
-// running the tool — resolve via $SUDO_USER first when present, matching
-// how the tool is actually expected to be invoked (`sudo blackb0x ...`).
-// Returns nullopt if no home directory or no ~/.ssh/authorized_keys could
-// be found.
-std::optional<std::string> findUserAuthorizedKeysPath();

@@ -61,6 +61,8 @@ fresh clone + build, not just assumed):
   to talk to, full stop.
 - **`ssh-keygen`** — you need a real SSH keypair of your own (see "Steps to
   jailbreak" below); this tool doesn't generate one for you.
+- **`ssh`** — used by `scripts/push_authorized_keys.sh` to grant yourself SSH access
+  to the device once it's jailbroken; see that step below.
 - **`stdbuf`** (GNU coreutils) — **required**, not optional: `blackb0x` refuses to
   run the `checkm8` exploit at all without it. `gaster`'s own progress output only
   gets flushed live through `stdbuf`; without it, a stuck/hanging exploit run would
@@ -113,6 +115,51 @@ sudo systemctl restart usbmuxd
 (Adjust the `ExecStart=` path/args to match your distro's existing unit —
 `systemctl cat usbmuxd` shows the original.)
 
+### One-time system setup (optional): run `blackb0x` without root
+
+`blackb0x` itself only ever needs root for one thing: opening a raw USB handle to
+the Apple TV while it's in DFU, Recovery, or WTF mode (vendor `05ac`, product
+`1222`/`1227`/`1280`-`1283` — the exact set of modes `libirecovery` ever opens a
+handle for). The kernel's default device-node permissions restrict that to root;
+a udev rule can hand it to your own user instead, via a real group rather than
+a desktop-session ACL (`TAG+="uaccess"` only covers whoever's logged in at the
+active graphical seat — this also needs to work headless/over SSH, which a
+group membership doesn't care about):
+
+```sh
+# 1. Create the plugdev group if your distro doesn't already ship one
+#    (Debian/Ubuntu do by default; Fedora, Arch, and others don't).
+getent group plugdev >/dev/null || sudo groupadd --system plugdev
+
+# 2. Add yourself to it.
+sudo usermod -aG plugdev "$USER"
+
+# 3. Grant that group access to the Apple TV's DFU/Recovery/WTF-mode USB device.
+sudo tee /etc/udev/rules.d/70-blackb0x.rules <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1222", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1227", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="128[0-3]", GROUP="plugdev", MODE="0660"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Then **log out and back in** (or run `newgrp plugdev` in your current shell) —
+group membership changes don't apply to sessions that already exist — and
+**unplug/replug the Apple TV** so the device node gets re-created under the new
+rule. After that, `./build/blackb0x` runs directly, no `sudo`.
+
+This only affects `blackb0x` itself. `sudo ./build/bake-all-ramdisks` still
+needs root regardless (it loop-mounts a real HFS+ image, which genuinely needs
+`CAP_SYS_ADMIN`) — this setup doesn't change that.
+
+If `blackb0x` still can't reach the device non-root after all of the above
+(commonly: "ERROR: Unable to connect to device" appearing immediately, even
+with the Apple TV visibly in DFU mode), check `lsusb -d 05ac:` shows the
+device and that the matching `/dev/bus/usb/*/*` node's group is actually
+`plugdev` (`ls -l`) — if it's still `root`, the rule didn't match or didn't
+reload; skip straight to `sudo ./build/blackb0x` rather than debug it further.
+
 ## Steps to jailbreak
 
 0. (3,1 only) PWN with Arduino + [synackuk's fork of checkm8-A5](https://github.com/synackuk/checkm8-a5) first.
@@ -122,21 +169,34 @@ sudo systemctl restart usbmuxd
    `blackb0x` itself needs for USB). `--signed-only` restricts the run to firmware
    Apple is currently signing, typically just the latest one or two per device —
    drop the flag to bake every known combination instead, including older/unsigned
-   ones, if your device is on an older firmware than what's currently signed.
+   ones, if your
+   device is on an older firmware than what's currently signed.
    `blackb0x` refuses to run at all against an empty `dist/`, and refuses a specific
    device+firmware with no matching entry there — re-run this (without
    `--signed-only`, if your device needs an older build) rather than trying to work
    around either check.
 2. Plug in your Apple TV via micro-USB **and** plug in the power cable.
-3. Run `sudo ./build/blackb0x` (root is required — raw USB access and the ramdisk
-   patching step both need it). Add `--dry-run` to preview the exploit/firmware steps
+3. Run `sudo ./build/blackb0x` (root is required by default — raw DFU/Recovery-mode
+   USB access needs it; run `./build/blackb0x` without `sudo` instead if you've set
+   up the udev rule above). Add `--dry-run` to preview the exploit/firmware steps
    without actually running the exploit or uploading anything to the device.
 4. Follow the on-screen instructions to enter DFU mode.
 5. Once the jailbreak finishes installing, connect to your TV and wait 5–10 minutes
    until Kodi appears (be patient, go have a coffee).
-
-SSH access on the jailbroken device uses your own `~/.ssh/authorized_keys`, not a
-shared default — make sure you have a real SSH keypair (`ssh-keygen`) before running.
+6. (Optional) Want SSH access? Once `blackb0x` reports the jailbreak is running, run
+   `scripts/push_authorized_keys.sh` — it pushes your own `~/.ssh/authorized_keys`
+   (make sure you have a real keypair first, `ssh-keygen`) onto the device over a
+   plain SSH connection tunneled through `usbmuxd`, so future connections use your
+   key instead of the device's default `root`/`alpine` password (Apple's own
+   long-standing default for every iOS/tvOS device, not something this project or
+   Cydia's openssh sets — ssh will just prompt for it interactively, like an
+   ordinary `ssh-copy-id` run). The script deliberately ignores your own
+   `~/.ssh/config` for this one connection (so a pubkey-only `Host *` entry there
+   doesn't kill that password fallback) and re-enables `ssh-dss`/`ssh-rsa`, since
+   this device's sshd is a 2014-era OpenSSH 6.7 that a modern `ssh` client
+   otherwise refuses to even handshake with. See the script's own `--help` for
+   options (targeting a specific device, a non-default keys file, etc.) — it needs
+   no root/sudo, unlike `blackb0x` itself.
 
 ## Development
 

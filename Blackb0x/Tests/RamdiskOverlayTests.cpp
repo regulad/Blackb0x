@@ -113,9 +113,9 @@ static void testDebsHasRequiredFiles() {
 
 // Regression guard: the ramdisk-stage sshd (and its host key/authorized_keys
 // baking) was deliberately dropped — SSH access is now granted post-boot,
-// over AFC2, using Cydia's own openssh package (see
-// DeviceManager::pushAuthorizedKeys() and ResourcePath's
-// findUserAuthorizedKeysPath()). None of it should quietly reappear here.
+// over Cydia's own openssh package, by running scripts/push_authorized_keys.sh
+// by hand once the jailbreak is confirmed running. None of it should quietly
+// reappear here.
 static void testOverlayHasNoSshdRemnants() {
     unsetenv("BLACKB0X_RAMDISK_DIR");
     fs::path root = resolveRamdiskPath();

@@ -253,9 +253,7 @@ struct MountGuard {
 // per entrypoint/README.md's own setup steps, and whatever
 // scripts/build_deb_cache.py's own podman calls need underneath it — all
 // belong to the real user, not root's own (separate) rootless podman
-// storage. Same $SUDO_USER convention ResourcePath's
-// findUserAuthorizedKeysPath() already uses, for the same reason (root's
-// own environment isn't the one that matters here).
+// storage.
 static bool runAsInvokingUser(const std::vector<std::string>& argv) {
     std::vector<std::string> cmd;
     const char* sudoUser = getenv("SUDO_USER");

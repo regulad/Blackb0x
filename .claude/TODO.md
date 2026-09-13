@@ -78,35 +78,51 @@ What's still open — narrower than before, but not closed:
   S5L8947X references) directly; both dead ends. No further leads found
   yet.
 
-## 2. Document & implement pushing SSH access to the device over AFC2
+## 2. Document & implement pushing SSH access to the device (resolved)
 
-Note: partial implementation already exists —
-`DeviceManager::pushAuthorizedKeys()` (`Blackb0x/Source/DeviceManager.cpp`)
-writes the invoking user's `~/.ssh/authorized_keys` to
-`/private/var/root/.ssh/authorized_keys` over `com.apple.afc2`
-(`com.saurik.afc2d`'s full-filesystem AFC service) once the jailbreak is
-confirmed running, wired in from `Cli.cpp` and mentioned briefly in both
-`AGENTS.md` and the top-level `README.md`. Treat this TODO as "make this
-real and complete," not "start from zero" — check the current
-implementation first before assuming there's nothing there.
+Previously: `DeviceManager::pushAuthorizedKeys()` hand-rolled an AFC2 write
+of the invoking user's `~/.ssh/authorized_keys` to
+`/private/var/root/.ssh/authorized_keys`, wired into `Cli.cpp` to run
+automatically once the jailbreak was confirmed running. This piled up
+exactly the "difficult flow" gaps this TODO originally listed (retry/timeout
+semantics, `.ssh/` directory creation, permission bits, host-key
+reconciliation, fatal-vs-warning), all needing to be gotten right inside
+`main.cpp`'s dependency graph.
 
-Gaps to close:
+Replaced with `scripts/push_authorized_keys.sh`, run by hand, outside the
+main binary entirely: it forwards a local TCP port to the device's real
+sshd (Cydia's own openssh package, already running post-boot) via
+`iproxy` (already built as part of the vendored `libusbmuxd`, no new
+dependency), then pushes the keys file over that tunnel like a normal
+`ssh-copy-id`. This sidesteps every gap above instead of solving it in C++:
+- Mechanism is now just "read `scripts/push_authorized_keys.sh`" — plain
+  `ssh`/`iproxy`, no bespoke AFC2 protocol code to document.
+- Retry/timeout is a simple TCP-reachability poll loop in the script, not
+  hand-rolled `waitForAFC2` state in `DeviceManager.cpp`.
+- `.ssh/` creation and `chmod 700`/`600` permissions are one `ssh` command
+  (`mkdir -p && chmod && cat > ... && chmod`) — the old AFC2 path never set
+  permissions at all, a latent bug now fixed as a side effect.
+- Host-key reconciliation is solved by not needing it: the script uses
+  `UserKnownHostsFile=/dev/null` + `StrictHostKeyChecking=accept-new`, so a
+  throwaway `127.0.0.1:<port>` tunnel never pollutes the user's real
+  `~/.ssh/known_hosts`, and normal `ssh`/password-prompt UX (default Cydia
+  openssh password `alpine`) handles first connect.
+- Fatal-vs-warning is moot: it's an optional, separate, user-run step with
+  its own exit code, not something `blackb0x`'s own run can fail on.
+- Device/tether-combination coverage is now uniform by construction — the
+  script only depends on Cydia's openssh already running post-boot, not on
+  anything exploit-path-specific, so there's no separate path per device to
+  validate.
 
-- No dedicated write-up anywhere (`Blackb0x/Misc/README.md` or `AGENTS.md`)
-  of the actual mechanism: which AFC2 calls are made, retry/timeout
-  behavior around `waitForAFC2`, what happens on partial failure (e.g.
-  `.ssh/` directory doesn't exist yet, write succeeds but permissions are
-  wrong), and how this interacts with Cydia's own `sshd-keygen-wrapper`
-  (which generates the device's host key — does anything reconcile that key
-  into the invoking user's own `~/.ssh/known_hosts`, or is the user left to
-  click through a host-key-mismatch prompt on first connect?).
-- Confirm this path is actually exercised for every supported device/tether
-  combination (AppleTV 2,1 / 3,1 / 3,2, tethered and untethered) — the
-  current wiring may only have been validated against one.
-- Decide/document whether a failed `pushAuthorizedKeys()` should be fatal or
-  just a warning (currently just logs "Failed to push authorized_keys..."
-  and continues — confirm that's actually the right call given the rest of
-  the jailbreak already succeeded at that point).
+`blackb0x` itself now only prints a one-line pointer to the script once
+`jailbreakRunning` first flips to 1 (`Cli.cpp`'s `onDeviceUpdated`); see
+`AGENTS.md`'s "Build & run" and "Runtime requirements" sections and the
+top-level `README.md`'s "Steps to jailbreak" step 6 for the user-facing
+writeup. Not yet re-verified against real hardware end-to-end (no unit
+available this session) — the mechanism (usbmuxd TCP forwarding + a real
+sshd behind it) is standard and low-risk, but flag if a real run surfaces
+anything `iproxy`-specific (e.g. AppleTV 2,1's older tvOS/openssh build
+behaving differently) worth recording here.
 
 ## 3. Reimplement p0sixspwn's postinst in `entrypoint.c`
 

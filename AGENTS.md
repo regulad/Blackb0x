@@ -70,7 +70,8 @@ original macOS Cocoa/Objective-C app (the `.m`/`.mm`/`.h` files still in
   tree — no more SSH-only vs full-Cydia split, so no reason to split the tree
   itself either; it used to be `common/`+`cydia/` subdirectories for exactly that
   now-gone distinction). Host key generation and SSH access are no longer baked in
-  here at all — see `BakeRamdisk.cpp`/`DeviceManager::pushAuthorizedKeys()`. A
+  here at all — SSH access is granted post-boot, by hand, via
+  `scripts/push_authorized_keys.sh` (see "Build & run" below). A
   large chunk of `ramdisk/files/cydia/` and `ramdisk/files/p0sixspwn/` is actually
   pre-extracted content that originally came from real Cydia `.deb` packages
   (identifiable via the dpkg `.list` manifests still present under
@@ -126,7 +127,9 @@ cmake -S . -B build && cmake --build build -j$(nproc)
 # Writes dist/<device>_<buildID>-Ramdisk.dmg per firmware (gitignored):
 sudo ./build/bake-all-ramdisks [--signed-only]
 
-sudo ./build/blackb0x [--ecid <id> | --udid <id>] [--tether-boot] [--dry-run]
+./build/blackb0x [--ecid <id> | --udid <id>] [--tether-boot] [--dry-run]
+# (needs sudo instead, unless a udev rule already grants your own user raw
+# USB access to the device in DFU/Recovery/WTF mode — see README)
 ```
 
 Two binaries, deliberately separated by privilege:
@@ -146,9 +149,18 @@ Two binaries, deliberately separated by privilege:
   checks whether the `dist/` entry it needs already exists, and tells you to run
   `bake-all-ramdisks` if not. Re-running is cheap: any `dist/` entry that already
   exists is skipped.
-- **`blackb0x`** drives everything else (DFU discovery, the exploit, uploads, AFC2)
-  and only needs root for raw DFU-mode USB access. No udev rules, no install step —
-  both binaries run from wherever they're built.
+- **`blackb0x`** drives everything else (DFU discovery, the exploit, uploads, checking
+  jailbreak status over AFC2) and needs root *by default* only for raw DFU/
+  Recovery/WTF-mode USB access — there's no hard `geteuid() != 0` gate in
+  `Cli.cpp` (there used to be; removed as a genuine correctness fix, not a
+  relaxation for its own sake — a udev rule can hand a normal user that same
+  access, see README's own setup section, and a real permission failure surfaces
+  clearly from `libirecovery`'s own `irecv_open_with_ecid()` either way). No
+  install step — both binaries run from wherever they're built.
+- **`scripts/push_authorized_keys.sh`** is separate from both: a standalone,
+  no-root-needed script you run by hand, after `blackb0x` reports the jailbreak is
+  running, to grant yourself SSH access (see "Runtime requirements" below for what
+  it actually does).
 
 **Build-time system dependencies, verified against a real fresh clone + build (see
 README for the full list)**: a C/C++ toolchain, GNU make, CMake ≥3.16,
@@ -177,9 +189,12 @@ autoconf/automake/libtool/pkg-config (most of the tree is autotools-based), and
   Normal-mode device discovery silently never fires. Both of these have to ship in
   the end-user README.
 - The invoking user's own `~/.ssh/authorized_keys`, if SSH access is wanted —
-  `blackb0x` pushes it over AFC2 once the jailbreak is confirmed running (see
-  `DeviceManager::pushAuthorizedKeys()`); missing is a warning, not a hard failure,
-  since (unlike the old ramdisk-baked path) nothing else depends on it.
+  `blackb0x` itself no longer touches this at all; run
+  `scripts/push_authorized_keys.sh` by hand once the jailbreak is confirmed running
+  (it forwards a local TCP port to the device's real sshd — Cydia's own openssh
+  package — over `usbmuxd`/`iproxy`, then pushes the file like a normal
+  `ssh-copy-id`). Entirely optional, no root/sudo needed, and nothing else in
+  `blackb0x` depends on it.
 - `stdbuf` (GNU coreutils) — **required**, not optional: `runGaster()`
   (`DeviceManager.cpp`) checks for it on `PATH` before ever forking `gaster` and
   refuses to run the exploit at all if it's missing, rather than silently falling
