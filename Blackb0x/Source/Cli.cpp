@@ -20,6 +20,7 @@
 #include "IPSW.hpp"
 #include "IPSWDownloader.hpp"
 #include "Patcher.hpp"
+#include "ResourcePath.hpp"
 
 extern "C" {
 #include <plist/plist.h>
@@ -981,11 +982,42 @@ int runCli(const CliOptions& options) {
     // signed build for any still-supported device (this is what makes
     // ipsw.me's "latest" endpoint meaningful at all) --
     // IpswFetch::firmwareURLForDevice() already treats the literal string
-    // "latest" as a request for exactly that (see its own implementation),
-    // so just ask for it directly instead of guessing/enumerating
-    // signedBuildsForDevice()'s own (unordered, not "give me the newest")
-    // result set.
-    if (options.stockSecurerom || options.stockRecovery) buildToRequest = "latest";
+    // "latest" as a request for exactly that (see its own implementation).
+    if (options.stockSecurerom || options.stockRecovery) {
+        buildToRequest = "latest";
+
+        // useStockIBSS()'s decrypt-only branch (stockRecovery without
+        // stockSecurerom) still needs a real local Blackb0x/ImageKeys/
+        // entry, and whatever build ipsw.me's "latest" resolves to often
+        // has no published keys at all yet (see Cli.hpp's own comment on
+        // stockRecovery) even though an OLDER build is still currently
+        // signed and DOES have a local .keys file. Enumerate every
+        // currently-signed build via signedBuildsForDevice() and prefer
+        // whichever one(s) blackb0x already has local keys for, picking
+        // the lexicographically-greatest match as a best-effort "newest"
+        // (safe in practice: candidates here are always both currently-
+        // signed AND already locally keyed, which in this project's own
+        // ImageKeys/ history has never spanned the 9.x/10.x digit-count
+        // boundary where plain string comparison would misorder). Falls
+        // straight through to the literal "latest" above, unchanged, if
+        // none of the currently-signed builds have local keys either --
+        // strictly better than guessing blind, never worse than before
+        // this existed.
+        std::set<std::string> signedBuilds = signedBuildsForDevice(device.deviceModel);
+        std::string preferred;
+        for (const auto& build : signedBuilds) {
+            std::error_code ec;
+            std::string keysPath =
+                resolveImageKeyPath(device.deviceModel + "/" + device.deviceModel + "_" + build + ".keys");
+            if (fs::exists(keysPath, ec)) preferred = build;
+        }
+        if (!preferred.empty()) {
+            printf("%s has local keys for currently-signed build %s -- requesting that instead of blindly "
+                   "resolving \"latest\".\n",
+                   device.deviceModel.c_str(), preferred.c_str());
+            buildToRequest = preferred;
+        }
+    }
 
     auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
                                                    options.dontCheckFirmwareSums, options.stockRamdisk,
