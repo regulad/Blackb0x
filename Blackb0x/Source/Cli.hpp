@@ -31,6 +31,14 @@ struct CliOptions {
     // patching/entrypoint.c or earlier in the chain (see
     // Patcher::useStockRamdisk()'s own comment).
     bool stockRamdisk = false;
+    // Sends the stock iBSS/iBEC exactly as downloaded from Apple instead
+    // of blackb0x's own patched versions -- checkm8/pwnTool still runs
+    // first (SecureROM's own signature check still needs bypassing to
+    // accept any file at all), but no boot-args/KASLR/ticket-check
+    // patches get applied to the bootloader itself. Same diagnostic
+    // purpose as stockRamdisk above, orthogonal to it (see
+    // Patcher::useStockIBSS()/useStockIBEC()'s own comment).
+    bool noPwn = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or
     // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms

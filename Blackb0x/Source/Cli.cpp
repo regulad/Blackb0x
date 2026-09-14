@@ -70,13 +70,22 @@ void printCliUsage(const char* argv0) {
     printf("                            re-running bake-all-ramdisks every time; NOT\n");
     printf("                            the default, since it can silently ship a\n");
     printf("                            stale ramdisk.\n");
-    printf("  --stock-ramdisk           Send the stock RestoreRamdisk exactly as\n");
-    printf("                            downloaded from Apple, instead of the\n");
-    printf("                            blackb0x-patched one -- diagnostic, to check\n");
-    printf("                            whether a boot failure is in blackb0x's own\n");
-    printf("                            ramdisk patching/entrypoint.c or earlier in\n");
-    printf("                            the chain. The device will NOT be jailbroken\n");
-    printf("                            by a run using this flag.\n");
+    printf("  --stock-ramdisk           DIAGNOSTIC: send the stock RestoreRamdisk exactly\n");
+    printf("                            as downloaded from Apple, instead of the\n");
+    printf("                            blackb0x-patched one -- to check whether a boot\n");
+    printf("                            failure is in blackb0x's own ramdisk\n");
+    printf("                            patching/entrypoint.c or earlier in the chain.\n");
+    printf("                            The device will NOT be jailbroken by a run\n");
+    printf("                            using this flag.\n");
+    printf("  --no-pwn                  DIAGNOSTIC: send the stock iBSS/iBEC exactly as\n");
+    printf("                            downloaded from Apple (still runs checkm8 first --\n");
+    printf("                            SecureROM's own signature check still needs\n");
+    printf("                            bypassing to accept any file at all -- but no\n");
+    printf("                            boot-args/KASLR/ticket-check patches applied to\n");
+    printf("                            the bootloader itself) -- to check whether a boot\n");
+    printf("                            failure is in blackb0x's own iBSS/iBEC patches or\n");
+    printf("                            elsewhere in the chain. The device will NOT be\n");
+    printf("                            jailbroken by a run using this flag.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -111,6 +120,8 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.dontCheckFirmwareSums = true;
         } else if (arg == "--stock-ramdisk") {
             options.stockRamdisk = true;
+        } else if (arg == "--no-pwn") {
+            options.noPwn = true;
         } else if (arg == "--pwntool") {
             std::string value = nextArg("--pwntool");
 #if defined(__APPLE__)
@@ -298,7 +309,8 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
 std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, const AppleTVDevice& device,
                                                               const std::string& buildToRequest,
                                                               bool onlyBootComponents,
-                                                              bool dontCheckFirmwareSums, bool stockRamdisk) {
+                                                              bool dontCheckFirmwareSums, bool stockRamdisk,
+                                                              bool noPwn) {
     patcher.onlyBootComponents = onlyBootComponents;
     patcher.dontCheckFirmwareSums = dontCheckFirmwareSums;
 
@@ -360,9 +372,19 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
         patchFn(localPath);
     };
 
-    downloadAndPatch("iBSS", manifest->iBSSPath, [&](const std::string& path) { patcher.patchiBSS(path); });
+    downloadAndPatch("iBSS", manifest->iBSSPath, [&](const std::string& path) {
+        if (noPwn) {
+            patcher.useStockIBSS(path);
+        } else {
+            patcher.patchiBSS(path);
+        }
+    });
 
     downloadAndPatch("iBEC", manifest->iBECPath, [&](const std::string& path) {
+        if (noPwn) {
+            patcher.useStockIBEC(path);
+            return;
+        }
         // Verbatim version heuristic from the original setIBECPath: — iBEC
         // files for 4.x-era firmware need empty flags and no ticket.
         if (path.find("4.") != std::string::npos) {
@@ -642,21 +664,22 @@ int runCli(const CliOptions& options) {
         return 1;
     }
 
+    if (options.stockRamdisk || options.noPwn) {
+        fprintf(stderr, "DIAGNOSTIC run:%s%s -- the device will NOT be jailbroken even if everything "
+                        "below succeeds.\n",
+                options.stockRamdisk ? " --stock-ramdisk (stock RestoreRamdisk)" : "",
+                options.noPwn ? " --no-pwn (stock iBSS/iBEC)" : "");
+    }
+
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
 
-    auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
-                                                   options.dontCheckFirmwareSums, options.stockRamdisk);
+    auto components =
+        downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
+                                    options.dontCheckFirmwareSums, options.stockRamdisk, options.noPwn);
     if (!components) {
         fprintf(stderr, "Failed to download/patch firmware components.\n");
         return 1;
-    }
-
-    if (options.stockRamdisk) {
-        fprintf(stderr,
-                "--stock-ramdisk: this run sends the stock, unmodified RestoreRamdisk -- the device "
-                "will NOT be jailbroken even if everything below succeeds. This is a diagnostic run "
-                "only.\n");
     }
 
     if (!sendComponentsToDevice(deviceManager, device, *components, tetherBoot, options.dryRun)) {
@@ -668,9 +691,11 @@ int runCli(const CliOptions& options) {
         return 0;
     }
 
-    if (options.stockRamdisk) {
-        printf("\nDone. --stock-ramdisk was set -- the Apple TV should reboot into a stock, "
-               "non-jailbroken state if this diagnostic run succeeded.\n");
+    if (options.stockRamdisk || options.noPwn) {
+        printf("\nDone. DIAGNOSTIC run (%s%s%s) -- the Apple TV should reboot into a stock, "
+               "non-jailbroken state if this run succeeded.\n",
+               options.stockRamdisk ? "--stock-ramdisk" : "", options.stockRamdisk && options.noPwn ? ", " : "",
+               options.noPwn ? "--no-pwn" : "");
     } else {
         printf("\nDone. %s\n", tetherBoot ? "The Apple TV should now boot the tethered jailbreak."
                                            : "The Apple TV should now reboot into the jailbroken system.");

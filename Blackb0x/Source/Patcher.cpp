@@ -131,6 +131,34 @@ bool Patcher::patchiBSS(const std::string& path) {
     return true;
 }
 
+// See Patcher.hpp's own comment. Deliberately minimal compared to
+// patchiBSS() above: decrypt()s exactly the same way, but skips the
+// iBootPatcher() call (and the AppleTV2-vs-AppleTV3 patchedPath/outPath
+// filename-heuristic branch that only matters for picking which of
+// patchiBSS()'s two *patched* outputs to keep) entirely -- there's only
+// ever one output here, the plain decrypted file, since nothing about it
+// differs by device model when unpatched.
+bool Patcher::useStockIBSS(const std::string& path) {
+    const FirmwareKeyPair* k = keyFor("iBSS");
+    if (!k) {
+        fprintf(stderr, "useStockIBSS: no iBSS keys loaded\n");
+        return false;
+    }
+
+    std::string outPath = outputPathFor(path);
+
+    fprintf(stderr,
+            "--no-pwn: decrypting the stock iBSS exactly as downloaded from Apple -- no boot-args/"
+            "KASLR/ticket-check patches applied.\n");
+
+    decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
+            const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE", nullptr);
+
+    outputs_.iBSS = outPath;
+    checkPatching();
+    return true;
+}
+
 bool Patcher::patchiBEC(const std::string& path, const std::string& flags, bool ticket) {
     (void)flags;
     const FirmwareKeyPair* k = keyFor("iBEC");
@@ -175,6 +203,35 @@ bool Patcher::patchiBEC(const std::string& path, const std::string& flags, bool 
     outputs_.iBECDowngrade = downgradePath;
     outputs_.iBECBoot = outPath;
 
+    checkPatching();
+    return true;
+}
+
+// See Patcher.hpp's own comment. Unlike patchiBEC(), there's no
+// downgrade-vs-boot distinction to make here at all -- both boot-args
+// variants above exist purely to steer iBootPatcher()'s own patch
+// selection for two different call sites (tethered downgrade vs full
+// jailbreak boot); with no patching happening, both outputs are the exact
+// same plain decrypted file, so both PatchedComponents fields just point
+// at it.
+bool Patcher::useStockIBEC(const std::string& path) {
+    const FirmwareKeyPair* k = keyFor("iBEC");
+    if (!k) {
+        fprintf(stderr, "useStockIBEC: no iBEC keys loaded\n");
+        return false;
+    }
+
+    std::string outPath = outputPathFor(path);
+
+    fprintf(stderr,
+            "--no-pwn: decrypting the stock iBEC exactly as downloaded from Apple -- no boot-args/"
+            "KASLR/ticket-check patches applied.\n");
+
+    decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
+            const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE", nullptr);
+
+    outputs_.iBECDowngrade = outPath;
+    outputs_.iBECBoot = outPath;
     checkPatching();
     return true;
 }
