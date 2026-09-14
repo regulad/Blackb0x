@@ -197,7 +197,7 @@ public:
     // patch step. Called once per entry in IPSW.hpp's own
     // ManifestInfo::loadedByIBootComponents (see that field's own
     // comment) -- name must match the manifest's own component key
-    // exactly, since DeviceManager::sendFirmwareComponent() sends it
+    // exactly, since DeviceManager::sendStockRestoreTail() sends it
     // alongside the "firmware" command the same way real idevicerestore
     // does, and nothing here validates it further.
     void addLoadedByIBootComponent(const std::string& name, const std::string& path);

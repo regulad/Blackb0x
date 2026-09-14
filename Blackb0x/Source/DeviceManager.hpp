@@ -26,6 +26,11 @@ extern "C" {
 #include <libimobiledevice/libimobiledevice.h>
 }
 
+// Patcher.hpp's own struct -- only referenced here (sendStockRestoreTail()'s
+// own parameter, by const ref) to avoid pulling that whole header in;
+// DeviceManager.cpp includes it for the real definition.
+struct PatchedComponents;
+
 // Declared here (with C linkage, matching their definitions in
 // DeviceManager.cpp) so the friend declarations below grant access to these
 // exact functions rather than implicitly declaring new C++-linkage ones.
@@ -132,41 +137,44 @@ public:
                  std::shared_ptr<void> buildIdentity = nullptr, const std::string& deviceModel = "",
                  const std::string& buildID = "");
     int sendiBEC(const std::string& path, uint64_t ecid);
-    // Gated on stockRecovery (Cli.hpp's CliOptions), not stockSecurom --
-    // this is about whether useStockIBEC()'s genuinely-unpatched iBEC is
-    // what's running, not whether checkm8 ran to get there (see
-    // Cli.cpp's sendComponentsToDevice() own comment for the full
-    // reasoning). Fetches and sends the combined APTicket that
-    // authorizes every component after iBSS together -- see
-    // Personalize.hpp's own fetchAPTicket() comment for why this is a
-    // separate step from personalizing iBSS itself. Must be called once,
-    // after sendiBEC() succeeds and before
-    // sendDeviceTree()/sendRamdisk()/sendKernelCache() -- a stock iBEC
-    // won't accept any of those without this on file first, matching
-    // real idevicerestore's own ordering (recovery.c's
-    // recovery_send_ticket(), called immediately on entering Recovery
-    // mode, before anything else).
-    int sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
-                      const std::string& buildID);
-    // Only called when Patcher.hpp's PatchedComponents::restoreLogo is
-    // set (this build's manifest actually lists a RestoreLogo component
-    // -- see ManifestInfo::restoreLogoPath's own comment). Sends the
-    // file, then "setpicture 4"/"bgcolor 0 0 0" (matching idevicerestore's
-    // recovery.c's recovery_send_applelogo() exactly) -- must run right
-    // after sendAPTicket(), before sendRamdisk(), same ordering reasoning
-    // as sendAPTicket()'s own comment.
-    int sendRestoreLogo(const std::string& path, uint64_t ecid);
-    // One call per entry in Patcher.hpp's PatchedComponents::loadedByIBoot
-    // (almost always empty -- see IPSW.hpp's own
-    // ManifestInfo::loadedByIBootComponents comment). Sends the file, then
-    // the "firmware" command, matching idevicerestore's own
-    // recovery_send_loaded_by_iboot()/recovery_send_component_and_command().
-    // Must run alongside sendRestoreLogo() above -- after sendAPTicket(),
-    // before sendRamdisk().
-    int sendFirmwareComponent(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
     int sendDeviceTree(const std::string& path, uint64_t ecid);
+
+    // stockRecovery only (see sendComponentsToDevice()'s own comment for
+    // why that's the gate, not stockSecurom): whether useStockIBEC()'s
+    // genuinely-unpatched iBEC is what's running, not whether checkm8 ran
+    // to get there -- patch_ticket_check() (patchiBEC(), applied by
+    // default) is what makes a ticket unnecessary, and it only ever runs
+    // against blackb0x's own patched iBEC.
+    //
+    // Sends the combined APTicket that authorizes every component after
+    // iBSS together (see Personalize.hpp's own fetchAPTicket() comment
+    // for why it's separate from personalizing iBSS itself), then
+    // (unless onlyBootComponents) RestoreLogo (if
+    // PatchedComponents::restoreLogo is set -- not every build's
+    // manifest has one) / loaded-by-iBoot components (almost always
+    // empty) / Ramdisk / DeviceTree, then KernelCache ('bootx') --
+    // matching real idevicerestore's own ordering (recovery.c's
+    // recovery_enter_restore(): ticket -> AppleLogo -> loaded-by-iBoot ->
+    // Ramdisk -> DeviceTree -> KernelCache). Includes sendKernelCache()'s
+    // own post-'bootx' left-Recovery-mode check.
+    //
+    // Confirmed directly on real hardware that this whole sequence needs
+    // to run on ONE persistent connection, not the usual reconnect-per-
+    // step pattern the rest of this class uses: closing and reopening
+    // right after the ticket specifically (not after any of the OTHER
+    // resets in this chain -- iBSS->iBEC, iBEC->DeviceTree, etc., which
+    // only ever need a Recovery-mode-preserving reconnect) drops the
+    // device all the way back to DFU mode, even though the "ticket"
+    // command itself gets acknowledged cleanly. Real idevicerestore never
+    // closes its own connection across this same span either (one
+    // irecv_client_t for the whole ticket-through-KernelCache sequence).
+    //
+    // deviceModel is AppleTVDevice::deviceModel (the signed-build warning
+    // before the TSS request).
+    int sendStockRestoreTail(uint64_t ecid, const PatchedComponents& components, const std::string& deviceModel,
+                              bool onlyBootComponents);
 
     // --- Jailbreak status polling (was checkJailbreak/checkJailbreakRunning) ---
     void checkJailbreak(const std::string& udid);

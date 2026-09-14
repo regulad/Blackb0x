@@ -19,6 +19,7 @@
 //
 
 #include "DeviceManager.hpp"
+#include "Patcher.hpp"
 #include "Personalize.hpp"
 #include "ResourcePath.hpp"
 #include "SHAtter.h"
@@ -1201,94 +1202,6 @@ int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
     return (err == IRECV_E_SUCCESS) ? 0 : -1;
 }
 
-int DeviceManager::sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
-                                 const std::string& buildID) {
-    irecv_client_t client = get_tv_patient(ecid);
-    if (!client) {
-        fprintf(stderr, "sendAPTicket: device did not reconnect\n");
-        return -1;
-    }
-
-    const struct irecv_device_info* info = irecv_get_device_info(client);
-    auto ticket =
-        fetchAPTicket(buildIdentity, ecid, info->ap_nonce, info->ap_nonce_size, deviceModel, buildID);
-    if (!ticket) {
-        irecv_close(client);
-        return -1;
-    }
-
-    irecv_error_t err = irecv_send_buffer(client, ticket->data(), ticket->size(), 0);
-    if (err != IRECV_E_SUCCESS) {
-        fprintf(stderr, "sendAPTicket: failed to send ApTicket (%zu bytes): %s\n", ticket->size(),
-                irecv_strerror(err));
-        irecv_close(client);
-        return -1;
-    }
-
-    err = irecv_send_command(client, "ticket");
-    if (err != IRECV_E_SUCCESS) {
-        fprintf(stderr, "sendAPTicket: failed to send 'ticket' command: %s\n", irecv_strerror(err));
-        irecv_close(client);
-        return -1;
-    }
-
-    fprintf(stderr, "sendAPTicket: sent ApTicket (%zu bytes) and device acknowledged the 'ticket' command.\n",
-            ticket->size());
-    // Every other send*() here (sendiBEC()/sendRamdisk()/sendKernelCache()/
-    // sendDeviceTree()) settles with sleep(2) after its own operation
-    // before the connection gets torn down -- this one was missing it.
-    // A real run showed DeviceTree's very next transfer immediately
-    // failing with a generic USB upload error right after this succeeded
-    // (having worked fine with identical content/device state in a run
-    // without any APTicket step at all) -- consistent with the device
-    // needing a moment to actually process/validate the ticket
-    // internally before it's ready for the next bulk transfer, same
-    // reasoning as every sibling function's own settle delay.
-    sleep(2);
-    irecv_close(client);
-    return 0;
-}
-
-int DeviceManager::sendRestoreLogo(const std::string& path, uint64_t ecid) {
-    irecv_client_t client = get_tv_patient(ecid);
-    if (!client) {
-        fprintf(stderr, "sendRestoreLogo: device did not reconnect for %s\n", path.c_str());
-        return -1;
-    }
-    // Every upload right after a successfully-acknowledged APTicket has
-    // failed so far, regardless of which component or how long we wait
-    // first -- ruling out both timing and ordering. Before guessing a
-    // fourth fix, confirm directly whether this reconnect actually landed
-    // back in real Recovery mode, or something else the transfer would
-    // legitimately fail against.
-    int mode = 0;
-    irecv_get_mode(client, &mode);
-    fprintf(stderr, "sendRestoreLogo: reconnected in mode %s (raw 0x%x) for %s\n", mode_to_str(mode), mode,
-            path.c_str());
-    irecv_error_t err = irecv_send_file(client, path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
-    if (err != IRECV_E_SUCCESS) {
-        fprintf(stderr, "sendRestoreLogo: failed to send %s: %s\n", path.c_str(), irecv_strerror(err));
-        irecv_close(client);
-        return -1;
-    }
-    err = irecv_send_command(client, "setpicture 4");
-    if (err != IRECV_E_SUCCESS) {
-        fprintf(stderr, "sendRestoreLogo: failed to send 'setpicture 4' command: %s\n", irecv_strerror(err));
-        irecv_close(client);
-        return -1;
-    }
-    err = irecv_send_command(client, "bgcolor 0 0 0");
-    if (err != IRECV_E_SUCCESS) {
-        fprintf(stderr, "sendRestoreLogo: failed to send 'bgcolor 0 0 0' command: %s\n", irecv_strerror(err));
-        irecv_close(client);
-        return -1;
-    }
-    fprintf(stderr, "sendRestoreLogo: sent %s and device acknowledged setpicture/bgcolor.\n", path.c_str());
-    irecv_close(client);
-    sleep(2);
-    return 0;
-}
-
 // Shared by sendRamdisk()/sendKernelCache()/sendDeviceTree() below: send a
 // file, then a follow-up command that tells the device what to do with it
 // (e.g. "ramdisk", "bootx", "devicetree"). Sending the command after a
@@ -1296,8 +1209,12 @@ int DeviceManager::sendRestoreLogo(const std::string& path, uint64_t ecid) {
 // act on data it never fully received, so this bails (and reports exactly
 // which of the two steps failed, and why) rather than sending it anyway and
 // unconditionally reporting success like the three callers used to.
+// keepOpen: for sendStockRestoreTail() below -- when true, never closes
+// `client` (success or failure), leaving connection lifecycle entirely
+// to the caller. Every other caller here leaves this at its default
+// (false, unchanged behavior).
 static int sendFileThenCommand(irecv_client_t client, const char* what, const std::string& path,
-                                const char* command) {
+                                const char* command, bool keepOpen = false) {
     if (!client) {
         fprintf(stderr, "%s: device did not reconnect for %s\n", what, path.c_str());
         return -1;
@@ -1305,13 +1222,13 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
     irecv_error_t err = irecv_send_file(client, path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
     if (err != IRECV_E_SUCCESS) {
         fprintf(stderr, "%s: failed to send %s: %s\n", what, path.c_str(), irecv_strerror(err));
-        irecv_close(client);
+        if (!keepOpen) irecv_close(client);
         return -1;
     }
     err = irecv_send_command(client, command);
     if (err != IRECV_E_SUCCESS) {
         fprintf(stderr, "%s: failed to send '%s' command: %s\n", what, command, irecv_strerror(err));
-        irecv_close(client);
+        if (!keepOpen) irecv_close(client);
         return -1;
     }
     // Previously silent on success -- this step's own USB-level outcome
@@ -1325,16 +1242,8 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
     // check for exactly that gap, since USB-level success and an actual
     // successful boot are two different, genuinely distinguishable things.
     fprintf(stderr, "%s: sent %s and device acknowledged the '%s' command.\n", what, path.c_str(), command);
-    irecv_close(client);
+    if (!keepOpen) irecv_close(client);
     return 0;
-}
-
-int DeviceManager::sendFirmwareComponent(const std::string& path, uint64_t ecid) {
-    // get_tv_patient(): same reasoning as sendiBEC() above.
-    irecv_client_t client = get_tv_patient(ecid);
-    int result = sendFileThenCommand(client, "sendFirmwareComponent", path, "firmware");
-    sleep(2);
-    return result;
 }
 
 // A real run against an AppleTV3,2 failed mid-Ramdisk-upload with a bulk
@@ -1522,6 +1431,100 @@ int DeviceManager::sendDeviceTree(const std::string& DeviceTree_Path, uint64_t e
     int result = sendFileThenCommand(client, "sendDeviceTree", DeviceTree_Path, "devicetree");
     sleep(2);
     return result;
+}
+
+int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& components,
+                                         const std::string& deviceModel, bool onlyBootComponents) {
+    irecv_client_t client = get_tv_patient(ecid);
+    if (!client) {
+        fprintf(stderr, "sendStockRestoreTail: device did not reconnect\n");
+        return -1;
+    }
+
+    const struct irecv_device_info* info = irecv_get_device_info(client);
+    auto ticket = fetchAPTicket(components.buildIdentity, ecid, info->ap_nonce, info->ap_nonce_size, deviceModel,
+                                 components.buildID);
+    if (!ticket) {
+        irecv_close(client);
+        return -1;
+    }
+
+    irecv_error_t err = irecv_send_buffer(client, ticket->data(), ticket->size(), 0);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendStockRestoreTail: failed to send ApTicket (%zu bytes): %s\n", ticket->size(),
+                irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    err = irecv_send_command(client, "ticket");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendStockRestoreTail: failed to send 'ticket' command: %s\n", irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    fprintf(stderr, "sendStockRestoreTail: sent ApTicket (%zu bytes) and device acknowledged the 'ticket' command.\n",
+            ticket->size());
+
+    if (!onlyBootComponents) {
+        if (components.restoreLogo) {
+            if (sendFileThenCommand(client, "sendStockRestoreTail(RestoreLogo)", *components.restoreLogo,
+                                     "setpicture 4", true) != 0) {
+                irecv_close(client);
+                return -1;
+            }
+            err = irecv_send_command(client, "bgcolor 0 0 0");
+            if (err != IRECV_E_SUCCESS) {
+                fprintf(stderr, "sendStockRestoreTail: failed to send 'bgcolor 0 0 0' command: %s\n",
+                        irecv_strerror(err));
+                irecv_close(client);
+                return -1;
+            }
+        }
+
+        for (const auto& [name, path] : components.loadedByIBoot) {
+            if (sendFileThenCommand(client, name.c_str(), path, "firmware", true) != 0) {
+                irecv_close(client);
+                return -1;
+            }
+        }
+
+        if (!components.ramdisk) {
+            fprintf(stderr, "sendStockRestoreTail: no ramdisk to send\n");
+            irecv_close(client);
+            return -1;
+        }
+        warnIfRamdiskExceedsDeviceLimit(client, *components.ramdisk);
+        if (sendFileThenCommand(client, "sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk", true) !=
+            0) {
+            irecv_close(client);
+            return -1;
+        }
+
+        if (!components.deviceTree) {
+            fprintf(stderr, "sendStockRestoreTail: no devicetree to send\n");
+            irecv_close(client);
+            return -1;
+        }
+        if (sendFileThenCommand(client, "sendStockRestoreTail(DeviceTree)", *components.deviceTree, "devicetree",
+                                 true) != 0) {
+            irecv_close(client);
+            return -1;
+        }
+    }
+
+    if (!components.kernel) {
+        fprintf(stderr, "sendStockRestoreTail: no kernelcache to send\n");
+        irecv_close(client);
+        return -1;
+    }
+    if (sendFileThenCommand(client, "sendStockRestoreTail(KernelCache)", *components.kernel, "bootx", true) != 0) {
+        irecv_close(client);
+        return -1;
+    }
+
+    irecv_close(client);
+    sleep(2);
+    return checkDeviceLeftRecoveryModeAfterBoot(ecid) ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------

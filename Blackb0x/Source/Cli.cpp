@@ -592,19 +592,27 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
     // ever runs against blackb0x's own patched iBEC -- stockRecovery's
     // stock iBEC has no such patch applied regardless of stockSecurom, so
     // it enforces real ticket verification on whatever it loads next
-    // (DeviceTree/Ramdisk/KernelCache) either way. See Personalize.hpp's
-    // fetchAPTicket()/DeviceManager::sendAPTicket()'s own comments. Must
-    // run right after iBEC succeeds, before anything else is sent --
-    // matching real idevicerestore's own ordering.
-    auto sendTicketIfNeeded = [&]() -> bool {
-        if (!stockRecovery) return true;
-        printf("Sending APTicket -> ");
+    // (DeviceTree/Ramdisk/KernelCache) either way.
+    //
+    // Everything from the ticket through KernelCache runs as ONE call
+    // (DeviceManager::sendStockRestoreTail()) on a single persistent
+    // connection when stockRecovery is set, rather than this function's
+    // usual reconnect-per-step calls -- confirmed directly on real
+    // hardware that reconnecting right after the ticket specifically
+    // (not after any of the OTHER resets in this chain) drops the device
+    // all the way back to DFU mode, matching real idevicerestore's own
+    // recovery_enter_restore(), which never closes its connection across
+    // this same span either. See sendStockRestoreTail()'s own comment.
+    auto sendStockTail = [&](bool onlyBootComponents) -> bool {
+        printf("Sending APTicket%s -> ", onlyBootComponents ? " + KernelCache"
+                                                              : " + RestoreLogo + Ramdisk + DeviceTree + "
+                                                                "KernelCache");
         fflush(stdout);
-        int i = deviceManager.sendAPTicket(device.ecid, components.buildIdentity, device.deviceModel,
-                                            components.buildID);
+        int i = deviceManager.sendStockRestoreTail(device.ecid, components, device.deviceModel, onlyBootComponents);
         printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
-            fprintf(stderr, "Failed to send APTicket. Re-enter DFU mode and try again.\n");
+            fprintf(stderr, "Failed to send the post-iBEC stock restore sequence. Re-enter DFU mode and try "
+                             "again.\n");
             return false;
         }
         return true;
@@ -622,7 +630,13 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
             return false;
         }
         device.didTetheredBoot = 1;
-        if (!sendTicketIfNeeded()) return false;
+
+        if (stockRecovery) {
+            if (!sendStockTail(/*onlyBootComponents=*/true)) return false;
+            device.waitForRecovery = 1;
+            printf("Waiting for Apple TV to boot\n");
+            return true;
+        }
     } else {
         printf("Sending iBEC (boot) -> ");
         fflush(stdout);
@@ -635,49 +649,15 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
                     "mode and try again.\n");
             return false;
         }
-        if (!sendTicketIfNeeded()) return false;
 
-        // Only present in some builds' manifests -- components.restoreLogo
-        // is unset wherever downloadAndPatchComponents() found nothing to
-        // download (see ManifestInfo::restoreLogoPath's own comment).
-        // Matches idevicerestore's own recovery_send_applelogo(), called
-        // right after the ticket, before Ramdisk.
-        if (components.restoreLogo) {
-            printf("Sending RestoreLogo -> ");
-            fflush(stdout);
-            i = deviceManager.sendRestoreLogo(*components.restoreLogo, device.ecid);
-            printf("%s\n", (i == 0) ? "Sent" : "Error");
-            if (i != 0) {
-                fprintf(stderr, "Failed to send RestoreLogo. Re-enter DFU mode and try again.\n");
-                return false;
-            }
+        if (stockRecovery) {
+            if (!sendStockTail(/*onlyBootComponents=*/false)) return false;
+            device.needsPostInstall = 1;
+            device.waitForRecovery = 1;
+            printf("Waiting for Apple TV to reboot\n");
+            return true;
         }
 
-        // Almost always empty (see ManifestInfo::loadedByIBootComponents'
-        // own comment) -- matches idevicerestore's own
-        // recovery_send_loaded_by_iboot(), called right after AppleLogo,
-        // before Ramdisk.
-        for (const auto& [name, path] : components.loadedByIBoot) {
-            printf("Sending %s -> ", name.c_str());
-            fflush(stdout);
-            i = deviceManager.sendFirmwareComponent(path, device.ecid);
-            printf("%s\n", (i == 0) ? "Sent" : "Error");
-            if (i != 0) {
-                fprintf(stderr, "Failed to send %s. Re-enter DFU mode and try again.\n", name.c_str());
-                return false;
-            }
-        }
-
-        // Ramdisk before DeviceTree -- matches idevicerestore's own real
-        // ordering (recovery.c's recovery_enter_restore(): ticket ->
-        // AppleLogo -> components loaded by iBoot -> Ramdisk ->
-        // DeviceTree -> (SEP) -> KernelCache), which this had backwards.
-        // A real run showed DeviceTree specifically rejected with a
-        // generic USB upload failure immediately after a successfully-
-        // acknowledged APTicket send -- consistent with a stock iBEC
-        // expecting Ramdisk first and refusing anything sent out of that
-        // order, not a timing issue (a settle delay on the ticket send
-        // didn't change the outcome).
         printf("Sending Ramdisk -> ");
         fflush(stdout);
         i = components.ramdisk ? deviceManager.sendRamdisk(*components.ramdisk, device.ecid) : -1;
@@ -699,6 +679,8 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
         device.needsPostInstall = 1;
     }
 
+    // Only reached when stockRecovery is unset -- sendStockTail() above
+    // already includes KernelCache and returns directly otherwise.
     printf("Sending KernelCache -> ");
     fflush(stdout);
     int kernelResult = components.kernel ? deviceManager.sendKernelCache(*components.kernel, device.ecid) : -1;
