@@ -658,20 +658,51 @@ static bool stageAptListsCache(const fs::path& blackb0xRoot, const std::string& 
 // .deb filename prefixes that never get staged into the ramdisk's own apt
 // cache, even when scripts/build_deb_cache.py's real dependency resolution
 // says they're needed — real, but too big for this old A4-era ramdisk's
-// 70MB ceiling (kMaxRamdiskSize below) to absorb on top of everything else.
+// 64MiB ceiling (kMaxRamdiskSize below) to absorb on top of everything else.
 // org.xbmc.kodi-atv2 alone is ~40MB; com.nito.nitotv is ~1.65MB on its own
 // (checked directly against the real vendored .deb — nowhere near
-// kodi-atv2's size, but still excluded on request). Not staging the .deb
-// bytes doesn't mean the package is unreachable, though: its real Packages
-// metadata still gets staged via stageAptListsCache() below, and
-// postinstall.sh's array (see stagePostinstallScript()) still lists it —
-// apt will fetch it over the network at install time if one is reachable,
-// and just fail to install that one specific package (not the rest) if
-// not, matching the "opportunistic network, not required" design this
-// whole staging pass is built around.
+// kodi-atv2's size, but still excluded on request). odcctools (ld64/as/
+// otool/nm/strip/etc — a native build toolchain, not something a media/
+// jailbreak ramdisk needs at runtime) was confirmed via a real bake+ncdu
+// pass to be the single largest package actually staged by default:
+// ~7.7MB unpacked, versus single-digit-KB-to-low-MB for everything else
+// (checked directly: `ar p odcctools_*.deb control.tar.gz | tar -xzO
+// ./control` shows it Depends only on openssl/uuid, and grepping every
+// other vendored .deb's own control file for "odcctools" turns up nothing
+// — no other package here declares a dependency on it, so excluding it
+// from bake-time staging can't break dependency resolution for anything
+// else). gettext (3.2MB) and curl (0.7MB) followed the same audit: built
+// the real dependency graph from every vendored .deb's own Depends:/
+// Pre-Depends: field and computed the transitive closure actually needed
+// to bootstrap postinstall.sh (bash, dpkg, coreutils(-bin), apt7(-lib),
+// and what THEY pull in — berkeleydb, bzip2, diffutils, findutils, gnupg,
+// grep, gzip, lzma, ncurses, readline, sed, tar; 20 packages total).
+// Neither gettext nor curl is in that closure. gettext's only dependent
+// among every vendored package is wget (itself outside the closure); curl's
+// dependents (org.xbmc.kodi-atv2, the tihmstar exploit-tool packages,
+// apt7-ssl) are all optional/already-excluded/not the apt7 actually
+// staged. Checked directly, not assumed: extracted apt7-lib's real
+// data.tar and ran `strings` on its actual usr/lib/apt/methods/http
+// binary — no libcurl reference at all (this old apt implements its own
+// HTTP client), and usr/lib/apt/methods/https turned out to be a plain
+// symlink to http (no TLS lib linked either), confirming apt's own
+// network fetch genuinely doesn't touch curl or, for that matter, openssl.
+// openssl itself stays regardless: openssh (a real feature — SSH access is
+// the whole point of the jailbreak, not a bootstrap-only tool) genuinely
+// Depends: on it. Not staging the .deb bytes doesn't mean the package is
+// unreachable, though: its real Packages metadata still gets staged via
+// stageAptListsCache() below, and postinstall.sh's array (see
+// stagePostinstallScript()) still lists it — apt will fetch it over the
+// network at install time if one is reachable, and just fail to install
+// that one specific package (not the rest) if not, matching the
+// "opportunistic network, not required" design this whole staging pass is
+// built around.
 static const std::vector<std::string> kNeverStageDebs = {
     "org.xbmc.kodi-atv2_",
     "com.nito.nitotv_",
+    "odcctools_",
+    "gettext_",
+    "curl_",
 };
 
 static bool shouldSkipStagingDeb(const std::string& filename) {
@@ -926,6 +957,24 @@ static std::set<std::string> computePreinstallEligibleFilenames(const std::vecto
         if (blacklist.count(name)) excluded.insert(name);
     }
 
+    // kNeverStageDebs (see its own comment, above shouldSkipStagingDeb())
+    // means "never stage this .deb's bytes into the ramdisk, period" — that
+    // has to hold here too, not just in stageDebcache()'s own apt-cache
+    // loop. A real bake confirmed odcctools stayed in the finished ramdisk
+    // anyway after being added to kNeverStageDebs: it has no postinst, so
+    // it sailed straight into the bake-time preinstall set below (which
+    // never consulted kNeverStageDebs at all) and got unpacked directly
+    // into /blackb0x regardless. Folding it into `excluded` up front here,
+    // same as blacklist entries, reuses the exact dependency-propagation
+    // pass right below — anything that depends on a never-staged package
+    // gets correctly excluded too, instead of being preinstalled against a
+    // "dependency" whose files were never actually staged anywhere.
+    std::set<std::string> neverStage;
+    for (const auto& [name, filename] : filenameByPackage) {
+        if (shouldSkipStagingDeb(filename)) neverStage.insert(name);
+    }
+    for (const auto& name : neverStage) excluded.insert(name);
+
     bool changed = true;
     while (changed) {
         changed = false;
@@ -958,16 +1007,18 @@ static std::set<std::string> computePreinstallEligibleFilenames(const std::vecto
     }
 
     std::set<std::string> eligibleFilenames;
-    int excludedByBlacklist = 0, excludedByPropagation = 0;
+    int excludedByBlacklist = 0, excludedByNeverStage = 0, excludedByPropagation = 0;
     for (const auto& name : resolvedNames) {
         if (excluded.count(name)) {
             if (blacklist.count(name)) {
                 excludedByBlacklist++;
+            } else if (neverStage.count(name)) {
+                excludedByNeverStage++;
             } else {
                 excludedByPropagation++;
                 fprintf(stderr,
-                        "bakeRamdisk: %s not bake-time preinstalled — depends on a blacklisted package "
-                        "(transitively)\n",
+                        "bakeRamdisk: %s not bake-time preinstalled — depends on a blacklisted or never-staged "
+                        "package (transitively)\n",
                         name.c_str());
             }
         } else {
@@ -991,9 +1042,10 @@ static std::set<std::string> computePreinstallEligibleFilenames(const std::vecto
         }
     }
     fprintf(stderr,
-            "bakeRamdisk: bake-time preinstall: %zu eligible, %d blacklisted directly, %d excluded via dependency "
-            "propagation, out of %zu resolved packages\n",
-            eligibleFilenames.size(), excludedByBlacklist, excludedByPropagation, resolvedNames.size());
+            "bakeRamdisk: bake-time preinstall: %zu eligible, %d blacklisted directly, %d never-staged directly, "
+            "%d excluded via dependency propagation, out of %zu resolved packages\n",
+            eligibleFilenames.size(), excludedByBlacklist, excludedByNeverStage, excludedByPropagation,
+            resolvedNames.size());
 
     return eligibleFilenames;
 }
@@ -2296,18 +2348,20 @@ bool bakeRamdisk(const std::string& path, const std::string& key, const std::str
     decrypt(const_cast<char*>(decDMG.c_str()), const_cast<char*>(patchedDMG.c_str()), const_cast<char*>(key.c_str()),
             const_cast<char*>(iv.c_str()), (char*)"FALSE", const_cast<char*>(path.c_str()));
 
-    // Tripwire on the finished, baked ramdisk. 70MB is a rule of thumb, not
-    // a number pulled from any documented, authoritative protocol limit
-    // for this old-era A4 restore process — there's no known spec stating
-    // real hardware/iBoot rejects a RestoreRamdisk component above some
-    // exact byte count. It's here because a ramdisk that's quietly grown
-    // far past every previously-known-working size deserves a loud flag at
-    // bake time, where it's cheap to notice — but since it's a rule of
-    // thumb and not a real protocol ceiling, exceeding it only warns, it
-    // doesn't fail the bake: this output may well work fine on real
-    // hardware, and the tripwire's job is to get someone to look, not to
-    // block a build that has no better alternative.
-    constexpr uint64_t kMaxRamdiskSize = 70ull * 1024 * 1024;
+    // Tripwire on the finished, baked ramdisk. 64MiB isn't a rule of thumb
+    // anymore -- a real run against an AppleTV3,2 failed mid-Ramdisk-upload
+    // with a USB bulk short-write at exactly byte offset 0x4000000 (64MiB)
+    // on a 68.9MiB ramdisk, and the device's own "ramdisk-size" getenv
+    // response (queried by warnIfRamdiskExceedsDeviceLimit() in
+    // DeviceManager.cpp, right before sendRamdisk() uploads it) is the
+    // authoritative source for this number on a given device/firmware —
+    // this constant is this port's best-known floor for it, not a
+    // per-device query result baked into every future run. Exceeding it
+    // only warns rather than failing the bake, since some devices/firmwares
+    // may genuinely tolerate more (or less) — see
+    // warnIfRamdiskExceedsDeviceLimit() for the real, per-device check that
+    // runs immediately before the upload that actually matters.
+    constexpr uint64_t kMaxRamdiskSize = 64ull * 1024 * 1024;
     std::error_code finalSizeEc;
     uint64_t finalSize = fs::file_size(patchedDMG, finalSizeEc);
     if (finalSizeEc) {

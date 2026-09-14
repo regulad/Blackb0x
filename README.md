@@ -1,7 +1,7 @@
 # Blackb0x
 
 Untethered jailbreak tool for the 2nd/3rd-gen Apple TV, via the checkm8/SHAtter DFU-mode
-boot exploit — side-loads Cydia + Kodi. This is a Linux CLI port of the original macOS
+boot exploit — side-loads Cydia + Kodi. This is a portable CLI port of the original macOS
 app; it runs entirely from the command line, no GUI.
 
 Devices supported:
@@ -11,10 +11,12 @@ Devices supported:
   to pwn DFU mode first; `blackb0x` picks up from there
 - Apple TV 2,1 (A1378) (tvOS 7.1.2 tethered, tvOS 6.1.4 untethered)
 
-**Tested hardware:** this Linux port — **blackb0x--** — has only ever been
-verified against a real AppleTV3,2 running tvOS 7.9. Every other
+**Tested hardware:** this portable port — **blackb0x--** — has only ever been
+verified against a real AppleTV3,2 running tvOS 7.9, on Linux. Every other
 device/firmware combination listed above is implemented from protocol
-analysis and disassembly, not confirmed on real hardware.
+analysis and disassembly, not confirmed on real hardware; macOS support is
+newer still and hasn't been built or run on real macOS hardware at all yet
+(see `.claude/TODO.md` item 4).
 
 IMPORTANT: make sure your device is connected to the internet for the first boot. Do
 not turn it off during first boot until Kodi appears.

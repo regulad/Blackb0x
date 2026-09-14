@@ -49,6 +49,12 @@ void printCliUsage(const char* argv0) {
     printf("  --dry-run                 Do everything up to but not including the\n");
     printf("                            exploit and the USB upload to the device —\n");
     printf("                            prints what would run/be sent instead\n");
+    printf("  --no-checkm8              Refuse to run checkm8 (gaster) — if the\n");
+    printf("                            connected device isn't already reporting a\n");
+    printf("                            pwned DFU serial string, fail instead of\n");
+    printf("                            attempting the exploit. For iterating on the\n");
+    printf("                            post-exploit send flow against an already-\n");
+    printf("                            pwned device without spawning gaster again.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -77,6 +83,8 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.tetherBoot = true;
         } else if (arg == "--dry-run") {
             options.dryRun = true;
+        } else if (arg == "--no-checkm8") {
+            options.noCheckm8 = true;
         } else if (arg == "--help" || arg == "-h") {
             options.help = true;
         } else {
@@ -177,8 +185,11 @@ bool waitForDFUMode(DeviceManager& deviceManager, uint64_t ecid, AppleTVDevice& 
 // device-model branching from the original, not simplified. `dryRun` skips
 // the actual SHAtter/checkm8 USB call (the point where this function stops
 // being observation and starts writing exploit payloads into the device),
-// printing what would have run instead.
-bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun) {
+// printing what would have run instead. `noCheckm8` only gates the
+// AppleTV3,2/checkm8 branch below (the one that actually spawns gaster) —
+// SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that never
+// touches gaster at all, so there's nothing for this flag to refuse there.
+bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noCheckm8) {
     if (device.pwnedDFU) return true;
 
     if (device.deviceModel == "AppleTV2,1") {
@@ -204,6 +215,13 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
     }
 
     if (device.deviceModel == "AppleTV3,2") {
+        if (noCheckm8) {
+            fprintf(stderr,
+                    "--no-checkm8: device is not already in pwned DFU (no PWND: in its serial string) — "
+                    "refusing to run checkm8/gaster. Pwn it separately first (e.g. `gaster pwn`), or drop "
+                    "--no-checkm8 to let blackb0x do it.\n");
+            return false;
+        }
         if (dryRun) {
             printf("(dry run) Would try checkm8\n");
             return true;
@@ -367,22 +385,43 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
         fflush(stdout);
         int i = components.iBECDowngrade ? deviceManager.sendiBEC(*components.iBECDowngrade, device.ecid) : -1;
         printf("%s\n", (i == 0) ? "Sent" : "Error");
+        if (i != 0) {
+            fprintf(stderr,
+                    "Failed to send iBEC (downgrade) -- the device may have rebooted out of the exploited\n"
+                    "state instead of staying put. Re-enter DFU mode and try again.\n");
+            return false;
+        }
         device.didTetheredBoot = 1;
     } else {
         printf("Sending iBEC (boot) -> ");
         fflush(stdout);
         int i = components.iBECBoot ? deviceManager.sendiBEC(*components.iBECBoot, device.ecid) : -1;
         printf("%s\n", (i == 0) ? "Sent" : "Error");
+        if (i != 0) {
+            fprintf(stderr,
+                    "Failed to send iBEC (boot) -- the device may have rebooted out of the exploited state\n"
+                    "instead of staying put (see any reconnect-attempt lines above for detail). Re-enter DFU\n"
+                    "mode and try again.\n");
+            return false;
+        }
 
         printf("Sending DeviceTree -> ");
         fflush(stdout);
         i = components.deviceTree ? deviceManager.sendDeviceTree(*components.deviceTree, device.ecid) : -1;
         printf("%s\n", (i == 0) ? "Sent" : "Error");
+        if (i != 0) {
+            fprintf(stderr, "Failed to send DeviceTree. Re-enter DFU mode and try again.\n");
+            return false;
+        }
 
         printf("Sending Ramdisk -> ");
         fflush(stdout);
         i = components.ramdisk ? deviceManager.sendRamdisk(*components.ramdisk, device.ecid) : -1;
         printf("%s\n", (i == 0) ? "Sent" : "Error");
+        if (i != 0) {
+            fprintf(stderr, "Failed to send Ramdisk. Re-enter DFU mode and try again.\n");
+            return false;
+        }
 
         device.needsPostInstall = 1;
     }
@@ -411,7 +450,7 @@ int runCli(const CliOptions& options) {
         return 0;
     }
 
-    printf("blackb0x (regulad's linux port) — Apple TV 2/3 jailbreak tool\n");
+    printf("blackb0x (regulad's portable port) — Apple TV 2/3 jailbreak tool\n");
 
     if (options.dryRun) {
         printf("(dry run) Discovery, DFU wait, download, and patch all happen for real.\n");
@@ -550,7 +589,7 @@ int runCli(const CliOptions& options) {
         }
     }
 
-    if (!checkExploit(deviceManager, device, options.dryRun)) {
+    if (!checkExploit(deviceManager, device, options.dryRun, options.noCheckm8)) {
         return 1;
     }
 

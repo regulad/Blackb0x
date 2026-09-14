@@ -397,7 +397,21 @@ ExternalProject_Add(libusbmuxd_ext
     CONFIGURE_COMMAND ${AUTOTOOLS_ENV} ./autogen.sh --prefix=${DEPS_PREFIX}
                         --enable-static --disable-shared
     BUILD_COMMAND   ${AUTOTOOLS_ENV} make -j
+    # libusbmuxd's common/collection.o and libimobiledevice-glue's
+    # src/collection.o (see libimobiledevice_glue_ext below) are both
+    # externally-linked copies of the exact same generic collection ADT —
+    # diffed directly: identical `struct collection` layout, byte-identical
+    # function bodies, glue's is a strict superset (adds collection_copy(),
+    # which nothing in libusbmuxd itself calls). Rather than paper over the
+    # resulting duplicate-symbol link error with the GNU-ld-only
+    # -Wl,--allow-multiple-definition (no equivalent on Apple's ld64 as of
+    # Xcode 15+ -- see the blackb0x target's own link options below and
+    # docs/HISTORY.md), drop libusbmuxd's copy of the object from its
+    # installed archive here so only one definition of each symbol ever
+    # reaches the final link, on every platform -- not just a Linux
+    # workaround.
     INSTALL_COMMAND make install
+              COMMAND ${CMAKE_AR} d ${DEPS_LIB}/libusbmuxd.a collection.o
 )
 
 # This pinned commit's own autogen.sh fails to bootstrap libtool correctly on
@@ -945,18 +959,34 @@ foreach(p ${GASTER_PAYLOADS})
 endforeach()
 
 add_executable(gaster ${GASTER_DIR}/gaster.c ${GASTER_DIR}/lzfse.c ${GASTER_PAYLOAD_HEADERS})
-target_compile_definitions(gaster PRIVATE HAVE_LIBUSB)
 target_include_directories(gaster PRIVATE ${GASTER_GEN_DIR} ${DEPS_INCLUDE})
-# BEFORE, same reasoning as dmg/xpwn above: guarantees wolfSSL's shim wins
-# over anything else that might otherwise land ahead of it on the include
-# path.
-target_include_directories(gaster BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
-target_compile_options(gaster PRIVATE -include ${DEPS_INCLUDE}/wolfssl/options.h)
-target_link_libraries(gaster PRIVATE deps::usb deps::wolfssl Threads::Threads)
-# Same Unix Makefiles generator caveat as blackb0x's own
-# add_dependencies() call below: depend on the ExternalProject targets
-# directly, not just the IMPORTED targets that wrap them.
-add_dependencies(gaster libusb_ext wolfssl_ext)
+if(APPLE)
+    # gaster.c's own `#else` branch (unconditional on !HAVE_LIBUSB, see its
+    # top-of-file includes) is its real upstream Darwin implementation: talks
+    # to the device directly via Apple's own IOKit USB stack (IOUSBLib) and
+    # CommonCrypto for its one AES-256-CBC call, instead of libusb + wolfSSL's
+    # OpenSSL shim. Both are first-party frameworks present on any Mac this
+    # project builds on — nothing to vendor. Selected here in preference to
+    # the portable libusb path specifically because it's gaster upstream's
+    # actively-used reference implementation for this platform, not a
+    # fallback — the libusb path below is what Linux (no IOKit) falls back
+    # to instead.
+    target_link_libraries(gaster PRIVATE "-framework CoreFoundation" "-framework IOKit" Threads::Threads)
+else()
+    target_compile_definitions(gaster PRIVATE HAVE_LIBUSB)
+    # BEFORE, same reasoning as dmg/xpwn above: guarantees wolfSSL's shim
+    # wins over anything else that might otherwise land ahead of it on the
+    # include path.
+    target_include_directories(gaster BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
+    target_compile_options(gaster PRIVATE -include ${DEPS_INCLUDE}/wolfssl/options.h)
+    target_link_libraries(gaster PRIVATE deps::usb deps::wolfssl Threads::Threads)
+    # Same Unix Makefiles generator caveat as blackb0x's own
+    # add_dependencies() call below: depend on the ExternalProject targets
+    # directly, not just the IMPORTED targets that wrap them. Only needed on
+    # this libusb/wolfSSL path — the native Apple path above has no vendored
+    # ExternalProject dependency of its own.
+    add_dependencies(gaster libusb_ext wolfssl_ext)
+endif()
 
 # ---------------------------------------------------------------------------
 # blackb0x CLI executable
@@ -996,15 +1026,19 @@ target_link_libraries(blackb0x PRIVATE
     Threads::Threads)
 # libusbmuxd.a (needed by common/userpref.c's usbmuxd_read_buid/
 # usbmuxd_read_pair_record/etc, its own daemon-side pairing-record cache
-# path) and libimobiledevice-glue-1.0.a each vendor their own separate copy
-# of common/collection.c with external linkage — a real, known conflict in
-# this ecosystem when both get statically linked together (confirmed
-# directly: exercising lockdownd_client_new_with_handshake(), which calls
-# into userpref.c's pairing-record functions, is what actually pulls both
-# in). Both implementations are the same generic collection ADT; letting
-# the linker keep whichever it sees first is the standard practical
-# workaround here, not a correctness compromise.
-target_link_options(blackb0x PRIVATE -Wl,--allow-multiple-definition)
+# path) and libimobiledevice-glue-1.0.a used to each vendor their own
+# separate copy of common/collection.c with external linkage — a real,
+# known conflict in this ecosystem when both get statically linked together
+# (confirmed directly: exercising lockdownd_client_new_with_handshake(),
+# which calls into userpref.c's pairing-record functions, is what actually
+# pulls both in). Both implementations are the same generic collection ADT
+# (confirmed byte-for-byte via diff, see libusbmuxd_ext's own comment
+# above); libusbmuxd_ext's INSTALL_COMMAND now strips its copy of the
+# object out of the installed archive so only libimobiledevice-glue's
+# survives to link time, which fixes the duplicate-symbol conflict itself
+# rather than papering over it here with the GNU-ld-only
+# -Wl,--allow-multiple-definition (no equivalent on Apple's ld64 as of
+# Xcode 15+ — this project needs to link on Darwin too, not just Linux).
 
 # The Unix Makefiles generator does not reliably serialize a real target's
 # link step behind ExternalProject-installed IMPORTED libraries via

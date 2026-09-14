@@ -92,6 +92,17 @@ std::map<std::string, FirmwareKeyPair> IpswFetch::keysForDevice(const std::strin
             FirmwareKeyPair pair;
             pair.iv = ivStr ? ivStr : "";
             pair.key = keyStr ? keyStr : "";
+            // "0"/"0" is the convention these key dumps use for "this
+            // component isn't encrypted at all" (real IV/key values are
+            // always full-length hex strings) — normalize to empty so
+            // every consumer's existing "no key" handling (decrypt()
+            // treats an empty key string as hasKey == FALSE) takes over,
+            // instead of feeding "0" into AES/Img3 keying code that
+            // assumes a real key is present.
+            if (pair.iv == "0" && pair.key == "0") {
+                pair.iv.clear();
+                pair.key.clear();
+            }
             result[key] = pair;
 
             free(ivStr);
@@ -144,7 +155,27 @@ std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool 
         plist_free(root);
         return std::nullopt;
     }
+
+    // Some manifests (confirmed on AppleTV2,1 8M89) carry more than one
+    // BuildIdentity — e.g. an "Erase" (full restore/DFU) variant AND an
+    // "Update" (in-place OTA, assumes an already-booted OS) variant — and
+    // list them in an order where Update comes last. blackb0x always does
+    // a full DFU restore, so it needs the Erase identity specifically; the
+    // two variants reference different RestoreRamDisk files under
+    // different (and differently keyed!) names, so picking the wrong one
+    // silently decrypts the wrong file with the wrong key. Prefer the
+    // identity whose own Info.RestoreBehavior is "Erase"; fall back to the
+    // last identity (the original, pre-existing behavior) for any manifest
+    // that doesn't carry this field at all.
     plist_t identity = plist_array_get_item(identities, count - 1);
+    for (uint32_t i = 0; i < count; i++) {
+        plist_t candidate = plist_array_get_item(identities, i);
+        plist_t candidateInfo = plist_dict_get_item(candidate, "Info");
+        if (candidateInfo && plistDictString(candidateInfo, "RestoreBehavior") == "Erase") {
+            identity = candidate;
+            break;
+        }
+    }
     plist_t manifest = plist_dict_get_item(identity, "Manifest");
 
     auto componentPath = [&](const char* component) -> std::string {

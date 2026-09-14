@@ -36,6 +36,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
@@ -283,6 +284,43 @@ static irecv_client_t get_tv_patient(uint64_t ecid, int attempts = 30) {
     return client;
 }
 
+#if defined(__APPLE__)
+// No /proc on Darwin, and proc_pidinfo()'s TASK_BASIC_INFO exposes no
+// equivalent third "genuinely uninterruptible" distinction the way Linux's
+// /proc/<pid>/status "State:" line does. `ps -o state=` is the standard
+// diagnostic here instead — BSD ps reports 'U' for uninterruptible wait,
+// same meaning as Linux's D-state. Shelled out via fork/exec+pipe (no
+// popen()/system()) to match this file's no-shell convention elsewhere.
+static bool isUninterruptible(pid_t pid) {
+    int outPipe[2];
+    if (pipe(outPipe) != 0) return false;
+    pid_t child = fork();
+    if (child < 0) {
+        close(outPipe[0]);
+        close(outPipe[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(outPipe[0]);
+        dup2(outPipe[1], STDOUT_FILENO);
+        close(outPipe[1]);
+        int devNull = open("/dev/null", O_WRONLY);
+        if (devNull >= 0) dup2(devNull, STDERR_FILENO);
+        char pidBuf[32];
+        snprintf(pidBuf, sizeof(pidBuf), "%d", (int)pid);
+        execlp("ps", "ps", "-o", "state=", "-p", pidBuf, (char*)nullptr);
+        _exit(127);
+    }
+    close(outPipe[1]);
+    char buf[64] = {0};
+    ssize_t n = read(outPipe[0], buf, sizeof(buf) - 1);
+    close(outPipe[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (n <= 0) return false;
+    return strchr(buf, 'U') != nullptr;
+}
+#else
 // Checks /proc/<pid>/status for "D (disk sleep)" — uninterruptible sleep,
 // the one process state SIGKILL cannot terminate; the kernel only wakes a
 // D-state task when whatever blocking call it's in returns on its own.
@@ -304,6 +342,7 @@ static bool isUninterruptible(pid_t pid) {
     fclose(f);
     return result;
 }
+#endif
 
 // Manual PATH search (no shell/system() — matches this file's own
 // no-shell convention elsewhere) for whether a bare command name resolves
@@ -325,6 +364,20 @@ static bool commandExistsOnPath(const char* name) {
         start = colon + 1;
     }
     return false;
+}
+
+// Resolves the real binary name for GNU coreutils' `stdbuf`. On Linux it's
+// always plain `stdbuf`. On Darwin, Homebrew's `coreutils` formula installs
+// it prefixed (`gstdbuf`) to avoid shadowing the BSD toolset, unless the
+// user has separately opted into coreutils' optional "gnubin" PATH shim
+// (which then exposes it unprefixed, same as Linux) — so try the
+// unprefixed name first either way, then fall back to the prefixed one.
+static std::string resolveStdbufBinary() {
+    if (commandExistsOnPath("stdbuf")) return "stdbuf";
+#if defined(__APPLE__)
+    if (commandExistsOnPath("gstdbuf")) return "gstdbuf";
+#endif
+    return "";
 }
 
 // Spawns the vendored `gaster` binary (third_party/gaster, built as its own
@@ -380,15 +433,22 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
     // whole mechanism exists to fix, and precisely when it would matter
     // most (a stuck/hanging exploit run). Fail loudly and immediately
     // instead, before ever forking gaster.
-    if (!commandExistsOnPath("stdbuf")) {
+    std::string stdbufBin = resolveStdbufBinary();
+    if (stdbufBin.empty()) {
         fprintf(stderr,
                 "checkm8: `stdbuf` (GNU coreutils) is required but not found on PATH -- "
                 "without it, gaster's exploit progress can't be streamed live, which makes "
-                "a stuck/hanging run indistinguishable from a silently-working one. Install "
-                "coreutils and try again.\n");
+                "a stuck/hanging run indistinguishable from a silently-working one. "
+#if defined(__APPLE__)
+                "Install it with `brew install coreutils` (this program looks for both the "
+                "unprefixed `stdbuf` and Homebrew's default `gstdbuf` name) and try again.\n"
+#else
+                "Install coreutils and try again.\n"
+#endif
+        );
         return -1;
     }
-    std::vector<std::string> argvStrings = { "stdbuf", "-oL", "-eL", resolveGasterPath() };
+    std::vector<std::string> argvStrings = { stdbufBin, "-oL", "-eL", resolveGasterPath() };
     argvStrings.insert(argvStrings.end(), args.begin(), args.end());
     std::vector<char*> cargv;
     cargv.reserve(argvStrings.size() + 1);
@@ -418,7 +478,7 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
         dup2(errPipe[1], STDERR_FILENO);
         close(outPipe[1]);
         close(errPipe[1]);
-        execvp("stdbuf", cargv.data());
+        execvp(stdbufBin.c_str(), cargv.data());
         // Only reachable if stdbuf disappeared between the PATH check above
         // and this exec (a real TOCTOU window, not expected in practice) --
         // no silent fallback here, per the "required" reasoning above.
@@ -893,6 +953,14 @@ static irecv_client_t get_tv(uint64_t ecid) {
             fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
             return nullptr;
         } else if (err != IRECV_E_SUCCESS) {
+            // Visible retry progress: without this, a device that dropped
+            // off USB mid-sequence (e.g. it rebooted to Normal Mode instead
+            // of staying in the exploited state after an iBEC send) looks
+            // identical, from the log alone, to one that's simply slow to
+            // re-enumerate -- both just sit silent for ~6 seconds before the
+            // final "Unable to connect to device". Surfacing each attempt's
+            // own error lets that distinction actually be made from the log.
+            fprintf(stderr, "  (reconnect attempt %d/6: %s, retrying...)\n", i + 1, irecv_strerror(err));
             sleep(1);
         } else {
             break;
@@ -1004,38 +1072,127 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid) {
 }
 
 int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
-    irecv_client_t client = get_tv(ecid);
+    // get_tv_patient(), not plain get_tv(): this reconnect follows iBSS's
+    // boot_client() actually manifesting/resetting the device now (see the
+    // DFU fix above) -- like checkm8's own post-payload reconnect, a device
+    // that just started executing freshly-uploaded code can take longer to
+    // re-enumerate than get_tv()'s own plain ~6-second retry budget.
+    irecv_client_t client = get_tv_patient(ecid);
+    if (!client) {
+        fprintf(stderr, "sendiBEC: device did not reconnect for %s\n", iBECpath.c_str());
+        return -1;
+    }
     irecv_error_t err = irecv_send_file(client, iBECpath.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendiBEC: failed to send %s: %s\n", iBECpath.c_str(), irecv_strerror(err));
+    }
     irecv_close(client);
     sleep(2);
     return (err == IRECV_E_SUCCESS) ? 0 : -1;
 }
 
-int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
-    irecv_client_t client = get_tv(ecid);
-    irecv_send_file(client, Ramdisk_Path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
-    irecv_send_command(client, "ramdisk");
+// Shared by sendRamdisk()/sendKernelCache()/sendDeviceTree() below: send a
+// file, then a follow-up command that tells the device what to do with it
+// (e.g. "ramdisk", "bootx", "devicetree"). Sending the command after a
+// failed/short file transfer would just be asking an already-gone device to
+// act on data it never fully received, so this bails (and reports exactly
+// which of the two steps failed, and why) rather than sending it anyway and
+// unconditionally reporting success like the three callers used to.
+static int sendFileThenCommand(irecv_client_t client, const char* what, const std::string& path,
+                                const char* command) {
+    if (!client) {
+        fprintf(stderr, "%s: device did not reconnect for %s\n", what, path.c_str());
+        return -1;
+    }
+    irecv_error_t err = irecv_send_file(client, path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "%s: failed to send %s: %s\n", what, path.c_str(), irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    err = irecv_send_command(client, command);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "%s: failed to send '%s' command: %s\n", what, command, irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
     irecv_close(client);
-    sleep(2);
     return 0;
+}
+
+// A real run against an AppleTV3,2 failed mid-Ramdisk-upload with a bulk
+// short-write ("wrote 0 of 32768 bytes") at exactly packet 2049/2204 -- byte
+// offset 0x4000000 (64MiB) on the nose, on a 68.9MiB ramdisk. Too round a
+// number to be USB flakiness (this same host/libusb stack sends much larger
+// files fine via checkra1n against >A7 devices): this looks like the
+// device's own recovery-mode staging buffer for the ramdisk running out,
+// not a bug in how we drive libusb. Recovery-mode devices advertise their
+// real limit via a "ramdisk-size" getenv variable (irecv_getenv(),
+// unused anywhere else in this codebase until now) -- checking it here
+// turns a cryptic mid-transfer USB failure into an upfront, actionable
+// diagnostic, and either confirms or rules out this theory outright on the
+// next real run. Warn-only, not a hard fail: unclear yet whether every
+// firmware/device combination this tool targets even implements this env
+// var, and a wrong guess here shouldn't block a transfer that might
+// otherwise have worked.
+static void warnIfRamdiskExceedsDeviceLimit(irecv_client_t client, const std::string& path) {
+    if (!client) return;
+
+    std::error_code ec;
+    uint64_t fileSize = std::filesystem::file_size(path, ec);
+    if (ec) return;
+
+    char* value = nullptr;
+    irecv_error_t err = irecv_getenv(client, "ramdisk-size", &value);
+    if (err != IRECV_E_SUCCESS || !value || !value[0]) {
+        free(value);
+        fprintf(stderr, "warnIfRamdiskExceedsDeviceLimit: device did not report a ramdisk-size (or getenv "
+                        "unsupported on this device/firmware) -- skipping the size check\n");
+        return;
+    }
+
+    char* end = nullptr;
+    uint64_t deviceLimit = strtoull(value, &end, 0);
+    bool parsed = end != value && deviceLimit != 0;
+    if (parsed && fileSize > deviceLimit) {
+        fprintf(stderr,
+                "warnIfRamdiskExceedsDeviceLimit: %s is %llu bytes, but the device reports a ramdisk-size "
+                "limit of %llu bytes (%s) -- the upload is very likely to fail partway through once it hits "
+                "that boundary. A smaller baked ramdisk is the real fix.\n",
+                path.c_str(), (unsigned long long)fileSize, (unsigned long long)deviceLimit, value);
+    } else if (!parsed) {
+        fprintf(stderr, "warnIfRamdiskExceedsDeviceLimit: device reported ramdisk-size=\"%s\", not parseable "
+                        "as a number -- skipping the size check\n", value);
+    }
+    free(value);
+}
+
+int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
+    // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
+    // follows DeviceTree's own NOTIFY_FINISH-triggered reset.
+    irecv_client_t client = get_tv_patient(ecid);
+    warnIfRamdiskExceedsDeviceLimit(client, Ramdisk_Path);
+    int result = sendFileThenCommand(client, "sendRamdisk", Ramdisk_Path, "ramdisk");
+    sleep(2);
+    return result;
 }
 
 int DeviceManager::sendKernelCache(const std::string& KernelCache_Path, uint64_t ecid) {
-    irecv_client_t client = get_tv(ecid);
-    irecv_send_file(client, KernelCache_Path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
-    irecv_send_command(client, "bootx");
-    irecv_close(client);
+    // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
+    // follows Ramdisk's own NOTIFY_FINISH-triggered reset.
+    irecv_client_t client = get_tv_patient(ecid);
+    int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx");
     sleep(2);
-    return 0;
+    return result;
 }
 
 int DeviceManager::sendDeviceTree(const std::string& DeviceTree_Path, uint64_t ecid) {
-    irecv_client_t client = get_tv(ecid);
-    irecv_send_file(client, DeviceTree_Path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
-    irecv_send_command(client, "devicetree");
-    irecv_close(client);
+    // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
+    // follows iBEC's own NOTIFY_FINISH-triggered reset.
+    irecv_client_t client = get_tv_patient(ecid);
+    int result = sendFileThenCommand(client, "sendDeviceTree", DeviceTree_Path, "devicetree");
     sleep(2);
-    return 0;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,7 +1357,59 @@ static int boot_client(irecv_client_t client, void* buf, size_t sz) {
     }
     free(ibss);
 
+    // Per the USB DFU 1.1 spec (6.1.2): from dfuDNLOAD-IDLE, a DFU_DNLOAD
+    // with wLength=0 is what actually tells the device "that was the last
+    // block" and moves it into dfuMANIFEST-SYNC; the GETSTATUS reads that
+    // follow drive it the rest of the way through dfuMANIFEST-SYNC ->
+    // dfuMANIFEST. This exact triplet already exists a few lines up
+    // (1223-1225) as a preamble clearing out any stale state left over from
+    // a previous session -- but the real payload's own upload loop just
+    // above never did the same thing at ITS end, so the device was left
+    // sitting in dfuDNLOAD-IDLE (state 5) instead of ever manifesting/
+    // jumping into the uploaded iBSS. Confirmed directly: the next
+    // component sent afterwards (iBEC) reconnects fine, but its own
+    // pre-upload GETSTATUS immediately observes that same leftover state 5.
+    irecv_usb_control_transfer(client, 0x21, 1, 0, 0, nullptr, 0, 100);
+    irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, blank, 6, 100);
+    irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, blank, 6, 100);
+
+    // The line below (ported byte-for-byte from the original .m -- see git
+    // history for DeviceManager.m, removed in 907b64b) is this function's
+    // own trigger for "go run it."
     irecv_usb_control_transfer(client, 0xA1, 2, 0xFFFF, 0, (unsigned char*)buf, 0, 100);
+
+    // Whether a real USB reset (irecv_reset(), libusb_reset_device() on
+    // Linux) belongs here turned out to depend on the device's actual
+    // state, not be a flat yes/no:
+    //  - Always resetting unconditionally (an earlier version of this
+    //    function) worked at least once (reached Recovery Mode end to
+    //    end), but was intermittently WORSE than not resetting at all: the
+    //    device sometimes booted straight into the full, real OS instead
+    //    of continuing the exploited chain. Adding a settle delay before
+    //    that unconditional reset didn't fix it.
+    //  - Never resetting at all (removing it outright) turned that
+    //    intermittent failure into a DETERMINISTIC one: the device now
+    //    reliably reports DFU state 8 (dfuMANIFEST-WAIT-RESET) when iBEC's
+    //    own pre-upload GETSTATUS checks it next -- per the USB DFU spec,
+    //    a device in that state (bitManifestationTolerant=0: it can't
+    //    safely keep talking over USB while it reprograms itself) is
+    //    waiting specifically for a host-issued reset and will never
+    //    proceed without one.
+    // Put together, these two results say the reset itself is genuinely
+    // required when the device is actually in state 8 -- it's issuing one
+    // to a device that ISN'T in state 8 (e.g. one whose
+    // bitManifestationTolerant=1 already looped it back to dfuIDLE, or one
+    // that's already off running the just-uploaded iBSS) that's the race:
+    // landing a real bus reset on a device already mid-boot is exactly the
+    // kind of timing-dependent hit that would show up as "usually fine,
+    // sometimes falls through to the real trust chain." So: check the
+    // real state first, and only reset if it's genuinely stuck in 8.
+    unsigned char statusBuf[6] = {0};
+    irecv_usb_control_transfer(client, 0xA1, 3, 0, 0, statusBuf, sizeof(statusBuf), 100);
+    unsigned int dfuState = statusBuf[4];
+    if (dfuState == 8) {
+        irecv_reset(client);
+    }
 
     irecv_close(client);
     return 0;

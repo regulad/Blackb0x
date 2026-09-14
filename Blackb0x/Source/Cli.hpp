@@ -23,6 +23,7 @@ struct CliOptions {
     std::string udid;     // empty = not specified
     bool tetherBoot = false;
     bool dryRun = false;
+    bool noCheckm8 = false;
     bool help = false;
 };
 

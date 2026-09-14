@@ -21,7 +21,7 @@
 //  checks the same sidecar before trusting a dist/ entry for the same
 //  reason.
 //
-//  Usage: sudo ./bake-all-ramdisks [--signed-only]
+//  Usage: sudo ./bake-all-ramdisks [--signed-only] [--device <model>]
 //  (needs CAP_SYS_ADMIN/CAP_CHOWN, same as bakeRamdisk() itself — see its
 //  header comment for why)
 //
@@ -29,6 +29,14 @@
 //  actively signing for that device right now — typically just the latest
 //  one or two per device (7 out of 92 known builds, checked live 2026-09-11),
 //  which is what the vast majority of real devices will actually be on.
+//
+//  --device <model> restricts the run to just that one device (e.g.
+//  "AppleTV3,2" — the exact ImageKeys/ directory name, case-sensitive),
+//  every known build for it. Meant for iterating on ramdisk/Debs/ content
+//  (kNeverStageDebs, the prebake blacklist, etc.) without paying for all
+//  92 known (device, firmware) combinations on every single test run —
+//  combine with --signed-only to narrow to just that device's currently-
+//  signed build(s).
 //
 
 #include "BakeRamdisk.hpp"
@@ -80,12 +88,19 @@ static std::vector<std::pair<std::string, std::string>> knownFirmwareTargets() {
 
 int main(int argc, char** argv) {
     bool signedOnly = false;
+    std::string deviceFilter;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--signed-only") == 0) {
             signedOnly = true;
+        } else if (strcmp(argv[i], "--device") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "bake-all-ramdisks: --device requires a value (e.g. --device AppleTV3,2)\n");
+                return 2;
+            }
+            deviceFilter = argv[++i];
         } else {
             fprintf(stderr, "bake-all-ramdisks: unrecognized argument %s\n", argv[i]);
-            fprintf(stderr, "usage: bake-all-ramdisks [--signed-only]\n");
+            fprintf(stderr, "usage: bake-all-ramdisks [--signed-only] [--device <model>]\n");
             return 2;
         }
     }
@@ -96,6 +111,21 @@ int main(int argc, char** argv) {
     if (targets.empty()) {
         fprintf(stderr, "bake-all-ramdisks: no .keys files found under %s\n", resolveImageKeyPath("").c_str());
         return 1;
+    }
+
+    if (!deviceFilter.empty()) {
+        size_t before = targets.size();
+        std::vector<std::pair<std::string, std::string>> filtered;
+        for (auto& target : targets) {
+            if (target.first == deviceFilter) filtered.push_back(target);
+        }
+        targets = std::move(filtered);
+        printf("--device %s: %zu of %zu known combinations match.\n", deviceFilter.c_str(), targets.size(), before);
+        if (targets.empty()) {
+            fprintf(stderr, "bake-all-ramdisks: no known (device, firmware) combinations for device %s\n",
+                    deviceFilter.c_str());
+            return 1;
+        }
     }
 
     if (signedOnly) {
@@ -138,16 +168,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Fail-fast, deliberately: computeGlobalDebcacheOnce() (BakeRamdisk.cpp)
-    // caches its result across every firmware target in this run, so a real
-    // failure in it (a broken dpkg/apt state, a bad .deb, etc.) isn't "this
-    // one target had a problem" — every remaining target shares the exact
-    // same cached failure and would fail identically. Continuing the loop
-    // after any failure here just re-demonstrates the same root cause
-    // several more times before reporting it; dying immediately on the
+    // Fail-fast, deliberately, for the actual bake step: computeGlobalDebcacheOnce()
+    // (BakeRamdisk.cpp) caches its result across every firmware target in this
+    // run, so a real failure in it (a broken dpkg/apt state, a bad .deb, etc.)
+    // isn't "this one target had a problem" — every remaining target shares
+    // the exact same cached failure and would fail identically. Continuing
+    // the loop after any failure here just re-demonstrates the same root
+    // cause several more times before reporting it; dying immediately on the
     // first one gets to the real error faster.
+    //
+    // Fetching the firmware itself is a different story: Apple pulling an
+    // old build's signing, a flaky mirror, etc. only affects that one
+    // target, so those failures are downgraded to a warning and the run
+    // moves on to the next target instead of aborting the whole batch.
     size_t succeeded = 0;
     size_t warned = 0;
+    size_t skippedDownload = 0;
 
     for (size_t i = 0; i < targets.size(); i++) {
         const std::string& device = targets[i].first;
@@ -174,16 +210,18 @@ int main(int argc, char** argv) {
         IpswFetch fetcher;
         std::string firmwareURL = fetcher.firmwareURLForDevice(device, buildID);
         if (firmwareURL.empty()) {
-            printf("FAILED (no firmware URL)\n");
+            printf("WARNING: could not download ramdisk from apple.\n");
             fprintf(stderr, "bake-all-ramdisks: %s: no firmware URL from ipsw.me\n", label.c_str());
-            return 1;
+            skippedDownload++;
+            continue;
         }
 
         FragmentDownloader downloader(firmwareURL);
         if (!downloader.open()) {
-            printf("FAILED (could not open remote IPSW)\n");
+            printf("WARNING: could not download ramdisk from apple.\n");
             fprintf(stderr, "bake-all-ramdisks: %s: could not open remote IPSW\n", label.c_str());
-            return 1;
+            skippedDownload++;
+            continue;
         }
 
         std::string workDir = ipswDataRoot() + "/" + device + "/" + buildID;
@@ -191,24 +229,27 @@ int main(int argc, char** argv) {
 
         std::string manifestPath = workDir + "/BuildManifest.plist";
         if (!downloader.downloadComponent("BuildManifest.plist", manifestPath, nullptr)) {
-            printf("FAILED (BuildManifest.plist download)\n");
+            printf("WARNING: could not download ramdisk from apple.\n");
             fprintf(stderr, "bake-all-ramdisks: %s: failed to download BuildManifest.plist\n", label.c_str());
-            return 1;
+            skippedDownload++;
+            continue;
         }
 
         auto manifest = parseManifest(manifestPath, /*onlyBootComponents=*/false);
         if (!manifest || manifest->restoreRamdiskPath.empty()) {
-            printf("FAILED (no RestoreRamDisk in manifest)\n");
+            printf("WARNING: could not download ramdisk from apple.\n");
             fprintf(stderr, "bake-all-ramdisks: %s: no RestoreRamDisk component in BuildManifest.plist\n",
                     label.c_str());
-            return 1;
+            skippedDownload++;
+            continue;
         }
 
         std::string localRamdiskPath = workDir + "/" + fs::path(manifest->restoreRamdiskPath).filename().string();
         if (!downloader.downloadComponent(manifest->restoreRamdiskPath, localRamdiskPath, nullptr)) {
-            printf("FAILED (RestoreRamDisk download)\n");
+            printf("WARNING: could not download ramdisk from apple.\n");
             fprintf(stderr, "bake-all-ramdisks: %s: failed to download RestoreRamDisk\n", label.c_str());
-            return 1;
+            skippedDownload++;
+            continue;
         }
 
         // Deliberately keyed by the buildID from the .keys filename we're
@@ -247,6 +288,9 @@ int main(int argc, char** argv) {
     printf("\n%zu/%zu succeeded", succeeded, targets.size());
     if (warned > 0) {
         printf(" (%zu with a size warning, see stderr above)", warned);
+    }
+    if (skippedDownload > 0) {
+        printf(", %zu skipped (could not download ramdisk from apple, see stderr above)", skippedDownload);
     }
     printf(".\n");
 

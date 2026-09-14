@@ -138,7 +138,18 @@ the real package's postinst does that isn't replicated anywhere yet.
 
 `AGENTS.md` currently states "CLI-only, Linux-only... dropped, not
 dual-maintained" as a "don't re-litigate without asking" convention — this
-entry reopens that by explicit request.
+entry reopens that by explicit request. Reopened a second time, more
+urgently, after a long real-hardware debugging session on Linux
+(AppleTV3,2, ECID 2685369898254) kept surfacing libusb/DFU-state races in
+`DeviceManager.cpp`'s `boot_client()` — an intermittent "boots into the
+real OS instead of continuing the exploit chain" failure that a conditional
+reset (only reset when the device actually reports DFU state 8) mitigates
+but hasn't been confirmed to fully resolve. Rather than keep chasing
+timing-dependent libusb behavior on Linux, the plan is to get the real
+chain running against gaster's and libimobiledevice's native, first-party
+IOKit paths on macOS instead, where they're the actively-maintained
+reference implementations rather than something inherited secondhand via
+libusb's Darwin backend.
 
 First cut is scoped to the `blackb0x`/`gaster` CLI path only — ramdisk
 baking (`bake-all-ramdisks`, `BakeRamdisk.cpp`) can stay Linux-only in the
@@ -147,40 +158,78 @@ interim (real loop-mounted HFS+, `CAP_SYS_ADMIN`), with a macOS build of
 macOS support for the ramdisk baker itself is also wanted eventually, not
 permanently deferred — see its own subsection below.
 
-Real blockers, in the code today:
+Real blockers, in the code today — **all four now addressed** (code
+written and cross-checked to still build clean on Linux; none of it has
+been compiled or run on actual macOS/Xcode yet, since no Mac was available
+this session):
 
-- `target_link_options(blackb0x PRIVATE -Wl,--allow-multiple-definition)`
-  (`CMakeLists.txt:1007`) — papers over a real `common/collection.c` symbol
-  collision between statically-linked `libusbmuxd`/`libimobiledevice-glue`.
-  GNU-ld-only flag; Apple's linker has no equivalent (the old
-  `-multiply_defined suppress` synonym is gone from Xcode 15+'s new
-  linker). Needs an actual fix on macOS — drop one archive's copy of the
-  symbol, or rename — not another flag.
-- `ResourcePath.cpp`'s `resolveGasterPath()` reads `/proc/self/exe` to find
-  the sibling `gaster` binary — no `/proc` on Darwin. Needs
-  `_NSGetExecutablePath()` (`<mach-o/dyld.h>`) behind `#ifdef __APPLE__`.
-- `DeviceManager.cpp`'s `isUninterruptible()` reads `/proc/<pid>/status`
-  for the D-state kill diagnostic — no Darwin equivalent via `/proc`.
-  Needs a `libproc.h`- or `ps -o stat=`-based check (BSD `ps` reports `U`
-  for uninterruptible wait), or a generic fallback message on that
-  platform.
-- `runGaster()`'s hard requirement on GNU `stdbuf` (to force line-buffered
-  stdio over a pipe) — not present on macOS by default. Either also probe
-  for Homebrew coreutils' `gstdbuf`, or replace the whole pipe+`stdbuf`
-  mechanism with a `forkpty()`-backed child so stdio is naturally
-  line-buffered on both platforms without an external binary at all (the
-  more robust fix).
+- ~~`target_link_options(blackb0x PRIVATE -Wl,--allow-multiple-definition)`~~
+  — root-caused and fixed properly instead of worked around: diffed
+  libusbmuxd's `common/collection.c` against libimobiledevice-glue's
+  `src/collection.c` directly (byte-for-byte identical `struct collection`
+  layout and function bodies; glue's is a strict superset, adding
+  `collection_copy()`, which nothing in libusbmuxd calls). `libusbmuxd_ext`'s
+  `INSTALL_COMMAND` (`CMakeLists.txt`) now runs `${CMAKE_AR} d
+  ${DEPS_LIB}/libusbmuxd.a collection.o` right after `make install`,
+  stripping libusbmuxd's copy of the object out of its installed archive so
+  only libimobiledevice-glue's survives to link time. No more duplicate
+  symbols to paper over, on any platform — the GNU-ld-only flag is gone
+  entirely, not just made conditional. Confirmed: Linux build still links
+  clean with it removed.
+- ~~`ResourcePath.cpp`'s `resolveGasterPath()`~~ — now branches on
+  `#if defined(__APPLE__)`: uses `_NSGetExecutablePath()`
+  (`<mach-o/dyld.h>`) + `realpath()` to resolve symlinks (matching what
+  `readlink("/proc/self/exe", ...)` already does implicitly on Linux),
+  falling back to the existing `readlink`-based path otherwise.
+- ~~`DeviceManager.cpp`'s `isUninterruptible()`~~ — now has a `#if
+  defined(__APPLE__)` branch that shells out to `ps -o state= -p <pid>` via
+  fork/exec+pipe (no `popen()`/`system()`, matching this file's existing
+  no-shell convention) and checks for `U` (BSD ps's uninterruptible-wait
+  code, same meaning as Linux's D-state), instead of reading
+  `/proc/<pid>/status`.
+- ~~`runGaster()`'s hard requirement on GNU `stdbuf`~~ — new
+  `resolveStdbufBinary()` helper tries plain `stdbuf` first (works
+  identically on Linux, and on macOS if the user has opted into Homebrew
+  coreutils' "gnubin" PATH shim), then falls back to `gstdbuf` (Homebrew's
+  default prefixed name) on Apple platforms. Went with the
+  probe-for-both-names fix rather than the alternative
+  `forkpty()`-backed rewrite floated here previously — smaller, more
+  targeted change; the `forkpty()` rewrite remains on the table later if
+  the `stdbuf`/`gstdbuf` dependency itself becomes a real pain point.
+- New, beyond the four originally listed here: `gaster` was being built
+  with `HAVE_LIBUSB` unconditionally regardless of target OS
+  (`CMakeLists.txt`'s `add_executable(gaster ...)` block), which — per the
+  next bullet's old wording — meant even a macOS build would've gone
+  through libusb's Darwin backend rather than gaster's own real upstream
+  IOKit implementation (gaster.c's `#else` branch, gated on `!HAVE_LIBUSB`:
+  `<CommonCrypto/CommonCrypto.h>` + `<IOKit/usb/IOUSBLib.h>`, no vendored
+  deps needed at all — both are always-present system frameworks). Now
+  `if(APPLE) ... else() ... endif()`-gated: Apple builds skip `HAVE_LIBUSB`/
+  `deps::usb`/`deps::wolfssl` entirely and link `-framework CoreFoundation
+  -framework IOKit` instead; Linux keeps the exact libusb+wolfSSL build it
+  already had. This directly answers the next bullet's old open question
+  for gaster's own exploit step (no longer inheriting libusb's Darwin
+  backend at all) — it doesn't touch `libimobiledevice`/`libirecovery`'s own
+  USB transport, which normal-mode/DFU-mode device communication elsewhere
+  in `blackb0x` still goes through; whether an IOKit-native path is
+  available/needed there too is unexplored.
 
-Needs real macOS hardware to verify, not just code review:
+Needs real macOS hardware to verify, not just code review — nothing below
+has changed, still all open:
 
 - Whether libusb's Darwin backend can claim a checkm8/DFU-mode Apple TV
-  without the system's own `usbmuxd`/`MobileDevice` stack interfering —
-  `gaster` here is built with `HAVE_LIBUSB` (not its own native IOKit
-  path), so it inherits whatever libusb's Darwin backend does. Likely
-  fine, unverified in this repo.
+  without the system's own `usbmuxd`/`MobileDevice` stack interfering, for
+  the libirecovery-mediated parts of the chain (`DeviceManager.cpp`'s
+  `sendiBSS`/`sendiBEC`/etc., `irecovery` itself) that still go through
+  libusb on every platform, gaster's own IOKit switch above notwithstanding.
 - Whether the `--no-preflight` usbmuxd workaround this repo needs on Linux
   is even relevant against macOS's built-in `usbmuxd` (probably not, since
   it's Apple's own reference daemon) — a docs question, not code.
+- End-to-end: whether building the CLI chain against gaster's native IOKit
+  path on real macOS hardware actually sidesteps the Linux-side DFU-state
+  races this reopening was prompted by, or whether that turns out to be a
+  property of the exploited device's own state machine rather than the
+  host's USB stack. Only a real Mac + real AppleTV3,2 run can answer this.
 
 Low-risk, expected to already work: `libusb_ext`'s `--disable-udev` is a
 no-op on Darwin (that configure branch is Linux-only, backend is

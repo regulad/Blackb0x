@@ -1,6 +1,7 @@
-# HISTORY.md — Blackb0x Linux port debugging log
+# HISTORY.md — Blackb0x portable port debugging log
 
-This is the full narrative log of the macOS→Linux port: every bug hunt, every dead end,
+This is the full narrative log of the macOS→Linux port (and, later, the reopened
+Linux→portable work — see "Reopening macOS support" below): every bug hunt, every dead end,
 every decision and the evidence behind it, in the order it happened. `AGENTS.md` (repo
 root) is the short version — what an agent needs to navigate the repo and build it right
 now. Come here when you need the *why* behind something AGENTS.md just states as fact, or
@@ -18,6 +19,8 @@ Cocoa/Objective-C app (Xcode project). This repo is being ported to a Linux CLI.
 
 - **CLI-only.** No GTK/Qt GUI port — a plain command-line tool replaces AppDelegate/MainView.
 - **Linux-only.** macOS/Xcode/AppKit support is being dropped entirely, not dual-maintained.
+  (Superseded — see "Reopening macOS support" below: this was reopened by explicit
+  request, scoped first to the `blackb0x`/`gaster` CLI path, not the ramdisk baker.)
 - **Surgical conversion, not a rewrite.** Keep already-portable C libraries as-is; convert
   Objective-C/Foundation files to C/C++ as each is touched, in the phase order below.
 - **CMake**, not Theos (Theos cross-compiles *for* Apple platforms; it can't produce a
@@ -2279,3 +2282,76 @@ special-case which injection point a given firmware uses. The ad-hoc
 signing identity changed to match: `com.apple.launchd` (was `com.apple.rc`,
 matching `/etc/rc.boot`'s own CodeDirectory identifier — no longer
 applicable now that the splice target is `launchd` again).
+
+## Reopening macOS support: root cause on `--allow-multiple-definition`, and gaster's own IOKit path
+
+A long real-hardware session against AppleTV3,2 (ECID 2685369898254) kept
+surfacing timing-dependent libusb/DFU-state races in `DeviceManager.cpp`'s
+`boot_client()` (the soft-DFU iBSS uploader) — most recently, an
+intermittent "boots into the real OS instead of continuing the exploit
+chain" failure where neither always resetting the USB bus after the final
+control transfer nor never resetting it were consistently correct (see
+`boot_client()`'s own inline comment for the full account; the
+state-conditional fix landed — reset only when the device's own GETSTATUS
+reports DFU state 8/`dfuMANIFEST-WAIT-RESET` — is a real, spec-grounded fix
+but wasn't confirmed to fully close out the intermittent failure by the time
+this section was written). Rather than keep chasing what may be inherent
+libusb-on-Linux timing behavior, `.claude/TODO.md`'s item 4 (macOS support,
+previously scoped-but-parked) was reopened as the more promising direction:
+run the real chain against gaster's and libimobiledevice's native,
+first-party macOS frameworks instead of a Linux libusb path that's already
+shown itself to be fragile against this exact device.
+
+Two pieces of real, verified work came out of picking this back up (both
+build clean on Linux — this session had no Mac to actually compile/run the
+Apple-only branches on):
+
+1. **The `-Wl,--allow-multiple-definition` link flag was a workaround for a
+   real, understood conflict, not an unavoidable one.** `libusbmuxd`'s
+   `common/collection.c` and `libimobiledevice-glue`'s `src/collection.c`
+   both vendor an externally-linked copy of the same generic collection
+   ADT. Diffed directly (not assumed): identical `struct collection`
+   layout, byte-identical function bodies for every symbol libusbmuxd
+   defines; glue's copy is a strict superset, adding one extra function
+   (`collection_copy()`) that libusbmuxd's own code never calls. Since
+   nothing depends on libusbmuxd's specific copy surviving, `libusbmuxd_ext`
+   (`CMakeLists.txt`) now runs `ar d <installed libusbmuxd.a> collection.o`
+   as an extra `INSTALL_COMMAND` step right after `make install`, so only
+   glue's copy of the object ever reaches final link. This removes the
+   duplicate-definition conflict at its source instead of suppressing the
+   linker's complaint about it — confirmed the Linux build still links
+   clean with the GNU-ld-only flag removed entirely. That flag had no
+   Apple-linker equivalent as of Xcode 15+ (the old `-multiply_defined
+   suppress` synonym is gone from the new linker), so this was a real
+   blocker for macOS, not just untidy — now it's simply gone, on every
+   platform.
+2. **gaster already ships a real, upstream-maintained IOKit implementation
+   — the build just never selected it.** `third_party/gaster/gaster.c`'s
+   top-of-file includes are `#ifdef HAVE_LIBUSB` / `#else`: the `#else`
+   branch pulls in `<CommonCrypto/CommonCrypto.h>` and
+   `<IOKit/usb/IOUSBLib.h>` directly, no vendored dependency needed at all
+   (both are always-present system frameworks on any Mac). This project's
+   `CMakeLists.txt` was defining `HAVE_LIBUSB` unconditionally for the
+   `gaster` target regardless of host OS, which — per the still-open TODO
+   item this reopening started from — meant even a macOS build would have
+   inherited whatever libusb's Darwin backend does, not gaster upstream's
+   own native path. Now gated `if(APPLE) ... else() ... endif()`: Apple
+   builds skip `HAVE_LIBUSB`/libusb/wolfSSL entirely and link `-framework
+   CoreFoundation -framework IOKit`; Linux keeps the existing libusb+wolfSSL
+   build byte-for-byte. Scoped deliberately narrow — this only changes
+   which implementation gaster's own standalone `pwn`/`reset` exploit step
+   uses; it does not touch libirecovery's own USB transport, which the rest
+   of `DeviceManager.cpp` (`sendiBSS`/`sendiBEC`/etc.) still goes through on
+   every platform, and whose Darwin behavior remains genuinely unverified
+   (see `.claude/TODO.md` item 4's "needs real macOS hardware" list).
+
+`ResourcePath.cpp`'s `resolveGasterPath()` (now `_NSGetExecutablePath()` +
+`realpath()` behind `#ifdef __APPLE__`) and `DeviceManager.cpp`'s
+`isUninterruptible()` (now a `ps -o state=`-based fork/exec+pipe check on
+Apple, matching the file's existing no-`popen()`/no-`system()` convention,
+instead of reading `/proc/<pid>/status`) and `runGaster()`'s `stdbuf`
+requirement (now probes for `gstdbuf` — Homebrew coreutils' default
+prefixed name — as a fallback when plain `stdbuf` isn't on `PATH`) were the
+other three blockers already named in `.claude/TODO.md` item 4; all three
+are mechanical platform bridging with no design decision of their own
+worth recording here beyond what that TODO entry already says.

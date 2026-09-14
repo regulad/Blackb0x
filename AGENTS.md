@@ -1,4 +1,4 @@
-# AGENTS.md — Blackb0x Linux port
+# AGENTS.md — Blackb0x portable port
 
 Short and operational: what an agent needs to move around this repo and build it
 correctly, right now. For the *why* — every bug hunt, dead end, and decision's
@@ -8,14 +8,16 @@ need more justification than it gives, it's almost certainly explained there.
 ## What Blackb0x is
 
 A jailbreak tool for 2nd/3rd-gen Apple TV (A1378/A1427/A1469) via the checkm8/SHAtter
-DFU-mode boot exploit, which then side-loads Cydia + Kodi. A Linux CLI port of an
+DFU-mode boot exploit, which then side-loads Cydia + Kodi. A portable CLI port of an
 original macOS Cocoa/Objective-C app (the `.m`/`.mm`/`.h` files still in
 `Blackb0x/Source/` are that original — reference-only, not built).
 
 ## Conventions (don't re-litigate without asking)
 
-- **CLI-only, Linux-only.** No GUI, no macOS/Xcode support — dropped, not
-  dual-maintained.
+- **CLI-only.** No GUI — dropped, not dual-maintained. Primary target is Linux;
+  macOS support (`blackb0x`/`gaster` only, not the ramdisk baker yet) is actively
+  being brought up — see `.claude/TODO.md` item 4 for exactly what's done vs. still
+  needs real macOS hardware to verify.
 - **Every third-party dependency is a git submodule under `third_party/`, built from
   source, statically linked.** Not FetchContent, not system packages, no exceptions —
   see the "vendored dependencies" table below and `CMakeLists.txt`'s
