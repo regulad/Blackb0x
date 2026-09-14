@@ -1234,6 +1234,17 @@ int DeviceManager::sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdenti
 
     fprintf(stderr, "sendAPTicket: sent ApTicket (%zu bytes) and device acknowledged the 'ticket' command.\n",
             ticket->size());
+    // Every other send*() here (sendiBEC()/sendRamdisk()/sendKernelCache()/
+    // sendDeviceTree()) settles with sleep(2) after its own operation
+    // before the connection gets torn down -- this one was missing it.
+    // A real run showed DeviceTree's very next transfer immediately
+    // failing with a generic USB upload error right after this succeeded
+    // (having worked fine with identical content/device state in a run
+    // without any APTicket step at all) -- consistent with the device
+    // needing a moment to actually process/validate the ticket
+    // internally before it's ready for the next bulk transfer, same
+    // reasoning as every sibling function's own settle delay.
+    sleep(2);
     irecv_close(client);
     return 0;
 }
