@@ -1609,6 +1609,112 @@ static std::string buildStatusStanzaFromControl(const std::string& controlPath, 
     return out;
 }
 
+// Result of extractDebAndBuildStanza() below.
+struct ExtractedDeb {
+    // Caller-owned either way — remove_all() this when done, whether `ok`
+    // came back true or false (mirrors makeTempDir()'s own contract: only
+    // empty if temp-dir creation itself failed, nothing to clean up then).
+    std::string tempDir;
+    // The dpkg status stanza built from the .deb's own control file — see
+    // buildStatusStanzaFromControl(). Empty if control.tar.* couldn't be
+    // found/extracted, or had no usable control file; this does NOT make
+    // `ok` false (see below), since the payload files under `tempDir` are
+    // still usable either way.
+    std::string stanza;
+    // True once data.tar.* has been located and extracted into `tempDir` —
+    // i.e. whether the caller has anything left to stage at all. False
+    // means the caller should give up immediately (no payload extracted);
+    // true does NOT mean `stanza` is non-empty — that's a separate,
+    // non-fatal-to-extraction failure the caller checks on its own, same as
+    // both callers already did before this was factored out.
+    bool ok = false;
+};
+
+// Shared by stageEtasonatv()/stageP0sixspwn() below — both need the exact
+// same three-step dance against their own .deb: `ar x` it into a fresh temp
+// dir, find+extract its data.tar.* (the actual persistence payload files,
+// left sitting in `tempDir` for the caller to stageFile() individually
+// afterward — every payload file lives at a different relative path per
+// package, so this helper can't know which ones to stage on the caller's
+// behalf), then find+extract its control.tar.* and turn its `control` file
+// into a dpkg status stanza via buildStatusStanzaFromControl().
+//
+// Why this is hand-rolled at all, instead of the normal dpkg-based install
+// pipeline every other .deb in Blackb0x/Debs/ goes through
+// (stageDebcache() -> computePreinstallEligibleFilenames() -> a real `dpkg
+// --unpack`/`--configure` in a container, or else a plain apt-cache entry
+// for postinstall.sh's own apt-get to install on-device): both
+// net.tihmstar.etasonuntether and com.ih8sn0w-squiffy-winocm.p0sixspwn are
+// firmware-version-gated packages (Depends: firmware = <exact point
+// release>) that can never resolve against this project's own synthetic
+// "firmware" package (see kPreinstallInnerScript's own comment), so they
+// never reach that normal pipeline's dependency resolution at all — apt/
+// dpkg would consider them uninstallable, not merely un-preinstalled. On
+// top of that, each needs bake-time treatment a plain install can't express
+// either way: etasonuntether's stanza has to be written `hold`, because
+// this project deliberately overrides the real .deb's own untether.bin with
+// a different one (see stageEtasonatv()'s own comment below) and a later
+// `apt-get upgrade` resolving the real package for real would silently
+// clobber that override; and neither package's real postinst is safe to
+// run at bake time at all (see stageManualDpkgInstall()'s own comment
+// above) — it does live, on-device work (testing a real exploit against
+// real hardware, or writing /etc/launchd.conf) that a mounted-but-not-
+// booted image can't meaningfully execute. So rather than force either
+// package through a pipeline built for unconditional, dependency-resolved
+// installs, stageEtasonatv()/stageP0sixspwn() extract each .deb's real
+// payload+control fields directly and hand-write the dpkg state
+// stageManualDpkgInstall() produces — a special-cased, conditional install
+// for the two packages that are exploit-critical enough to need one, not a
+// hand-rolled reimplementation of dpkg for its own sake.
+static ExtractedDeb extractDebAndBuildStanza(const std::string& debPath, const std::string& tempDirPrefix,
+                                              const std::string& labelForLogging, bool hold = false) {
+    ExtractedDeb result;
+    result.tempDir = makeTempDir(tempDirPrefix);
+    if (result.tempDir.empty()) return result;
+
+    if (!fs::exists(debPath) || !runCommand({"ar", "x", debPath}, result.tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s — %s not staged\n", debPath.c_str(),
+                labelForLogging.c_str());
+        return result;
+    }
+
+    std::string dataTar;
+    std::error_code dirEc;
+    for (const auto& e : fs::directory_iterator(result.tempDir, dirEc)) {
+        if (e.path().filename().string().rfind("data.tar", 0) == 0) {
+            dataTar = e.path().string();
+            break;
+        }
+    }
+    if (dataTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", dataTar}, result.tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's data.tar.* — %s not staged\n", debPath.c_str(),
+                labelForLogging.c_str());
+        return result;
+    }
+
+    std::string controlTar;
+    for (const auto& e : fs::directory_iterator(result.tempDir, dirEc)) {
+        if (e.path().filename().string().rfind("control.tar", 0) == 0) {
+            controlTar = e.path().string();
+            break;
+        }
+    }
+    if (controlTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", controlTar}, result.tempDir)) {
+        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's control.tar.* — dpkg state not staged\n",
+                debPath.c_str());
+    } else {
+        result.stanza = buildStatusStanzaFromControl(result.tempDir + "/control", hold);
+        if (result.stanza.empty()) {
+            fprintf(stderr,
+                    "bakeRamdisk: WARNING: %s's control.tar.* has no usable control file — dpkg state not staged\n",
+                    debPath.c_str());
+        }
+    }
+
+    result.ok = true;
+    return result;
+}
+
 // iOS 8.4 branch — tihmstar's EtasonATV untether (see Blackb0x/Misc/README.md's
 // "etasonATV / tihmstar-untether provenance" for the jsc/rtbuddyd/--early-boot
 // mechanism this stages), extracted directly from the real
@@ -1638,48 +1744,17 @@ static std::string buildStatusStanzaFromControl(const std::string& controlPath, 
 // propagated).
 static bool stageEtasonatv(const fs::path& blackb0xRoot) {
     std::string debPath = fs::absolute(resolveDebsPath() + "/net.tihmstar.etasonuntether-1.3.1.deb").string();
-    std::string tempDir = makeTempDir("blackb0x-etasonatv-");
-    if (tempDir.empty()) return false;
-    if (!fs::exists(debPath) || !runCommand({"ar", "x", debPath}, tempDir)) {
-        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s — 8.4 untether payload not staged\n",
-                debPath.c_str());
-        std::error_code rmEc;
-        fs::remove_all(tempDir, rmEc);
+    ExtractedDeb extracted = extractDebAndBuildStanza(debPath, "blackb0x-etasonatv-", "8.4 untether payload",
+                                                        /*hold=*/true);
+    if (!extracted.ok) {
+        if (!extracted.tempDir.empty()) {
+            std::error_code rmEc;
+            fs::remove_all(extracted.tempDir, rmEc);
+        }
         return false;
     }
-    std::string dataTar;
-    std::error_code dirEc;
-    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
-        if (e.path().filename().string().rfind("data.tar", 0) == 0) {
-            dataTar = e.path().string();
-            break;
-        }
-    }
-    if (dataTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", dataTar}, tempDir)) {
-        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's data.tar.* — 8.4 untether payload not staged\n",
-                debPath.c_str());
-        std::error_code rmEc;
-        fs::remove_all(tempDir, rmEc);
-        return false;
-    }
-    std::string controlTar;
-    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
-        if (e.path().filename().string().rfind("control.tar", 0) == 0) {
-            controlTar = e.path().string();
-            break;
-        }
-    }
-    std::string stanza;
-    if (controlTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", controlTar}, tempDir)) {
-        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's control.tar.* — dpkg state not staged\n",
-                debPath.c_str());
-    } else {
-        stanza = buildStatusStanzaFromControl(tempDir + "/control", /*hold=*/true);
-        if (stanza.empty()) {
-            fprintf(stderr, "bakeRamdisk: WARNING: %s's control.tar.* has no usable control file — dpkg state not staged\n",
-                    debPath.c_str());
-        }
-    }
+    const std::string& tempDir = extracted.tempDir;
+    const std::string& stanza = extracted.stanza;
     bool ok = true;
     ok &= stageFile(blackb0xRoot, "private/etc/rc.d/daemonload", tempDir + "/etc/rc.d/daemonload", 0, 0, 0755);
     ok &= stageFile(blackb0xRoot, "usr/bin/orphan_commander", tempDir + "/usr/bin/orphan_commander", 0, 0, 0755);
@@ -1754,48 +1829,16 @@ static bool stageIos7Tether(const fs::path& blackb0xRoot) {
 // against.
 static bool stageP0sixspwn(const fs::path& blackb0xRoot) {
     std::string debPath = fs::absolute(resolveDebsPath() + "/com.ih8sn0w-squiffy-winocm.p0sixspwn_1.4-1_iphoneos-arm.deb").string();
-    std::string tempDir = makeTempDir("blackb0x-p0sixspwn-");
-    if (tempDir.empty()) return false;
-    if (!fs::exists(debPath) || !runCommand({"ar", "x", debPath}, tempDir)) {
-        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s — 6.1.4 untether payload not staged\n",
-                debPath.c_str());
-        std::error_code rmEc;
-        fs::remove_all(tempDir, rmEc);
+    ExtractedDeb extracted = extractDebAndBuildStanza(debPath, "blackb0x-p0sixspwn-", "6.1.4 untether payload");
+    if (!extracted.ok) {
+        if (!extracted.tempDir.empty()) {
+            std::error_code rmEc;
+            fs::remove_all(extracted.tempDir, rmEc);
+        }
         return false;
     }
-    std::string dataTar;
-    std::error_code dirEc;
-    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
-        if (e.path().filename().string().rfind("data.tar", 0) == 0) {
-            dataTar = e.path().string();
-            break;
-        }
-    }
-    if (dataTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", dataTar}, tempDir)) {
-        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's data.tar.* — 6.1.4 untether payload not staged\n",
-                debPath.c_str());
-        std::error_code rmEc;
-        fs::remove_all(tempDir, rmEc);
-        return false;
-    }
-    std::string controlTar;
-    for (const auto& e : fs::directory_iterator(tempDir, dirEc)) {
-        if (e.path().filename().string().rfind("control.tar", 0) == 0) {
-            controlTar = e.path().string();
-            break;
-        }
-    }
-    std::string stanza;
-    if (controlTar.empty() || !runCommand({"tar", "--auto-compress", "-xf", controlTar}, tempDir)) {
-        fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's control.tar.* — dpkg state not staged\n",
-                debPath.c_str());
-    } else {
-        stanza = buildStatusStanzaFromControl(tempDir + "/control");
-        if (stanza.empty()) {
-            fprintf(stderr, "bakeRamdisk: WARNING: %s's control.tar.* has no usable control file — dpkg state not staged\n",
-                    debPath.c_str());
-        }
-    }
+    const std::string& tempDir = extracted.tempDir;
+    const std::string& stanza = extracted.stanza;
     bool ok = true;
     ok &= stageFile(blackb0xRoot, "usr/libexec/dirhelper", tempDir + "/usr/libexec/dirhelper", 0, 0, 0755);
     stageDir(blackb0xRoot, "private/var/untether", 0, 0, 0755);
