@@ -1227,77 +1227,55 @@ int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
 // control transfer that DELIVERS 'bootx' was acknowledged, not that the
 // device went on to actually boot the kernel it names.
 //
-// IMPORTANT, cross-checked directly against the original: staying in
-// Recovery mode for a while after 'bootx' is the EXPECTED, NORMAL state,
-// not a failure signal -- the just-booted kernel is running the ramdisk's
-// own userland (entrypoint.c, merging /blackb0x onto the real volume,
-// etc.), which is still classified as Recovery/Restore mode over USB the
-// whole time it runs; the device only actually leaves that mode once
-// entrypoint.c itself finishes and calls reboot() a SECOND time. The
-// original DeviceManager.m/MainView.m's own device_event handler
-// (newDevice() in DeviceManager.m) confirms this exactly: it treats a
-// Recovery-mode reconnect with waitForRecovery==1 as the SUCCESS case
-// ("Done! ... You will be able to use it once it automatically restarts
-// itself"), not a failure -- and it waits for that reconnect completely
-// unboundedly (an async device_event callback, no timeout at all), never
-// polling with a short deadline the way an earlier version of this
-// function did.
-//
-// So: this only ever logs observations, never declares "boot failed" --
-// there's no way to distinguish "still legitimately running
-// entrypoint.c's install work" from "actually stuck" purely from USB
-// reachability, since both look identical (device still answers as
-// Recovery mode). The one genuinely unambiguous failure signal this
-// project has no way to check over USB at all is Apple's own branded
-// error screen (the support.apple.com/appletv/restore URL) -- that has to
-// be read off the device's physical display, not inferred here.
-static void checkDeviceLeftRecoveryModeAfterBoot(uint64_t ecid) {
+// CORRECTED (an earlier version of this function assumed staying in
+// Recovery mode for up to 60s after 'bootx' was normal, reasoning that
+// entrypoint.c's own install work takes real time before it reboots the
+// device a second time): a real run's `irecovery -s` console capture,
+// taken right after a 'bootx' attempt, showed iBoot's own fresh startup
+// banner and NAND probe sequence ending in "Boot Failure Count: 1 ...
+// Entering recovery mode, starting command prompt" -- i.e. a real,
+// independent iBoot boot-failure fallback, not entrypoint.c quietly still
+// working. A working handoff leaves Recovery mode in well under 5
+// seconds; still being reachable past that point means iBoot rejected or
+// failed to boot the uploaded kernelcache/ramdisk/devicetree combination
+// outright (signature/format validation, a bad boot-args/KASLR patch,
+// etc.), not that anything is legitimately still running. Returns true if
+// the device left Recovery mode within that window, false otherwise --
+// the caller now treats false as a real failure, not just a log line.
+static bool checkDeviceLeftRecoveryModeAfterBoot(uint64_t ecid) {
     fprintf(stderr,
-            "sendKernelCache: 'bootx' acknowledged. Watching for up to 60s to see whether the device "
-            "leaves Recovery mode (the ramdisk's own entrypoint.c calls reboot() a second time once it "
-            "finishes installing -- staying in Recovery mode during this window is normal, not evidence "
-            "of failure; see this function's own comment). If the device's own screen shows Apple's "
-            "branded restore/error screen, that IS a real failure signal -- this check can't see that "
-            "over USB at all.\n");
-    for (int i = 1; i <= 12; i++) {
-        sleep(5);
+            "sendKernelCache: 'bootx' acknowledged. A working boot hands off well under 5s -- checking "
+            "whether the device actually leaves Recovery mode within that window.\n");
+    for (int i = 1; i <= 5; i++) {
+        sleep(1);
         irecv_client_t check = get_tv(ecid);
         if (!check) {
-            fprintf(stderr,
-                    "sendKernelCache: device is no longer responding in Recovery mode (checked after "
-                    "%ds) -- it left that state, most likely because entrypoint.c finished and rebooted "
-                    "it. Still doesn't by itself confirm which mode it landed in next (Normal = fully "
-                    "successful; DFU = entrypoint.c's own auto-boot=1 nvram call didn't take effect) -- "
-                    "check the device directly.\n",
-                    i * 5);
-            return;
+            fprintf(stderr, "sendKernelCache: device left Recovery mode after %ds -- boot handoff succeeded.\n",
+                    i);
+            return true;
         }
         // Raw numeric mode, not just mode_to_str()'s collapsed "Recovery"
         // string -- IRECV_K_RECOVERY_MODE_1..4 (0x1280-0x1283) are four
-        // genuinely different USB PIDs that mode_to_str() folds into one
-        // label. Whether this device's kernel-booted-and-running-the-
-        // ramdisk's-own-restore-protocol state uses a *different* one of
-        // these four than iBoot's own pre-kernel-boot recovery console
-        // does isn't confirmed anywhere in this codebase -- logging the
-        // raw value on every poll at least surfaces if/when it changes,
-        // which plain reachability alone can't. Serial string logged too:
-        // if anything about the device's self-reported identity changes
-        // once the ramdisk's kernel is actually running versus iBoot
-        // itself, this is the other place that would show up.
+        // genuinely different USB PIDs mode_to_str() folds into one label
+        // (looked up directly: they're iBoot *protocol-version* IDs tied
+        // to firmware generation, not live boot-state indicators, so this
+        // is expected to stay constant across polls on a single device --
+        // logged anyway since it's free, real data. Serial string logged
+        // too, for the same reason.
         int mode = 0;
         irecv_get_mode(check, &mode);
         const struct irecv_device_info* info = irecv_get_device_info(check);
         fprintf(stderr,
-                "sendKernelCache: still responding in Recovery mode after %ds (this can be entirely "
-                "normal -- see above). Raw mode: 0x%04x. Serial string: %s\n",
-                i * 5, mode, (info && info->serial_string) ? info->serial_string : "(none)");
+                "sendKernelCache: still responding in Recovery mode after %ds. Raw mode: 0x%04x. Serial "
+                "string: %s\n",
+                i, mode, (info && info->serial_string) ? info->serial_string : "(none)");
         irecv_close(check);
     }
     fprintf(stderr,
-            "sendKernelCache: still responding in Recovery mode 60s after 'bootx'. Past this point it's "
-            "worth being suspicious, but this still isn't proof of failure by itself -- check the "
-            "device's own screen for Apple's branded restore/error screen (real failure) versus just a "
-            "dark/idle display (plausibly still working).\n");
+            "sendKernelCache: device is STILL in Recovery mode 5s after 'bootx' was acknowledged -- "
+            "treating this as a failure. iBoot most likely rejected or failed to boot the uploaded "
+            "kernelcache/ramdisk/devicetree combination.\n");
+    return false;
 }
 
 int DeviceManager::sendKernelCache(const std::string& KernelCache_Path, uint64_t ecid) {
@@ -1305,7 +1283,9 @@ int DeviceManager::sendKernelCache(const std::string& KernelCache_Path, uint64_t
     // follows Ramdisk's own NOTIFY_FINISH-triggered reset.
     irecv_client_t client = get_tv_patient(ecid);
     int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx");
-    if (result == 0) checkDeviceLeftRecoveryModeAfterBoot(ecid);
+    if (result == 0 && !checkDeviceLeftRecoveryModeAfterBoot(ecid)) {
+        result = -1;
+    }
     sleep(2);
     return result;
 }
