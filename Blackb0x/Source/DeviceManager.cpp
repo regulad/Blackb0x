@@ -1254,6 +1254,14 @@ int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
         fprintf(stderr, "sendiBEC: device did not reconnect for %s\n", iBECpath.c_str());
         return -1;
     }
+    // Real idevicerestore's own dfu_enter_recovery() (dfu.c) explicitly
+    // sets the USB configuration back to 1 right after this same
+    // post-iBSS reconnect, before sending iBEC -- blackb0x never did this
+    // at all. Harmless if the device was already on configuration 1 (the
+    // only one these DFU/Recovery-mode devices ever expose), but matches
+    // idevicerestore exactly rather than assuming libirecovery's own
+    // reconnect always leaves it set.
+    irecv_usb_set_configuration(client, 1);
     irecv_error_t err = irecv_send_file(client, iBECpath.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
     if (err != IRECV_E_SUCCESS) {
         fprintf(stderr, "sendiBEC: failed to send %s: %s\n", iBECpath.c_str(), irecv_strerror(err));
@@ -1297,9 +1305,16 @@ int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
 // (without this) still left the device resetting back to iBoot's own
 // prompt every time. sendKernelCache() below passes true for exactly
 // this reason; every other caller leaves this at its default (false).
+// extraCommandBeforeMain: real idevicerestore's own recovery_send_ramdisk()
+// fires "getenv ramdisk-delay" (fire-and-forget, plain irecv_send_command()
+// -- no response read at all, unlike irecv_getenv()) right after the
+// ramdisk file upload, before the actual "ramdisk" command. sendRamdisk()/
+// sendStockRestoreTail() below both pass "getenv ramdisk-delay" for
+// exactly this component; every other caller leaves this at its default
+// (nullptr, no extra command sent).
 static int sendFileThenCommand(irecv_client_t client, const char* what, const std::string& path,
                                 const char* command, bool keepOpen = false, uint8_t commandBreq = 0,
-                                bool dnloadFinish = false) {
+                                bool dnloadFinish = false, const char* extraCommandBeforeMain = nullptr) {
     if (!client) {
         fprintf(stderr, "%s: device did not reconnect for %s\n", what, path.c_str());
         return -1;
@@ -1312,6 +1327,9 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
     }
     if (dnloadFinish) {
         irecv_usb_control_transfer(client, 0x21, 1, 0, 0, nullptr, 0, 5000);
+    }
+    if (extraCommandBeforeMain) {
+        irecv_send_command(client, extraCommandBeforeMain);
     }
     err = irecv_send_command_breq(client, command, commandBreq);
     if (err != IRECV_E_SUCCESS) {
@@ -1352,7 +1370,8 @@ int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
     // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
     // follows DeviceTree's own NOTIFY_FINISH-triggered reset.
     irecv_client_t client = get_tv_patient(ecid);
-    int result = sendFileThenCommand(client, "sendRamdisk", Ramdisk_Path, "ramdisk");
+    int result = sendFileThenCommand(client, "sendRamdisk", Ramdisk_Path, "ramdisk", false, 0, false,
+                                      "getenv ramdisk-delay");
     sleep(2);
     return result;
 }
@@ -1530,15 +1549,17 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
     // a step's own send fails -- exactly the failure shape a stale handle
     // produces -- rather than giving up on the very first attempt.
     auto sendFileThenCommandWithReconnect = [&](const char* what, const std::string& path, const char* command,
-                                                 uint8_t bReq = 0) -> bool {
-        if (sendFileThenCommand(client, what, path, command, true, bReq) == 0) return true;
+                                                 uint8_t bReq = 0, const char* extraCommandBeforeMain = nullptr) -> bool {
+        if (sendFileThenCommand(client, what, path, command, true, bReq, false, extraCommandBeforeMain) == 0) {
+            return true;
+        }
         fprintf(stderr, "%s: retrying once against a freshly-reopened connection...\n", what);
         client = get_tv_patient(ecid);
         if (!client) {
             fprintf(stderr, "%s: device did not reconnect for the retry\n", what);
             return false;
         }
-        return sendFileThenCommand(client, what, path, command, true, bReq) == 0;
+        return sendFileThenCommand(client, what, path, command, true, bReq, false, extraCommandBeforeMain) == 0;
     };
 
     const struct irecv_device_info* info = irecv_get_device_info(client);
@@ -1564,6 +1585,26 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
     }
     fprintf(stderr, "sendStockRestoreTail: sent ApTicket (%zu bytes) and device acknowledged the 'ticket' command.\n",
             ticket->size());
+
+    // Real idevicerestore's own recovery_enter_restore() (recovery.c) sends
+    // `setenv auto-boot false` + `saveenv` right here, before RestoreLogo
+    // -- blackb0x never did this at all. Without it, iBoot's own default
+    // auto-boot behavior (whatever it was left at) stays in effect through
+    // the rest of this sequence instead of being explicitly disabled for
+    // the duration of the restore.
+    err = irecv_send_command(client, "setenv auto-boot false");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendStockRestoreTail: failed to send 'setenv auto-boot false' command: %s\n",
+                irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    err = irecv_send_command(client, "saveenv");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendStockRestoreTail: failed to send 'saveenv' command: %s\n", irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
 
     if (!onlyBootComponents) {
         if (components.restoreLogo) {
@@ -1593,7 +1634,8 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
             irecv_close(client);
             return -1;
         }
-        if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk")) {
+        if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk",
+                                               /*bReq=*/0, "getenv ramdisk-delay")) {
             if (client) irecv_close(client);
             return -1;
         }
