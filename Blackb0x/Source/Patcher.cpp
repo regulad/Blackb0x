@@ -332,6 +332,35 @@ bool Patcher::patchRamdisk(const std::string& path) {
     return true;
 }
 
+// See Patcher.hpp's own comment on why this exists. Deliberately minimal
+// compared to patchRamdisk()/bake-all-ramdisks' own bakeRamdisk(): no
+// dist/ lookup, no .sum check, no HFS+/loop-mount work at all -- just
+// decrypt()'s the freshly-downloaded RestoreRamdisk exactly the way
+// patchiBSS()/patchiBEC() decrypt their own components, and sends that
+// straight through. This is byte-for-byte what a real, unmodified Apple
+// restore would send the device.
+bool Patcher::useStockRamdisk(const std::string& path) {
+    const FirmwareKeyPair* k = keyFor("RestoreRamdisk");
+    if (!k) {
+        fprintf(stderr, "useStockRamdisk: no RestoreRamdisk keys loaded\n");
+        return false;
+    }
+
+    std::string outPath = outputPathFor(path);
+
+    fprintf(stderr,
+            "--stock-ramdisk: decrypting the stock RestoreRamdisk exactly as downloaded from Apple -- "
+            "skipping the blackb0x-patched dist/ ramdisk and entrypoint.c entirely, for isolating "
+            "whether a boot failure is in blackb0x's own ramdisk patching or earlier in the chain.\n");
+
+    decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
+            const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE", nullptr);
+
+    outputs_.ramdisk = outPath;
+    checkPatching();
+    return true;
+}
+
 void Patcher::setDeviceTreePath(const std::string& path) {
     outputs_.deviceTree = path;
     checkPatching();

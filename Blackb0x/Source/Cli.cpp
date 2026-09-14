@@ -70,6 +70,13 @@ void printCliUsage(const char* argv0) {
     printf("                            re-running bake-all-ramdisks every time; NOT\n");
     printf("                            the default, since it can silently ship a\n");
     printf("                            stale ramdisk.\n");
+    printf("  --stock-ramdisk           Send the stock RestoreRamdisk exactly as\n");
+    printf("                            downloaded from Apple, instead of the\n");
+    printf("                            blackb0x-patched one -- diagnostic, to check\n");
+    printf("                            whether a boot failure is in blackb0x's own\n");
+    printf("                            ramdisk patching/entrypoint.c or earlier in\n");
+    printf("                            the chain. The device will NOT be jailbroken\n");
+    printf("                            by a run using this flag.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -102,6 +109,8 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.noCheckm8 = true;
         } else if (arg == "--dont-check-firmware-sums") {
             options.dontCheckFirmwareSums = true;
+        } else if (arg == "--stock-ramdisk") {
+            options.stockRamdisk = true;
         } else if (arg == "--pwntool") {
             std::string value = nextArg("--pwntool");
 #if defined(__APPLE__)
@@ -289,7 +298,7 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
 std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, const AppleTVDevice& device,
                                                               const std::string& buildToRequest,
                                                               bool onlyBootComponents,
-                                                              bool dontCheckFirmwareSums) {
+                                                              bool dontCheckFirmwareSums, bool stockRamdisk) {
     patcher.onlyBootComponents = onlyBootComponents;
     patcher.dontCheckFirmwareSums = dontCheckFirmwareSums;
 
@@ -371,8 +380,13 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
                       [&](const std::string& path) { patcher.setDeviceTreePath(path); });
 
     if (!onlyBootComponents) {
-        downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath,
-                          [&](const std::string& path) { patcher.patchRamdisk(path); });
+        downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath, [&](const std::string& path) {
+            if (stockRamdisk) {
+                patcher.useStockRamdisk(path);
+            } else {
+                patcher.patchRamdisk(path);
+            }
+        });
     }
 
     if (!result) {
@@ -631,11 +645,18 @@ int runCli(const CliOptions& options) {
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
 
-    auto components =
-        downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot, options.dontCheckFirmwareSums);
+    auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
+                                                   options.dontCheckFirmwareSums, options.stockRamdisk);
     if (!components) {
         fprintf(stderr, "Failed to download/patch firmware components.\n");
         return 1;
+    }
+
+    if (options.stockRamdisk) {
+        fprintf(stderr,
+                "--stock-ramdisk: this run sends the stock, unmodified RestoreRamdisk -- the device "
+                "will NOT be jailbroken even if everything below succeeds. This is a diagnostic run "
+                "only.\n");
     }
 
     if (!sendComponentsToDevice(deviceManager, device, *components, tetherBoot, options.dryRun)) {
@@ -647,7 +668,12 @@ int runCli(const CliOptions& options) {
         return 0;
     }
 
-    printf("\nDone. %s\n", tetherBoot ? "The Apple TV should now boot the tethered jailbreak."
-                                       : "The Apple TV should now reboot into the jailbroken system.");
+    if (options.stockRamdisk) {
+        printf("\nDone. --stock-ramdisk was set -- the Apple TV should reboot into a stock, "
+               "non-jailbroken state if this diagnostic run succeeded.\n");
+    } else {
+        printf("\nDone. %s\n", tetherBoot ? "The Apple TV should now boot the tethered jailbreak."
+                                           : "The Apple TV should now reboot into the jailbroken system.");
+    }
     return 0;
 }

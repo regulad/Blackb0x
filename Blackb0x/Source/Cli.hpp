@@ -25,6 +25,12 @@ struct CliOptions {
     bool dryRun = false;
     bool noCheckm8 = false;
     bool dontCheckFirmwareSums = false;
+    // Sends the stock RestoreRamdisk exactly as downloaded from Apple
+    // instead of the blackb0x-patched dist/ one -- a diagnostic for
+    // narrowing down whether a boot failure is in blackb0x's own ramdisk
+    // patching/entrypoint.c or earlier in the chain (see
+    // Patcher::useStockRamdisk()'s own comment).
+    bool stockRamdisk = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or
     // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms

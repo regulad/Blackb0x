@@ -72,6 +72,17 @@ public:
     bool patchKernel(const std::string& path, const std::string& productVersion);
     bool patchRamdisk(const std::string& path);
 
+    // --stock-ramdisk (Cli.hpp's CliOptions): decrypts and sends the
+    // RestoreRamdisk exactly as downloaded from Apple -- no /blackb0x
+    // merge, no entrypoint.c, none of bake-all-ramdisks' own work at all
+    // -- instead of patchRamdisk()'s usual dist/<device>_<buildID>-
+    // Ramdisk.dmg lookup. A diagnostic: if the device boots this one fine,
+    // the failure is somewhere in blackb0x's own ramdisk patching or
+    // entrypoint.c; if it fails the same way even with a stock ramdisk,
+    // the failure is earlier in the chain (iBSS/iBEC/KASLR-boot-args
+    // patches, kernelcache, devicetree, or the boot trigger itself).
+    bool useStockRamdisk(const std::string& path);
+
     void setDeviceTreePath(const std::string& path);
 
     bool onlyBootComponents = false;
