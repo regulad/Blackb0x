@@ -1189,6 +1189,29 @@ target_link_libraries(blackb0x PRIVATE
     deps::curl
     ZLIB::ZLIB
     Threads::Threads)
+
+# Real macOS link failure: the shared libirecovery_ext build picks IOKit
+# by default there (its own configure.ac's --with-iokit defaults to yes
+# when IOKit is available -- see the blackb0x-pwn block above for the
+# full story on this default), and wolfSSL's own DoAppleNativeCertValidation/
+# LoadSystemCaCertsMac (its native-macOS-cert-store support) and curl's
+# Curl_macos_init (proxy detection) both call into Apple frameworks
+# directly too -- none of that is optional/conditional on this project's
+# own build flags, it's baked into those libraries' own Darwin code paths.
+# Undefined symbols spanned CoreFoundation (irecovery + wolfSSL),
+# IOKit (irecovery), Security (wolfSSL's Sec*/native cert validation), and
+# SystemConfiguration (curl's SCDynamicStoreCopyProxies) specifically --
+# confirmed against the real link error, not guessed. blackb0x-pwn/gaster's
+# own Apple link lines don't need Security/SystemConfiguration since
+# neither links wolfSSL or curl at all.
+if(APPLE)
+    target_link_libraries(blackb0x PRIVATE
+        "-framework CoreFoundation"
+        "-framework IOKit"
+        "-framework Security"
+        "-framework SystemConfiguration")
+endif()
+
 # libusbmuxd.a (needed by common/userpref.c's usbmuxd_read_buid/
 # usbmuxd_read_pair_record/etc, its own daemon-side pairing-record cache
 # path) and libimobiledevice-glue-1.0.a used to each vendor their own
