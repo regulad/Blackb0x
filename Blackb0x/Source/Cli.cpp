@@ -526,7 +526,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 // — verbatim from the original's `self.selected_device.jailbroken == 1`
 // branch.
 bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device, const PatchedComponents& components,
-                             bool tetherBoot, bool dryRun) {
+                             bool tetherBoot, bool dryRun, bool stockRecovery, bool stockSecurom) {
     if (dryRun) {
         printf("(dry run) Would send:\n");
         printf("  iBSS%s\n", components.iBSS ? "" : " (missing, would fail here)");
@@ -544,9 +544,12 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
 
     printf("Sending iBSS -> ");
     fflush(stdout);
-    if (deviceManager.sendiBSS(*components.iBSS, device.ecid) != 0) {
+    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery || stockSecurom) != 0) {
         printf("Error\n");
-        fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.\n");
+        fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
+                stockSecurom ? " (this failure is predictable, since you are trying to send the pwned "
+                               "recovery with an intact securom)"
+                             : "");
         return false;
     }
     printf("Sent\n");
@@ -802,7 +805,8 @@ int runCli(const CliOptions& options) {
         return 1;
     }
 
-    if (!sendComponentsToDevice(deviceManager, device, *components, tetherBoot, options.dryRun)) {
+    if (!sendComponentsToDevice(deviceManager, device, *components, tetherBoot, options.dryRun,
+                                 options.stockRecovery, options.stockSecurom)) {
         return 1;
     }
 

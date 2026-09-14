@@ -61,10 +61,10 @@ static int send_data(irecv_client_t client, unsigned char* data, size_t size);
 static bool commandExistsOnPath(const char* name);
 static int runGaster(const std::vector<std::string>& args, int timeoutSeconds = 0);
 static int runBlackb0xPwn(const std::vector<std::string>& args, int timeoutSeconds = 0);
-static int boot_client(irecv_client_t client, void* buf, size_t sz);
+static int boot_client(irecv_client_t client, void* buf, size_t sz, bool allowUnpwned = false);
 static int check_img3_file_format(irecv_client_t client, void* file, size_t sz, void** out, size_t* outsz);
-static int sendiBSS_ATV31(uint64_t ecid, const char* iBSSpath);
-static int sendiBSS_ATV32(uint64_t ecid, const char* path);
+static int sendiBSS_ATV31(uint64_t ecid, const char* iBSSpath, bool allowUnpwned = false);
+static int sendiBSS_ATV32(uint64_t ecid, const char* path, bool allowUnpwned = false);
 static void send_progress(double progress);
 static int progress_cb(irecv_client_t client, const irecv_event_t* event);
 
@@ -1079,7 +1079,7 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid) {
 // sendComponentsToDevice(), which already knows exactly when each one
 // starts and what its result was) — these stay quiet on success and only
 // report genuine, otherwise-unexplained failures.
-int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid) {
+int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool allowUnpwned) {
     irecv_client_t client = get_tv(ecid);
     if (!client) {
         return -1;
@@ -1090,12 +1090,12 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid) {
 
     if (strstr(device->product_type, "AppleTV3,1")) {
         irecv_close(client);
-        return sendiBSS_ATV31(ecid, iBSSpath.c_str());
+        return sendiBSS_ATV31(ecid, iBSSpath.c_str(), allowUnpwned);
     }
 
     if (strstr(device->product_type, "AppleTV3,2")) {
         irecv_close(client);
-        return sendiBSS_ATV32(ecid, iBSSpath.c_str());
+        return sendiBSS_ATV32(ecid, iBSSpath.c_str(), allowUnpwned);
     }
 
     // AppleTV2,1
@@ -1355,7 +1355,7 @@ int DeviceManager::sendDeviceTree(const std::string& DeviceTree_Path, uint64_t e
 // AppleTV3,2 booting (soft DFU)
 // ---------------------------------------------------------------------------
 
-static int sendiBSS_ATV32(uint64_t ecid, const char* path) {
+static int sendiBSS_ATV32(uint64_t ecid, const char* path, bool allowUnpwned) {
     irecv_client_t client = get_tv(ecid);
     if (!client) {
         return -1;
@@ -1387,7 +1387,7 @@ static int sendiBSS_ATV32(uint64_t ecid, const char* path) {
         return -1;
     }
 
-    int ret = boot_client(client, buffer, buffer_size);
+    int ret = boot_client(client, buffer, buffer_size, allowUnpwned);
     free(buffer);
     close(handle);
     return (ret == 0) ? 0 : 1;
@@ -1397,7 +1397,7 @@ static int sendiBSS_ATV32(uint64_t ecid, const char* path) {
 // AppleTV3,1 booting
 // ---------------------------------------------------------------------------
 
-static int sendiBSS_ATV31(uint64_t ecid, const char* iBSSpath) {
+static int sendiBSS_ATV31(uint64_t ecid, const char* iBSSpath, bool allowUnpwned) {
     irecv_client_t client = get_tv(ecid);
     if (!client) return -1;
 
@@ -1416,7 +1416,7 @@ static int sendiBSS_ATV31(uint64_t ecid, const char* iBSSpath) {
     fclose(iBSSfile);
     (void)nread;
 
-    int ret = boot_client(client, buf, length);
+    int ret = boot_client(client, buf, length, allowUnpwned);
     free(buf);
     if (ret != 0) {
         return -1;
@@ -1470,7 +1470,7 @@ static int send_data(irecv_client_t client, unsigned char* data, size_t size) {
     return irecv_usb_control_transfer(client, 0x21, 1, 0, 0, data, size, 100);
 }
 
-static int boot_client(irecv_client_t client, void* buf, size_t sz) {
+static int boot_client(irecv_client_t client, void* buf, size_t sz, bool allowUnpwned) {
     if (!client) {
         return -1;
     }
@@ -1478,9 +1478,23 @@ static int boot_client(irecv_client_t client, void* buf, size_t sz) {
     const struct irecv_device_info* info = irecv_get_device_info(client);
     const char* pwnd_str = strstr(info->serial_string, "PWND:[");
     if (!pwnd_str) {
-        irecv_close(client);
-        fprintf(stderr, "Device is not in pwned DFU mode.\n");
-        return -1;
+        if (!allowUnpwned) {
+            irecv_close(client);
+            fprintf(stderr, "Device is not in pwned DFU mode.\n");
+            return -1;
+        }
+        // --stock-recovery/--stock-securom (Cli.hpp's CliOptions): the
+        // caller deliberately wants this attempted against a device
+        // without a "PWND:[" serial string. The soft-DFU sequence below is
+        // built entirely around checkm8's own memory-corruption state
+        // accepting a raw, unsigned payload over USB -- a genuinely
+        // un-pwned device's real, intact SecureROM has no reason to honor
+        // any of it, so this is expected to go on to fail below rather
+        // than being a new bug (see the --stock-securom-specific note on
+        // that failure in Cli.cpp's sendComponentsToDevice()).
+        fprintf(stderr,
+                "Device does not report pwned DFU mode (no PWND:[ in its serial string) -- continuing anyway "
+                "since --stock-recovery/--stock-securom was passed.\n");
     }
 
     void* ibss;

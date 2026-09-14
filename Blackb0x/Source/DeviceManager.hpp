@@ -102,7 +102,16 @@ public:
     irecv_client_t get_tv(uint64_t ecid);
 
     // --- iRecovery upload helpers ---
-    int sendiBSS(const std::string& path, uint64_t ecid);
+    // allowUnpwned: skip the hard "PWND:[" serial-string check that would
+    // otherwise refuse to even attempt the AppleTV3,1/3,2 soft-DFU iBSS
+    // upload (see boot_client() in DeviceManager.cpp) -- set for
+    // --stock-recovery/--stock-securom (Cli.hpp's CliOptions), which
+    // deliberately want to try this against a device that either hasn't
+    // been pwned by this run's own checkm8 call, or was never meant to be
+    // (--stock-securom). Does not change anything else about the upload --
+    // a genuinely un-pwned device's real SecureROM is still free to reject
+    // it on its own terms.
+    int sendiBSS(const std::string& path, uint64_t ecid, bool allowUnpwned = false);
     int sendiBEC(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
