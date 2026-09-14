@@ -544,7 +544,22 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     }
 
     if (!result) {
-        fprintf(stderr, "Not all required components patched successfully\n");
+        std::vector<std::string> missing = patcher.missingRequiredComponents();
+        std::string joined;
+        for (size_t i = 0; i < missing.size(); i++) joined += (i ? ", " : "") + missing[i];
+        // Not "...patched successfully" -- on any --stock-* route
+        // nothing here actually patches anything (useStockIBSS()/
+        // useStockIBEC()/etc. just decrypt or pass the original file
+        // through untouched), so that wording pointed at the wrong half
+        // of the problem when the real cause was e.g. a missing
+        // decryption key or a download failure instead.
+        fprintf(stderr,
+                "Not all required components were prepared successfully -- still missing: %s. Look further up "
+                "for the actual reason that component's own step failed (a download failure prints \"Failed "
+                "to download <name>\"; a missing decryption key prints \"no ... keys loaded\"; an actual patch "
+                "failure -- only possible on a non-stock route -- prints its own iBootPatcher()/patch_kernel() "
+                "error).\n",
+                joined.empty() ? "(nothing? this shouldn't happen)" : joined.c_str());
         return std::nullopt;
     }
     return result;
@@ -955,7 +970,13 @@ int runCli(const CliOptions& options) {
                                                    options.stockRecovery, options.stockFirmware,
                                                    options.stockSecurom);
     if (!components) {
-        fprintf(stderr, "Failed to download/patch firmware components.\n");
+        // Not "...to patch..." -- on any --stock-* route nothing here
+        // actually patches anything (useStockIBSS()/useStockIBEC()/etc.
+        // just decrypt or pass the original file through untouched), so
+        // that wording pointed at the wrong half of the problem. The
+        // real reason is already printed above (see
+        // downloadAndPatchComponents()'s own message).
+        fprintf(stderr, "Failed to download or prepare firmware components.\n");
         return 1;
     }
 

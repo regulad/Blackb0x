@@ -471,9 +471,15 @@ bool Patcher::patchRamdisk(const std::string& path) {
 // straight through. This is byte-for-byte what a real, unmodified Apple
 // restore would send the device.
 // Called for either --stock-ramdisk or --stock-firmware (see Cli.cpp's
-// downloadAndPatchComponents()) -- neither message below names a
-// specific flag, since either one (or both) could be why this is
-// running.
+// downloadAndPatchComponents()) -- the stockRecovery branch below is only
+// ever actually reachable in practice alongside --stock-securom (runCli()
+// requires --stock-firmware for --stock-recovery, and the only reason to
+// combine those two without also testing against a real, un-pwned
+// SecureROM is rare/contrived), so that message names --stock-securom
+// specifically rather than a generic internal function name a user has
+// no way to connect back to anything they typed. The other (non-
+// stockRecovery) branch is reachable via --stock-ramdisk or
+// --stock-firmware alone -- named generically since either could be why.
 bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
     if (stockRecovery) {
         // See this method's own comment in Patcher.hpp -- whichever iBEC
@@ -481,7 +487,7 @@ bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
         // the only iBEC stockRecovery ever produces) still verifies the
         // ramdisk's img3 signature over the original encrypted bytes.
         fprintf(stderr,
-                "useStockRamdisk: sending the original downloaded RestoreRamdisk untouched (still encrypted, "
+                "--stock-securom: sending the original downloaded RestoreRamdisk untouched (still encrypted, "
                 "still img3-wrapped) -- the stock iBEC that's now running still verifies its signature.\n");
         outputs_.ramdisk = path;
         checkPatching();
@@ -497,8 +503,8 @@ bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
     std::string outPath = outputPathFor(path);
 
     fprintf(stderr,
-            "useStockRamdisk: decrypting the stock RestoreRamdisk exactly as downloaded from Apple -- "
-            "skipping the blackb0x-patched dist/ ramdisk and entrypoint.c entirely, for isolating "
+            "--stock-ramdisk/--stock-firmware: decrypting the stock RestoreRamdisk exactly as downloaded from "
+            "Apple -- skipping the blackb0x-patched dist/ ramdisk and entrypoint.c entirely, for isolating "
             "whether a boot failure is in blackb0x's own ramdisk patching or earlier in the chain.\n");
 
     decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
@@ -543,4 +549,18 @@ void Patcher::checkPatching() {
 
 void Patcher::clearComponents() {
     outputs_ = PatchedComponents{};
+}
+
+std::vector<std::string> Patcher::missingRequiredComponents() const {
+    std::vector<std::string> missing;
+    if (!outputs_.iBSS) missing.push_back("iBSS");
+    if (!onlyBootComponents) {
+        if (!outputs_.iBECDowngrade) missing.push_back("iBEC (downgrade)");
+        if (!outputs_.ramdisk) missing.push_back("RestoreRamdisk");
+    } else {
+        if (!outputs_.iBECBoot) missing.push_back("iBEC (boot)");
+    }
+    if (!outputs_.kernel) missing.push_back("KernelCache");
+    if (!outputs_.deviceTree) missing.push_back("DeviceTree");
+    return missing;
 }

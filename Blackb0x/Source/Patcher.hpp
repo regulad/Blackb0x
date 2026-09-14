@@ -227,6 +227,18 @@ public:
     // whichever patch*() call completes the last required component.
     std::function<void(const PatchedComponents&)> onComponentsReady;
 
+    // Human-readable names of whichever components checkPatching() is
+    // still waiting on -- empty once everything required is present.
+    // Mirrors checkPatching()'s own exact requirements (including the
+    // onlyBootComponents branch), so downloadAndPatchComponents()
+    // (Cli.cpp) can report specifically what's missing on failure instead
+    // of a blanket "not all components patched successfully" with no
+    // detail at all -- a silently-failed download or patch step
+    // (wrong/missing keys, a 404 for a build blackb0x has no local
+    // support for, etc.) used to surface this way with no indication of
+    // which step actually failed or why.
+    std::vector<std::string> missingRequiredComponents() const;
+
 private:
     IpswFetch fetcher_;
     std::map<std::string, FirmwareKeyPair> keys_;
