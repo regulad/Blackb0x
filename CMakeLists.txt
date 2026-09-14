@@ -334,7 +334,17 @@ foreach(_d ${_xpwn_subdirs})
                 # actually used by blackb0x/bake-all-ramdisks at runtime
                 # (only the `xpwn` library and blackb0x_xpwntool are), so
                 # there's no harm in over-applying this.
-                target_link_libraries(${_t} PRIVATE
+                #
+                # Plain signature, not PRIVATE: every one of xpwn's own
+                # CMakeLists.txt files already links these same targets
+                # with the old plain (non-keyword) signature
+                # (`target_link_libraries(dmg-bin dmg)` etc.) — CMake
+                # hard-errors ("has already been used with the target...
+                # All uses... must be either all-keyword or all-plain") the
+                # moment a second call on the same target mixes styles,
+                # confirmed for real against every target this loop
+                # touches, not just one.
+                target_link_libraries(${_t}
                     "-framework CoreFoundation"
                     "-framework Security")
             endif()
