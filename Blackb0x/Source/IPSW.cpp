@@ -259,3 +259,32 @@ std::set<std::string> signedBuildsForDevice(const std::string& deviceModel) {
     }
     return result;
 }
+
+std::string newestVersionForDevice(const std::string& deviceModel) {
+    std::string json = httpGet("https://api.ipsw.me/v4/device/" + deviceModel + "?type=ipsw");
+    if (json.empty()) return "";
+
+    // Same flat non-nested-braces entry matching as signedBuildsForDevice()
+    // above (see that function's own comment) — the "firmwares" array's
+    // own entries have no nested {} of their own. Confirmed directly
+    // (`curl -s 'https://api.ipsw.me/v4/device/AppleTV3,2?type=ipsw'`) that
+    // this array is already ordered newest-release-first (by
+    // "releasedate", descending) — so the first entry with a "version"
+    // field found in document order is the newest, no sorting needed.
+    // "buildid" is required in the match too only to distinguish a real
+    // firmware entry from some other flat {} elsewhere in the response
+    // (e.g. "boards") that happens to carry no "version"/"buildid" pair at
+    // all.
+    std::regex entryRe(R"RE(\{[^{}]*\})RE");
+    std::regex versionRe(R"RE("version"\s*:\s*"([^"]*)")RE");
+    std::regex buildidRe(R"RE("buildid"\s*:\s*"([^"]*)")RE");
+
+    for (auto it = std::sregex_iterator(json.begin(), json.end(), entryRe); it != std::sregex_iterator(); ++it) {
+        std::string entry = it->str();
+        std::smatch versionMatch;
+        if (!std::regex_search(entry, versionMatch, versionRe)) continue;
+        if (!std::regex_search(entry, buildidRe)) continue;
+        return versionMatch[1].str();
+    }
+    return "";
+}

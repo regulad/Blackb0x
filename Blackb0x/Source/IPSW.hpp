@@ -100,3 +100,17 @@ public:
 // — linking it for real here would risk exactly the kind of duplicate-
 // symbol ABI conflict this codebase has otherwise been careful to avoid.
 std::set<std::string> signedBuildsForDevice(const std::string& deviceModel);
+
+// GET https://api.ipsw.me/v4/device/<deviceModel>?type=ipsw — returns the
+// "version" field of the newest firmware entry ipsw.me lists for this
+// device, or "" on failure/empty response. Used as bake-all-ramdisks' own
+// fallback when a real BuildManifest.plist (the normal, authoritative
+// source of ProductVersion for a specific (device, buildID) tuple) somehow
+// fails to yield a productVersion — confirmed directly (`curl -s
+// 'https://api.ipsw.me/v4/device/AppleTV3,2?type=ipsw'`) that this
+// endpoint's own "firmwares" array is already ordered newest-release-first
+// (by "releasedate", descending), so the first entry with both "version"
+// and "buildid" fields is simply the newest one — no sorting needed.
+// Shares signedBuildsForDevice()'s same hand-rolled regex extraction (see
+// that function's own comment for why a real JSON parser isn't used here).
+std::string newestVersionForDevice(const std::string& deviceModel);

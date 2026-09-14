@@ -293,8 +293,34 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // manifest->productVersion is the real, authoritative ProductVersion
+        // for this exact (device, buildID) tuple straight out of the
+        // BuildManifest.plist just downloaded/parsed above — bakeRamdisk()
+        // threads it all the way down to the synthetic "firmware" dpkg
+        // stanza scripts/build_deb_cache.py's sandbox and BakeRamdisk.cpp's
+        // own bake-time preinstall declare (see those files' own comments),
+        // so packages gated on `Depends: firmware (>= X)` resolve correctly
+        // against whichever real firmware is actually being baked. In
+        // practice this should always be populated (a genuinely downloaded,
+        // real manifest), but handle it defensively: warn and fall back to
+        // the newest version ipsw.me currently lists for this device model
+        // rather than silently baking a blank/wrong firmware declaration.
+        std::string productVersion = manifest->productVersion;
+        if (productVersion.empty()) {
+            fprintf(stderr,
+                    "bake-all-ramdisks: %s: BuildManifest.plist had no ProductVersion; falling back to "
+                    "ipsw.me's newest known version for %s\n",
+                    label.c_str(), device.c_str());
+            productVersion = newestVersionForDevice(device);
+            if (productVersion.empty()) {
+                fprintf(stderr,
+                        "bake-all-ramdisks: %s: ipsw.me fallback also failed to yield a version for %s\n",
+                        label.c_str(), device.c_str());
+            }
+        }
+
         bool sizeWarning = false;
-        if (!bakeRamdisk(localRamdiskPath, it->second.key, it->second.iv, manifest->productVersion, outputPath,
+        if (!bakeRamdisk(localRamdiskPath, it->second.key, it->second.iv, productVersion, outputPath,
                           entrypointBinaryPath, sizeWarning)) {
             printf("FAILED (bake)\n");
             fprintf(stderr, "bake-all-ramdisks: %s: bakeRamdisk() failed — see stderr above\n", label.c_str());

@@ -1308,6 +1308,12 @@ dpkg --root=/preinstall --add-architecture iphoneos-arm
 # these packages were resolvable in the first place), the real dpkg
 # --audit/apt-get check below would report every one of them as a false-
 # positive "unmet dependency" and abort the whole step over nothing.
+# __FIRMWARE_VERSION__ below is substituted with the real, per-tuple
+# firmware version (the same one passed to build_deb_cache.py's own
+# --firmware-version) right before this script is written to disk — see
+# where kPreinstallInnerScript is instantiated below — so this dpkg root
+# always agrees with whichever real (device, buildID) the outer apt
+# resolution actually ran against, not a fixed pin.
 cat >> /preinstall/var/lib/dpkg/status <<'EOF'
 Package: firmware
 Status: install ok installed
@@ -1316,7 +1322,7 @@ Section: base
 Installed-Size: 0
 Maintainer: Blackb0x BakeRamdisk.cpp <noreply@regulad.xyz>
 Architecture: iphoneos-arm
-Version: 8.4.2
+Version: __FIRMWARE_VERSION__
 Description: Synthetic package matching scripts/build_deb_cache.py's own
  declaration, so this bootstrap root's dpkg agrees with the outer apt
  resolution that already decided firmware-version-gated Depends: lines
@@ -1425,6 +1431,7 @@ rm -rf /preinstall/var/lib/dpkg /preinstall/etc/apt
 static bool computePreinstalledPackages(const std::set<std::string>& eligibleFilenames,
                                          const std::set<std::string>& /*stripPostinstPackages*/,
                                          const std::set<std::string>& /*stripPreinstFilenames*/,
+                                         const std::string& firmwareVersion,
                                          std::string& outPreinstallDir, std::string& outDpkgStateDir) {
     std::string preinstallDir = makeTempDir("blackb0x-preinstall-root-");
     std::string outDir = makeTempDir("blackb0x-preinstall-out-");
@@ -1582,7 +1589,7 @@ static bool computePreinstalledPackages(const std::set<std::string>& eligibleFil
         "Installed-Size: 0\n"
         "Maintainer: Blackb0x BakeRamdisk.cpp <noreply@regulad.xyz>\n"
         "Architecture: iphoneos-arm\n"
-        "Version: 8.4.2\n"
+        "Version: " + firmwareVersion + "\n"
         "Description: Synthetic package matching scripts/build_deb_cache.py's own\n"
         " declaration, so this ramdisk's dpkg agrees with the outer apt resolution\n"
         " that already decided firmware-version-gated Depends: lines here are\n"
@@ -1628,6 +1635,7 @@ static bool computePreinstalledPackages(const std::set<std::string>& eligibleFil
 static bool computePreinstalledPackages(const std::set<std::string>& eligibleFilenames,
                                          const std::set<std::string>& stripPostinstPackages,
                                          const std::set<std::string>& stripPreinstFilenames,
+                                         const std::string& firmwareVersion,
                                          std::string& outPreinstallDir, std::string& outDpkgStateDir) {
     std::string preinstallDir = makeTempDir("blackb0x-preinstall-root-");
     std::string outDir = makeTempDir("blackb0x-preinstall-out-");
@@ -1661,8 +1669,20 @@ static bool computePreinstalledPackages(const std::set<std::string>& eligibleFil
         for (const auto& name : stripPostinstPackages) f << name << "\n";
     }
     {
+        // kPreinstallInnerScript is a plain shell script template using its
+        // own real `$`/`{}` syntax throughout, so this is a targeted literal
+        // substitution rather than treating it as an f-string-style
+        // template (see this constant's own comment) — matches
+        // scripts/build_deb_cache.py's identical INNER_SCRIPT.replace()
+        // technique for the same placeholder.
+        std::string innerScript = kPreinstallInnerScript;
+        const std::string placeholder = "__FIRMWARE_VERSION__";
+        size_t placeholderPos = innerScript.find(placeholder);
+        if (placeholderPos != std::string::npos) {
+            innerScript.replace(placeholderPos, placeholder.size(), firmwareVersion);
+        }
         std::ofstream f(workDir + "/inner.sh");
-        f << kPreinstallInnerScript;
+        f << innerScript;
     }
     std::string debsRoot = resolveDebsPath();
     bool stripOk = true;
@@ -1712,7 +1732,8 @@ static bool mergePreinstalledPackages(const fs::path& blackb0xRoot, const std::s
 }
 
 // Everything scripts/build_deb_cache.py resolves, plus the bake-time
-// preinstall computed from it, cached for the lifetime of this process.
+// preinstall computed from it, cached per real firmware version for the
+// lifetime of this process (see computeGlobalDebcacheOnce()).
 struct GlobalDebcacheResult {
     bool ok = false;
     std::vector<std::string> allFilenames;
@@ -1730,29 +1751,42 @@ struct GlobalDebcacheResult {
 };
 
 // Runs scripts/build_deb_cache.py and the bake-time dpkg preinstall
-// mechanism exactly ONCE per process, no matter how many firmwares this
-// run bakes. Blackb0x/Misc/packages.txt's own resolution (and the real
-// dpkg unpack/audit it feeds) is entirely firmware-independent — the same
-// apt repos, the same package set, regardless of which device/firmware
-// bakeRamdisk() happens to be building right now — so re-running the
-// whole apt-resolution + real-dpkg-container pipeline once per firmware
-// (bake-all-ramdisks bakes dozens in a full run) would just repeat
+// mechanism at most ONCE per distinct real firmware version, no matter how
+// many (device, buildID) tuples this run bakes. Blackb0x/Misc/packages.txt's
+// own resolution (and the real dpkg unpack/audit it feeds) is entirely
+// firmware-independent EXCEPT for the synthetic "firmware" package's own
+// declared version (see kPreinstallInnerScript's/INNER_SCRIPT's own
+// comments) — the same apt repos, the same package set, but a package
+// gated on `Depends: firmware (>= X)` can genuinely resolve differently
+// depending on which real firmware is being declared. So this can no
+// longer be a single process-wide result: it's cached per firmware-version
+// string instead, keyed by the real, per-tuple ProductVersion the caller
+// passes in. Two tuples that happen to share the same real firmware
+// version (e.g. two different device models both actually running 6.1.3)
+// still correctly reuse one resolution — re-running the whole
+// apt-resolution + real-dpkg-container pipeline for each would just repeat
 // identical network fetches, GPG verification, and container work for no
-// reason, and risks a genuinely different result on different bakes in
-// the same run if an upstream repo happens to change mid-run. A plain
-// function-local `static` cache is exactly the right lifetime here: it
-// persists for as long as this one process runs (one bake-all-ramdisks
+// reason, and risks a genuinely different result on different bakes in the
+// same run if an upstream repo happens to change mid-run — but two tuples
+// with genuinely different firmware versions each get their own real,
+// independent resolution, which is the whole point of this fix. A
+// function-local `static` map is exactly the right lifetime here: entries
+// persist for as long as this one process runs (one bake-all-ramdisks
 // invocation), and a fresh process (the next run) correctly recomputes
 // from scratch. stageDebcache() calls this once per firmware and merges
-// the same cached result into each bake's own /blackb0x.
-static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
-    static bool computed = false;
-    static GlobalDebcacheResult cached;
-    if (computed) {
-        outResult = cached;
-        return cached.ok;
+// the (per-version) cached result into each bake's own /blackb0x.
+static bool computeGlobalDebcacheOnce(const std::string& firmwareVersion, GlobalDebcacheResult& outResult) {
+    static std::map<std::string, GlobalDebcacheResult> cache;
+    auto existing = cache.find(firmwareVersion);
+    if (existing != cache.end()) {
+        outResult = existing->second;
+        return existing->second.ok;
     }
-    computed = true;
+    // Default-constructed (ok=false) until filled in below — every early
+    // return on failure below leaves this cached as a real, negative result
+    // for this exact firmware version, matching the previous single-result
+    // cache's own failure-caching behavior.
+    GlobalDebcacheResult& cached = cache[firmwareVersion];
 
     std::string tempDir = makeTempDir("blackb0x-debcache-");
     if (tempDir.empty()) {
@@ -1770,14 +1804,18 @@ static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
     // resolved_packages.txt contract (verified directly against its own
     // main()), just a plain local transitive-closure walk over Blackb0x/Debs/
     // instead of a real apt dependency solve — see that script's own module
-    // docstring for its real, accepted gaps versus build_deb_cache.py.
+    // docstring for its real, accepted gaps versus build_deb_cache.py. It
+    // has no notion of firmware-version-gated Depends: at all (see its own
+    // module docstring — parse_dependency_groups() strips version
+    // constraints outright), so it takes no --firmware-version flag.
     bool ok = runAsInvokingUser(
         {"python3", "scripts/build_deb_cache_experimental_no_container.py", "--output-dir", tempDir});
     if (!ok) {
         fprintf(stderr, "bakeRamdisk: scripts/build_deb_cache_experimental_no_container.py failed\n");
         outResult = cached;
 #else
-    bool ok = runAsInvokingUser({"python3", "scripts/build_deb_cache.py", "--output-dir", tempDir});
+    bool ok = runAsInvokingUser(
+        {"python3", "scripts/build_deb_cache.py", "--output-dir", tempDir, "--firmware-version", firmwareVersion});
     if (!ok) {
         fprintf(stderr, "bakeRamdisk: scripts/build_deb_cache.py failed\n");
         outResult = cached;
@@ -1810,7 +1848,7 @@ static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
                                                                       stripPostinstPackages, stripPreinstFilenames);
 
     if (!computePreinstalledPackages(cached.preinstallFilenames, stripPostinstPackages, stripPreinstFilenames,
-                                      cached.preinstallPayloadDir, cached.dpkgStateDir)) {
+                                      firmwareVersion, cached.preinstallPayloadDir, cached.dpkgStateDir)) {
         outResult = cached;
         return false;
     }
@@ -1837,8 +1875,8 @@ static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
     return true;
 }
 
-// Stages this firmware's share of the (process-wide cached) debcache
-// result into `blackb0xRoot`: the non-preinstalled .deb set (minus
+// Stages this firmware's share of the (per-firmware-version cached)
+// debcache result into `blackb0xRoot`: the non-preinstalled .deb set (minus
 // kNeverStageDebs) into the real apt cache directory
 // (private/var/cache/apt/archives/) — apt finds these itself via its
 // normal cache-before-download check, no local file:// source or
@@ -1848,13 +1886,18 @@ static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
 // and the apt lists cache. Returns the real, apt-resolved package NAMES
 // (not .deb filenames) via `outResolvedPackages` for
 // stagePostinstallScript() to bake into postinstall.sh's install array.
+// `firmwareVersion` is this bake's real, per-tuple ProductVersion (see
+// stageBlackb0xTree()'s own caller) — threaded straight into
+// computeGlobalDebcacheOnce() as both the cache key and the synthetic
+// "firmware" package's own declared version.
 // Real failure (the underlying computation failing, or producing no
 // picklist) is treated as fatal for the whole bake, unlike a single
 // missing loose asset elsewhere: a ramdisk with no packages to install
 // can't actually finish the jailbreak.
-static bool stageDebcache(const fs::path& blackb0xRoot, std::vector<std::string>& outResolvedPackages) {
+static bool stageDebcache(const fs::path& blackb0xRoot, const std::string& firmwareVersion,
+                           std::vector<std::string>& outResolvedPackages) {
     GlobalDebcacheResult result;
-    if (!computeGlobalDebcacheOnce(result)) {
+    if (!computeGlobalDebcacheOnce(firmwareVersion, result)) {
         return false;
     }
 
@@ -2430,7 +2473,7 @@ static bool stageBlackb0xTree(const std::string& parentDir, const std::string& p
               kUidMobile, kGidStaff, 0644);
 
     std::vector<std::string> resolvedPackages;
-    if (!stageDebcache(blackb0xRoot, resolvedPackages)) ok = false;
+    if (!stageDebcache(blackb0xRoot, productVersion, resolvedPackages)) ok = false;
     if (!stagePostinstallScript(blackb0xRoot, resolvedPackages)) ok = false;
     if (!stageVersionBranch(blackb0xRoot, productVersion)) ok = false;
 

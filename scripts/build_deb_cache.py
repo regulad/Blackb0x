@@ -148,7 +148,7 @@ live repo at all while still genuinely being needed. local_only_debs.txt
 is exactly that narrow case, not a reversion of the original decision.
 
 Usage:
-    scripts/build_deb_cache.py --output-dir DIR [--keep-sandbox]
+    scripts/build_deb_cache.py --output-dir DIR --firmware-version VERSION [--keep-sandbox]
 
 Requires: podman on PATH (or /usr/bin/podman directly — see PODMAN below).
 Nothing else; the container provides apt/dpkg/gnupg itself.
@@ -179,7 +179,7 @@ LOCAL_ONLY_LIST = MISC_DIR / "local_only_debs.txt"
 #
 # net.tihmstar.etasonuntether used to be here too (same firmware-gated
 # reasoning — Depends: firmware (= 8.4.1) doesn't satisfy this sandbox's
-# synthetic 8.4.2 pin below), but it's not apt-attempted at all anymore:
+# synthetic firmware pin below), but it's not apt-attempted at all anymore:
 # it moved to Blackb0x/Misc/local_only_debs.txt once repo.tihmstar.net (the
 # only repo that ever carried its Packages stanza) turned out to be an
 # unreliable live dependency — see Blackb0x/Misc/apt/net.tihmstar.list.disabled
@@ -232,20 +232,31 @@ cp /work/sources.list /sandbox/etc/apt/sources.list
 # satisfied by Cydia's own injected entry for whatever iOS the device
 # happens to run. Our sandbox has no real device, so nothing satisfies
 # those Depends: at all unless we declare the same thing ourselves.
-# Pinned to 8.4.2 (AppleTV3,2 — this project's newest/most-capable
-# supported target, and the version-era saurik.list's own "ios/8.0" dist
-# choice already targets) rather than trying to satisfy every firmware
-# range this ecosystem has ever used at once — some packages are
-# genuinely gated to a DIFFERENT range only (com.ih8sn0w-squiffy-winocm.p0sixspwn
-# needs firmware < 7.0, since it's a 6.1.4-only untether payload) and will
-# correctly fail resolution here rather than silently resolving as if they
-# applied to every firmware. That's accurate, not a bug: this project's own
-# persistence-establishing packages for OTHER firmware branches are already
-# installed as direct loose-file copies, not through apt (see
-# .claude/NEO_FLOW.md) — packages.txt driving apt resolution is for
-# the firmware-independent base Cydia system, and per-branch persistence
-# payloads dropping out of it here is exactly the signal that they don't
-# belong being resolved this way.
+# Was previously hardcoded to a single literal pin, 8.4.2 (AppleTV3,2 —
+# this project's newest/most-capable supported target at the time, and the
+# version-era saurik.list's own "ios/8.0" dist choice already targets).
+# That was wrong for every OTHER (device, buildID) tuple this project
+# bakes: a package correctly gated to (say) `firmware (>= 7.0)` would
+# falsely resolve/install even while baking a 6.1.x ramdisk, since the
+# sandbox always claimed to be running 8.4.2 regardless of which real
+# firmware was actually being baked. Now filled in from --firmware-version
+# below, the real, per-tuple ProductVersion from that exact build's own
+# BuildManifest.plist (threaded down from BakeAllRamdisks.cpp's main loop
+# through bakeRamdisk() -> stageBlackb0xTree() -> stageDebcache() ->
+# computeGlobalDebcacheOnce()), so this sandbox's synthetic firmware
+# declaration always matches the real device this run is actually baking
+# for. Some packages are genuinely gated to a DIFFERENT range only
+# (com.ih8sn0w-squiffy-winocm.p0sixspwn needs firmware < 7.0, since it's a
+# 6.1.4-only untether payload) — with the real per-tuple version now in
+# play, whether that correctly resolves or correctly fails depends on
+# which firmware is actually being baked, which is the accurate behavior;
+# it no longer unconditionally fails the way it did under the old fixed
+# 8.4.2 pin. This project's own persistence-establishing packages for
+# OTHER firmware branches are already installed as direct loose-file
+# copies, not through apt (see .claude/NEO_FLOW.md) — packages.txt driving
+# apt resolution is for the firmware-independent base Cydia system, and
+# per-branch persistence payloads dropping out of it here (when they do)
+# is exactly the signal that they don't belong being resolved this way.
 cat > /sandbox/var/lib/dpkg/status <<'EOF'
 Package: firmware
 Status: install ok installed
@@ -254,7 +265,7 @@ Section: base
 Installed-Size: 0
 Maintainer: Blackb0x build_deb_cache.py <noreply@regulad.xyz>
 Architecture: iphoneos-arm
-Version: 8.4.2
+Version: __FIRMWARE_VERSION__
 Description: Synthetic package declared by build_deb_cache.py to satisfy
  firmware-version-gated Depends: lines the same way a real device's own
  dpkg status would (see that script's own comment for why).
@@ -425,6 +436,7 @@ def is_flat_repo(dist: str) -> bool:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--output-dir", required=True, type=Path, help="Where to write picklist.txt/resolved_packages.txt/apt-lists/ — caller-owned, not created or cleaned up here")
+    ap.add_argument("--firmware-version", required=True, help="Real, per-tuple ProductVersion (e.g. \"6.1.3\") to declare as the sandbox's synthetic `firmware` package — see INNER_SCRIPT's own comment for why this must be the real version for whichever (device, buildID) is actually being baked, not a fixed pin")
     ap.add_argument("--keep-sandbox", action="store_true", help="Don't delete the temp working directory (for debugging)")
     args = ap.parse_args()
 
@@ -503,7 +515,7 @@ def main():
         (work / "sources.list").write_text("\n".join(sources_lines) + "\n")
         (work / "packages.txt").write_text("\n".join(apt_attempted_packages) + "\n")
         (work / "verify.txt").write_text("\n".join(verify_lines) + "\n")
-        (work / "inner.sh").write_text(INNER_SCRIPT)
+        (work / "inner.sh").write_text(INNER_SCRIPT.replace("__FIRMWARE_VERSION__", args.firmware_version))
         for k in keyed:
             shutil.copy(k, work / "keys" / k.name)
 
