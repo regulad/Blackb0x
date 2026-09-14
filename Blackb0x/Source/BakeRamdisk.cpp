@@ -29,13 +29,34 @@
 #include "BakeRamdisk.hpp"
 #include "ResourcePath.hpp"
 
+// Already a linked dependency of this target either way (see
+// CMakeLists.txt's bake-all-ramdisks target — same deps::plist IPSW.cpp
+// already uses for its own plist parsing, same plist_* C API/calling
+// convention followed here). Not wrapped in `extern "C" {}` below, matching
+// IPSW.cpp's own include of the same header.
+#include <plist/plist.h>
+
 extern "C" {
 #include <xpwntool.h>
 }
 
 extern "C" {
 #include <abstractfile.h>
+// third_party/xpwn's vendored hfs/hfsplus.h (pulled in transitively here,
+// via dmg/dmg.h) uses the `register` storage-class specifier in one
+// function prototype (FastUnicodeCompare) — legal C++14, removed from the
+// C++17 grammar entirely. GCC only warns; Clang (macOS's default) hard-
+// errors on it, which is why bake-all-ramdisks was Linux-only until this
+// port (see CMakeLists.txt's own comment on its `if(NOT APPLE)` guard).
+// Bracketing just this #include (rather than editing the vendored header
+// itself) with an empty #define is harmless on GCC too, so this isn't
+// __APPLE__-gated — a per-file CXX_STANDARD downgrade isn't an option
+// instead, since this file uses std::filesystem throughout, a C++17
+// *library* feature not reliably available under a downgraded language
+// standard.
+#define register
 #include <dmg/dmglib.h>
+#undef register
 #include <hfs/hfslib.h>
 #include <hfs/hfsplus.h>
 #include <xpwn/libxpwn.h>
@@ -51,6 +72,7 @@ extern "C" {
 #include <map>
 #include <set>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include <fcntl.h>
@@ -128,25 +150,41 @@ static std::string runCommandCapture(const std::vector<std::string>& argv) {
     return output;
 }
 
-// Real on-disk content size via `du` (a real, standard tool — matches this
-// project's own established "shell out to real tools" convention) rather
-// than summing st_size ourselves, which would undercount actual space
-// consumed against allocation-block granularity. Deliberately NOT `-b`/
-// `--apparent-size`: that reports exact byte lengths, which is exactly the
-// undercount this needs to avoid — these trees have thousands of small
-// files (terminfo entries, dpkg info files, etc.), each of which consumes
-// a full allocation block on the destination HFS+ volume regardless of its
-// actual byte length. Plain `du -s --block-size=1` reports real block-
-// rounded disk usage instead (per the *host* filesystem's own block size,
-// not HFS+'s — not exact, but a real measurement of the same rounding
-// effect, unlike apparent size which has none at all). A real bake run
-// with this still on `-sb` ran out of space almost immediately despite a
-// volume nominally sized well past the apparent byte count, confirming
-// the undercount was real and not theoretical.
+// Real content size, measured as a portable std::filesystem walk summing
+// fs::file_size() over every regular file. Used to replace an earlier
+// `du -s --block-size=1` shellout, which was deliberately chosen over a
+// plain byte-sum specifically to capture the *destination* filesystem's own
+// allocation-block rounding (thousands of small files here — terminfo
+// entries, dpkg info files, etc. — each consume a full allocation block on
+// the destination HFS+ volume regardless of actual byte length; a real bake
+// run with `-sb`/apparent-size instead ran out of space almost immediately
+// despite a nominally oversized volume, confirming the undercount was real,
+// not theoretical). `--block-size` is GNU-coreutils-only, though, with no
+// macOS/BSD equivalent — it blocked this function from working on macOS at
+// all. A plain byte-sum still undercounts real on-disk usage by roughly
+// that same rounding gap, but bakeRamdisk()'s own newVolumeSize margin
+// (10% of content, 4MB minimum, whichever is larger — see its own comment)
+// already exists specifically to absorb slop between a size measurement and
+// real device usage, and was proven, empirically, against a materially
+// larger effect (extent fragmentation near a full volume) than block-
+// rounding alone. Removing the `du` dependency entirely is worth that
+// trade: this measurement now also works identically against whatever
+// plain host directory the macOS build sequence measures (there's no live
+// HFS+ mount to `du` against there at all — see bakeRamdisk()'s
+// __APPLE__ branch).
 static uint64_t directoryContentSize(const std::string& dir) {
-    std::string out = runCommandCapture({"du", "-s", "--block-size=1", dir});
-    if (out.empty()) return 0;
-    return (uint64_t)strtoull(out.c_str(), nullptr, 10);
+    uint64_t total = 0;
+    std::error_code walkEc;
+    for (const auto& entry :
+         fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied, walkEc)) {
+        if (walkEc) break;
+        std::error_code typeEc;
+        if (!fs::is_regular_file(entry.path(), typeEc) || typeEc) continue;
+        std::error_code sizeEc;
+        uint64_t sz = (uint64_t)fs::file_size(entry.path(), sizeEc);
+        if (!sizeEc) total += sz;
+    }
+    return total;
 }
 
 // Reads the original ramdisk's volume label, so the freshly-mkfs'd
@@ -160,6 +198,37 @@ static std::string readVolumeLabel(const std::string& imagePath) {
     while (!label.empty() && (label.back() == '\n' || label.back() == '\r')) label.pop_back();
     return label.empty() ? "ramdisk" : label;
 }
+
+#if defined(__APPLE__)
+// macOS equivalent of readVolumeLabel() above — there's no blkid on
+// Darwin, and unlike blkid's read of the raw image file directly,
+// `diskutil info` only works against an attached (mounted) device, not a
+// bare image file, so bakeRamdisk()'s __APPLE__ branch calls this AFTER
+// `hdiutil attach` rather than before mounting, the way the Linux path
+// does. Parsed via libplist's C API — same plist_* calling convention
+// IPSW.cpp's own plistDictString() already established project-wide.
+static std::string readVolumeLabelMac(const std::string& mountpoint) {
+    std::string plistXml = runCommandCapture({"diskutil", "info", "-plist", mountpoint});
+    if (plistXml.empty()) return "ramdisk";
+
+    plist_t root = nullptr;
+    plist_from_xml(plistXml.c_str(), (uint32_t)plistXml.size(), &root);
+    if (!root) return "ramdisk";
+
+    std::string label;
+    plist_t node = plist_dict_get_item(root, "VolumeName");
+    if (node) {
+        char* val = nullptr;
+        plist_get_string_val(node, &val);
+        if (val) {
+            label = val;
+            free(val);
+        }
+    }
+    plist_free(root);
+    return label.empty() ? "ramdisk" : label;
+}
+#endif
 
 // Copies a deliberately narrow set of "identity" fields from the original
 // volume's fixed-size HFS+ header into the freshly-mkfs'd replacement:
@@ -221,6 +290,57 @@ static void copyVolumeHeaderMetadata(const std::string& origPath, const std::str
     }
 }
 
+#if defined(__APPLE__)
+// Detects a UDIF ("koly" trailer) wrapper on `path` and, if present,
+// rewrites `path` in place with the unwrapped raw partition bytes — the
+// same probe-then-extractDmg() technique bakeRamdisk() already runs on the
+// original decrypted firmware component near the top of this file,
+// factored out so the macOS build sequence can apply it defensively to
+// `hdiutil create`'s own output too. Real `hdiutil create -format UDRW
+// -layout NONE`'s exact output byte layout could not be verified against
+// actual hdiutil on this (Linux) build host — see bakeRamdisk()'s
+// __APPLE__ branch for the full caveat. This is a no-op if that output
+// turns out to already be flat raw bytes (no koly trailer found), and
+// correctly unwraps it if it isn't, so it's safe to run unconditionally
+// either way — copyVolumeHeaderMetadata() right after it, and the shared
+// UDIF-rewrap step at the end of bakeRamdisk(), both need genuinely flat
+// raw bytes to work correctly.
+static bool unwrapUDIFIfPresent(const std::string& path) {
+    bool wrapped = false;
+    {
+        std::ifstream probe(path, std::ios::binary);
+        if (probe) {
+            probe.seekg(0, std::ios::end);
+            std::streamoff size = probe.tellg();
+            if (size >= 512) {
+                probe.seekg(size - 512);
+                char magic[4] = {0};
+                probe.read(magic, 4);
+                wrapped = (memcmp(magic, "koly", 4) == 0);
+            }
+        }
+    }
+    if (!wrapped) return true;
+
+    FILE* wrappedFile = fopen(path.c_str(), "rb");
+    if (!wrappedFile) return false;
+    void* rawBuffer = nullptr;
+    size_t rawSize = 0;
+    AbstractFile* wrappedAbs = createAbstractFileFromFile(wrappedFile);
+    AbstractFile* rawOut = createAbstractFileFromMemoryFile(&rawBuffer, &rawSize);
+    extractDmg(wrappedAbs, rawOut, -1);
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        free(rawBuffer);
+        return false;
+    }
+    out.write((const char*)rawBuffer, (std::streamsize)rawSize);
+    free(rawBuffer);
+    return true;
+}
+#endif
+
 static std::string makeTempDir(const std::string& prefix) {
     std::string tmpl = (fs::temp_directory_path() / (prefix + "XXXXXX")).string();
     std::vector<char> buf(tmpl.begin(), tmpl.end());
@@ -237,7 +357,16 @@ struct MountGuard {
     std::string mountpoint;
     bool mounted = false;
     ~MountGuard() {
-        if (mounted) runCommand({"umount", mountpoint});
+        if (mounted) {
+#if defined(__APPLE__)
+            // hdiutil, not umount — this mountpoint was attached via
+            // `hdiutil attach` (see bakeRamdisk()'s __APPLE__ branch), and
+            // `hdiutil detach` is its own matching unmount command.
+            runCommand({"hdiutil", "detach", mountpoint});
+#else
+            runCommand({"umount", mountpoint});
+#endif
+        }
         if (!mountpoint.empty()) {
             std::error_code ec;
             fs::remove(mountpoint, ec);
@@ -400,7 +529,15 @@ static bool spliceFileContentInPlace(const std::string& targetPath, const std::s
 
     chmod(targetPath.c_str(), st.st_mode & 07777);
     chown(targetPath.c_str(), st.st_uid, st.st_gid);
+#if defined(__APPLE__)
+    // Darwin's struct stat spells these fields st_atimespec/st_mtimespec
+    // instead of Linux/glibc's st_atim/st_mtim — same fields, different
+    // names (see ResourcePath.cpp's own #if defined(__APPLE__) branches
+    // for this project's established house style).
+    struct timespec times[2] = {st.st_atimespec, st.st_mtimespec};
+#else
     struct timespec times[2] = {st.st_atim, st.st_mtim};
+#endif
     utimensat(AT_FDCWD, targetPath.c_str(), times, 0);
     return true;
 }
@@ -754,28 +891,57 @@ static bool readDebControlInfo(const std::string& debPath, DebControlInfo& out) 
         }
         ok = !controlTar.empty();
     }
+    // The control archive's own member names aren't consistently
+    // "./control"/"./postinst"/"./preinst" — confirmed directly against
+    // real, already-vendored data: 14 org.tihmstar.* .debs in
+    // Blackb0x/Debs/ store these as plain "control"/"postinst"/"preinst"
+    // (no "./" prefix) instead, and which spelling a given .deb uses isn't
+    // consistent even within that same set (whatever tool originally built
+    // each one). Listing the archive first and matching whichever spelling
+    // is actually present is more robust than assuming one fixed path for
+    // any of the three — same fix already made and verified on the Python
+    // side, see scripts/build_deb_cache_experimental_no_container.py's own
+    // read_deb_control_info().
+    std::vector<std::string> controlMembers;
     if (ok) {
         std::string listing = runCommandCapture({"tar", "--auto-compress", "-tf", controlTar});
-        out.hasPostinst = listing.find("./postinst") != std::string::npos;
-        // Same audit-then-strip treatment as postinst, just enforced
-        // differently: preinst runs unconditionally DURING --unpack
-        // itself, before a plain post-hoc file delete could ever
-        // intervene the way stripping postinst works, so a trivial
-        // preinst instead gets removed from the .deb's own control
-        // archive before dpkg ever sees it — see stripPreinstFromDeb().
-        // Confirmed by real disassembly, not guessed: ncurses's preinst
-        // (a real ARM Mach-O binary) turned out to be a harmless
-        // migration symlink (`/usr/lib/_ncurses` -> `/usr/lib`, only on
-        // install or upgrade-from-5.6-), identical on any platform — a
-        // genuine false positive if treated the same as firmware-sbin/
-        // rtadvd/pam/pam-modules's real, device-state-dependent preinst
-        // scripts (see prebake_package_blacklist.txt's own note on each,
-        // which — since preinst can't be stripped after the fact —
-        // are the actual, enforced exclusion for those four, not just
-        // documentation).
-        out.hasPreinst = listing.find("./preinst") != std::string::npos;
+        std::istringstream listingStream(listing);
+        std::string member;
+        while (std::getline(listingStream, member)) {
+            while (!member.empty() && (member.back() == '\r' || member.back() == '\n')) member.pop_back();
+            if (!member.empty()) controlMembers.push_back(member);
+        }
     }
-    if (ok) ok = runCommand({"tar", "--auto-compress", "-xf", controlTar, "./control"}, tempDir);
+    auto findControlMember = [&](const std::string& name) -> std::string {
+        std::string withDot = "./" + name;
+        for (const auto& m : controlMembers) {
+            if (m == name || m == withDot) return m;
+        }
+        return "";
+    };
+
+    out.hasPostinst = !findControlMember("postinst").empty();
+    // Same audit-then-strip treatment as postinst, just enforced
+    // differently: preinst runs unconditionally DURING --unpack
+    // itself, before a plain post-hoc file delete could ever
+    // intervene the way stripping postinst works, so a trivial
+    // preinst instead gets removed from the .deb's own control
+    // archive before dpkg ever sees it — see stripPreinstFromDeb().
+    // Confirmed by real disassembly, not guessed: ncurses's preinst
+    // (a real ARM Mach-O binary) turned out to be a harmless
+    // migration symlink (`/usr/lib/_ncurses` -> `/usr/lib`, only on
+    // install or upgrade-from-5.6-), identical on any platform — a
+    // genuine false positive if treated the same as firmware-sbin/
+    // rtadvd/pam/pam-modules's real, device-state-dependent preinst
+    // scripts (see prebake_package_blacklist.txt's own note on each,
+    // which — since preinst can't be stripped after the fact —
+    // are the actual, enforced exclusion for those four, not just
+    // documentation).
+    out.hasPreinst = !findControlMember("preinst").empty();
+
+    std::string controlMember = findControlMember("control");
+    if (ok) ok = !controlMember.empty();
+    if (ok) ok = runCommand({"tar", "--auto-compress", "-xf", controlTar, controlMember}, tempDir);
     std::ifstream in(tempDir + "/control");
     if (!ok || !in) {
         std::error_code rmEc;
@@ -2164,6 +2330,142 @@ bool bakeRamdisk(const std::string& path, const std::string& key, const std::str
     // real, already-existing file on it — no guessing involved). That real
     // number is what actually sizes the final volume; the scratch one is
     // discarded immediately after.
+#if defined(__APPLE__)
+    // macOS build sequence — see this function's own header comment above
+    // for the full "three designs tried" history behind Linux's three-
+    // mount dance. That history doesn't apply here: those were all real,
+    // confirmed bugs in Linux-side HFS+ *write* tooling (xpwn's own
+    // grow_hfs(), libhfsp), not anything intrinsic to HFS+ itself, so this
+    // instead generalizes the original, pre-port Objective-C
+    // implementation's one legacy special case (AppleTV2,1 4.x only:
+    // `hdiutil create -srcfolder <mounted-original> -format UDRW -layout
+    // NONE`, synthesizing a whole new volume from a folder tree in one
+    // step — see origin/main:Blackb0x/Source/Patcher.mm's
+    // patchRamdisk:ssh:, lines 335-516) into the GENERAL mechanism here,
+    // combined with this file's own real improvement over that original:
+    // computing the actual needed volume size dynamically
+    // (directoryContentSize() below) instead of a hardcoded 60MB/40MB
+    // guess. Only ONE real mount is needed (the original, read-only) —
+    // Linux's second "scratch" HFS+ mount exists only to let a real,
+    // mounted HFS+ filesystem's own `du` measure real block-rounded usage;
+    // directoryContentSize() is now a portable std::filesystem walk that
+    // works directly against a plain host directory, so the assembled
+    // original+launchd+/blackb0x content is staged straight onto one
+    // instead of a second mounted volume.
+    MountGuard origMount;
+    origMount.mountpoint = makeTempDir("blackb0x-origmnt-");
+    if (origMount.mountpoint.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create a temp mountpoint\n");
+        return false;
+    }
+    if (!runCommand(
+            {"hdiutil", "attach", "-mountpoint", origMount.mountpoint, "-nobrowse", "-readonly", rawImgPath})) {
+        fprintf(stderr, "bakeRamdisk: failed to attach original ramdisk via hdiutil\n");
+        return false;
+    }
+    origMount.mounted = true;
+
+    // No blkid equivalent on Darwin — read back via `diskutil info -plist`
+    // instead, which only works against an attached device, so (unlike
+    // Linux's readVolumeLabel(), which reads the raw image file directly
+    // and so can run before mounting) this has to run after the attach
+    // above.
+    std::string label = readVolumeLabelMac(origMount.mountpoint);
+
+    // A plain host directory — no second mounted HFS+ volume needed here,
+    // see this branch's own header comment above. Reuses this file's own
+    // makeTempDir() helper, same as every other scratch directory
+    // bakeRamdisk() creates.
+    std::string stagingDir = makeTempDir("blackb0x-stage-");
+    if (stagingDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create staging dir\n");
+        return false;
+    }
+    if (!runCommand({"cp", "-a", origMount.mountpoint + "/.", stagingDir + "/"})) {
+        fprintf(stderr, "bakeRamdisk: failed to copy original ramdisk contents\n");
+        return false;
+    }
+    if (!runCommand({"hdiutil", "detach", origMount.mountpoint})) {
+        fprintf(stderr, "bakeRamdisk: failed to detach original ramdisk\n");
+        return false;
+    }
+    origMount.mounted = false;
+
+    std::string blackb0xStagingDir = makeTempDir("blackb0x-payload-");
+    if (blackb0xStagingDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create /blackb0x staging dir\n");
+        return false;
+    }
+    if (!stageBlackb0xTree(blackb0xStagingDir, productVersion)) {
+        fprintf(stderr, "bakeRamdisk: failed to stage /blackb0x\n");
+        return false;
+    }
+
+    // The one and only content change to anything the pristine ramdisk
+    // already shipped — see spliceFileContentInPlace()'s own comment for
+    // why a blind overwrite isn't good enough. The `cp -a` above already
+    // carried over launchd's real permissions onto this staged copy, so
+    // splicing against a plain directory here works exactly the same as
+    // splicing against a mounted volume does on Linux.
+    if (!spliceFileContentInPlace(stagingDir + "/sbin/launchd", entrypointBinaryPath)) {
+        return false;
+    }
+    if (!runCommand({"cp", "-a", blackb0xStagingDir + "/blackb0x", stagingDir + "/blackb0x"})) {
+        fprintf(stderr, "bakeRamdisk: failed to move staged /blackb0x into place\n");
+        return false;
+    }
+    std::error_code stagingRmEc;
+    fs::remove_all(blackb0xStagingDir, stagingRmEc);
+
+    // The real number: how much space the assembled content actually
+    // needs — see directoryContentSize()'s own comment. Same margin
+    // computation Linux uses below, just pointed at this plain staging
+    // directory instead of a live HFS+ mount.
+    uint64_t realContentSize = directoryContentSize(stagingDir);
+    constexpr uint64_t kFlatSizeMargin = 4ull * 1024 * 1024;
+    uint64_t percentSizeMargin = realContentSize / 10;
+    uint64_t newVolumeSize = realContentSize + std::max(kFlatSizeMargin, percentSizeMargin);
+
+    std::string newRawImgPath = decDMG + ".new-raw.hfs";
+    std::error_code newRawRmEc;
+    fs::remove(newRawImgPath, newRawRmEc);
+    // UNVERIFIED against real hdiutil — this file could only be written
+    // and read over, never actually run, on this (Linux) build host, with
+    // no macOS available at all. Two specific things here to check against
+    // real hardware before trusting this blindly:
+    //   1. The exact -fs argument string for case-sensitive HFS+.
+    //      "Case-sensitive HFS+" is believed correct (it's the display
+    //      name macOS's own Disk Utility/hdiutil use for this format on
+    //      modern macOS), but if a real bake on real macOS hardware
+    //      rejects it, check `hdiutil create -help`'s own -fs listing on
+    //      that machine and correct it here. Case sensitivity itself is
+    //      NOT optional, though — see the Linux mkfs.hfsplus -s call's own
+    //      comment further down (real ncurses terminfo e/E collisions
+    //      under case-insensitive lookup).
+    //   2. Whether `-format UDRW -layout NONE`'s real output is genuinely
+    //      flat raw bytes (what copyVolumeHeaderMetadata() below, and the
+    //      shared UDIF-rewrap step further down, both assume) or itself
+    //      carries additional UDIF structure beyond a trailing "koly"
+    //      block. unwrapUDIFIfPresent() right below is a defensive,
+    //      no-op-if-already-raw safety net for exactly that uncertainty,
+    //      reusing the same probe+extractDmg() technique this function
+    //      already runs on the original decrypted firmware component
+    //      above.
+    if (!runCommand({"hdiutil", "create", "-srcfolder", stagingDir, "-volname", label, "-fs",
+                      "Case-sensitive HFS+", "-format", "UDRW", "-layout", "NONE", "-size",
+                      std::to_string(newVolumeSize) + "b", newRawImgPath})) {
+        fprintf(stderr, "bakeRamdisk: hdiutil create failed on %s\n", newRawImgPath.c_str());
+        return false;
+    }
+    if (!unwrapUDIFIfPresent(newRawImgPath)) {
+        fprintf(stderr, "bakeRamdisk: failed to unwrap hdiutil's own output at %s\n", newRawImgPath.c_str());
+        return false;
+    }
+    copyVolumeHeaderMetadata(rawImgPath, newRawImgPath);
+
+    std::error_code stagingDirRmEc;
+    fs::remove_all(stagingDir, stagingDirRmEc);
+#else
     MountGuard origMount;
     origMount.mountpoint = makeTempDir("blackb0x-origmnt-");
     if (origMount.mountpoint.empty()) {
@@ -2342,6 +2644,7 @@ bool bakeRamdisk(const std::string& path, const std::string& key, const std::str
         return false;
     }
     newMount.mounted = false;
+#endif
 
     std::error_code oldRawRmEc;
     fs::remove(rawImgPath, oldRawRmEc);
