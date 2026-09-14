@@ -1052,6 +1052,13 @@ if(APPLE)
     set(DEPS_IOKIT_PREFIX ${CMAKE_BINARY_DIR}/deps-iokit)
     set(DEPS_IOKIT_INCLUDE ${DEPS_IOKIT_PREFIX}/include)
     set(DEPS_IOKIT_LIB ${DEPS_IOKIT_PREFIX}/lib)
+    # Must exist at configure time, same reasoning as DEPS_INCLUDE's own
+    # file(MAKE_DIRECTORY) near the top of this file: an IMPORTED target's
+    # INTERFACE_INCLUDE_DIRECTORIES is checked for existence at configure
+    # time, before libirecovery_iokit_ext has actually run and populated
+    # it -- deps::irecovery_iokit below would otherwise fail CMake's own
+    # "includes non-existent path" check on every clean configure.
+    file(MAKE_DIRECTORY ${DEPS_IOKIT_INCLUDE})
 
     # BUILD_IN_SOURCE 0 (the default -- omitted, unlike every libusb-backed
     # ExternalProject_Add above): libirecovery_ext already builds in-source
