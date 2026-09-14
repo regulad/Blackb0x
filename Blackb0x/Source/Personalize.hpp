@@ -40,6 +40,15 @@
 // ecid/apNonce/apNonceSize: read from the live DFU-mode device
 // (irecv_get_device_info()) -- this device's personalization is only
 // valid for the ECID and nonce it was actually requested against.
+// deviceModel/buildID: IPSW.hpp's own AppleTVDevice::deviceModel/
+// ManifestInfo::realBuildID -- checked against IPSW.cpp's
+// signedBuildsForDevice() (the same ipsw.me API bake-all-ramdisks'
+// --signed-only already uses) before ever sending a real TSS request, so
+// an already-known-hopeless request at least warns first instead of
+// just silently failing several seconds later. Not a hard gate -- this
+// is a best-effort, third-party-reported snapshot, not Apple's own
+// answer, so a mismatch here doesn't block the real request that
+// actually decides this.
 //
 // Returns the personalized (SHSH-stitched) img3 bytes on success. On
 // failure -- including Apple's TSS server explicitly refusing (the
@@ -49,5 +58,6 @@
 std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& componentName,
                                                                const std::string& rawImg3Path,
                                                                std::shared_ptr<void> buildIdentity, uint64_t ecid,
-                                                               const unsigned char* apNonce,
-                                                               unsigned int apNonceSize);
+                                                               const unsigned char* apNonce, unsigned int apNonceSize,
+                                                               const std::string& deviceModel,
+                                                               const std::string& buildID);

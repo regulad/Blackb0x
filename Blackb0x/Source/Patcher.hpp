@@ -65,6 +65,11 @@ struct PatchedComponents {
     // this to personalize iBSS with a real TSS-issued SHSH ticket. Unset
     // (nullptr) whenever stockSecurom isn't in play.
     std::shared_ptr<void> buildIdentity;
+    // IPSW.hpp's ManifestInfo::realBuildID, passed through unchanged --
+    // personalizeIMG3Component() (Personalize.cpp) needs this alongside
+    // buildIdentity above, to check against signedBuildsForDevice()
+    // before ever sending a real TSS request.
+    std::string buildID;
 };
 
 class Patcher {
@@ -173,6 +178,8 @@ public:
 
     // See PatchedComponents::buildIdentity's own comment.
     void setBuildIdentity(std::shared_ptr<void> identity) { outputs_.buildIdentity = std::move(identity); }
+    // See PatchedComponents::buildID's own comment.
+    void setBuildID(const std::string& buildID) { outputs_.buildID = buildID; }
 
     bool onlyBootComponents = false;
 

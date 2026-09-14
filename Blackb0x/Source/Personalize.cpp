@@ -3,6 +3,7 @@
 //  Blackb0x
 //
 
+#include "IPSW.hpp"
 #include "Personalize.hpp"
 
 extern "C" {
@@ -16,6 +17,7 @@ extern "C" {
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <set>
 
 namespace {
 constexpr const char* kTSSServerURL = "https://gs.apple.com/TSS/controller?action=2";
@@ -32,12 +34,30 @@ constexpr size_t kTssBlobSizeCheck = 64;
 std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& componentName,
                                                                const std::string& rawImg3Path,
                                                                std::shared_ptr<void> buildIdentity, uint64_t ecid,
-                                                               const unsigned char* apNonce,
-                                                               unsigned int apNonceSize) {
+                                                               const unsigned char* apNonce, unsigned int apNonceSize,
+                                                               const std::string& deviceModel,
+                                                               const std::string& buildID) {
     plist_t identity = static_cast<plist_t>(buildIdentity.get());
     if (!identity) {
         fprintf(stderr, "personalizeIMG3Component: no BuildIdentity available for %s\n", componentName.c_str());
         return std::nullopt;
+    }
+
+    // Best-effort, cheap check before ever bothering Apple's real TSS
+    // server: ipsw.me's own crowd-sourced signing-status snapshot (the
+    // same one bake-all-ramdisks' --signed-only already relies on) can
+    // at least warn upfront that this is very likely a wasted request --
+    // it's not authoritative (can lag Apple's own signing-window changes
+    // in either direction), so this only warns, never blocks.
+    if (!deviceModel.empty() && !buildID.empty()) {
+        std::set<std::string> signedBuilds = signedBuildsForDevice(deviceModel);
+        if (!signedBuilds.count(buildID)) {
+            fprintf(stderr,
+                    "personalizeIMG3Component: ipsw.me does not currently list %s %s as signed by Apple -- the "
+                    "TSS request below is very likely to be refused. Trying anyway, since ipsw.me's own "
+                    "signing-status snapshot isn't authoritative.\n",
+                    deviceModel.c_str(), buildID.c_str());
+        }
     }
 
     tss_set_debug_level(1);

@@ -438,6 +438,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 
     patcher.loadKeysForDevice(device.deviceModel, manifest->realBuildID);
     patcher.setBuildIdentity(manifest->buildIdentity);
+    patcher.setBuildID(manifest->realBuildID);
 
     std::optional<PatchedComponents> result;
     patcher.onComponentsReady = [&](const PatchedComponents& c) { result = c; };
@@ -548,7 +549,7 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
     printf("Sending iBSS -> ");
     fflush(stdout);
     if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurom,
-                                components.buildIdentity) != 0) {
+                                components.buildIdentity, device.deviceModel, components.buildID) != 0) {
         printf("Error\n");
         fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
                 stockSecurom ? " (--stock-securom personalizes the image with a real TSS-issued SHSH ticket "

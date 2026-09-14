@@ -1082,7 +1082,8 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid) {
 // starts and what its result was) — these stay quiet on success and only
 // report genuine, otherwise-unexplained failures.
 int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool stockRecovery, bool stockSecurom,
-                             std::shared_ptr<void> buildIdentity) {
+                             std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
+                             const std::string& buildID) {
     irecv_client_t client = get_tv(ecid);
     if (!client) {
         return -1;
@@ -1140,7 +1141,7 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
         // be bound to.
         const struct irecv_device_info* info = irecv_get_device_info(client);
         auto personalized = personalizeIMG3Component("iBSS", iBSSpath, buildIdentity, ecid, info->ap_nonce,
-                                                       info->ap_nonce_size);
+                                                       info->ap_nonce_size, deviceModel, buildID);
         if (!personalized) {
             irecv_close(client);
             return -1;

@@ -124,10 +124,13 @@ public:
     //     a genuinely un-pwned SecureROM's signature check requires this
     //     regardless of how correct the delivery protocol is. buildIdentity
     //     is the matching BuildManifest.plist identity (IPSW.hpp's
-    //     ManifestInfo::buildIdentity) that personalization needs; ignored
-    //     unless stockSecurom is set.
+    //     ManifestInfo::buildIdentity) that personalization needs;
+    //     deviceModel/buildID (IPSW.hpp's ManifestInfo::realBuildID) let
+    //     it check signedBuildsForDevice() before ever sending a real TSS
+    //     request. All four ignored unless stockSecurom is set.
     int sendiBSS(const std::string& path, uint64_t ecid, bool stockRecovery = false, bool stockSecurom = false,
-                 std::shared_ptr<void> buildIdentity = nullptr);
+                 std::shared_ptr<void> buildIdentity = nullptr, const std::string& deviceModel = "",
+                 const std::string& buildID = "");
     int sendiBEC(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
