@@ -83,7 +83,7 @@ public:
     // patches, kernelcache, devicetree, or the boot trigger itself).
     bool useStockRamdisk(const std::string& path);
 
-    // --no-pwn (Cli.hpp's CliOptions): decrypts and sends iBSS/iBEC
+    // --stock-recovery (Cli.hpp's CliOptions): decrypts and sends iBSS/iBEC
     // exactly as downloaded from Apple -- no iBootPatcher() call at all,
     // so no boot-args injection, no KASLR patch, no ticket/RSA-check
     // bypass. checkm8/pwnTool still needs to run beforehand for the
@@ -98,6 +98,23 @@ public:
     // trigger itself).
     bool useStockIBSS(const std::string& path);
     bool useStockIBEC(const std::string& path);
+
+    // --stock-firmware (Cli.hpp's CliOptions): the kernelcache half of the
+    // same idea -- decrypts and sends the kernelcache exactly as
+    // downloaded from Apple, no patch_kernel()/CBPatcher call at all (no
+    // tfp0, no AMFI/memcmp bypass, no sandbox patch). Combined with
+    // useStockIBSS()/useStockIBEC()/useStockRamdisk() (what --stock-firmware
+    // sets all of, together) this sends a completely unmodified firmware
+    // suite end to end -- devicetree is already always sent unmodified
+    // regardless (see setDeviceTreePath()'s own comment), so there's no
+    // separate stock/patched distinction to make there. If a fully-stock
+    // suite boots fine, checkm8 and the bootx trigger are both confirmed
+    // working and the failure is specifically in one of blackb0x's own
+    // patches; if it fails the same way even fully stock, the failure is
+    // somewhere checkm8/the boot trigger doesn't control at all (or this
+    // device/firmware genuinely can't complete this boot path regardless
+    // of what's sent).
+    bool useStockKernel(const std::string& path);
 
     void setDeviceTreePath(const std::string& path);
 

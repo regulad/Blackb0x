@@ -33,6 +33,7 @@ extern "C" {
 #include <optional>
 #include <set>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -49,12 +50,13 @@ void printCliUsage(const char* argv0) {
     printf("  --dry-run                 Do everything up to but not including the\n");
     printf("                            exploit and the USB upload to the device —\n");
     printf("                            prints what would run/be sent instead\n");
-    printf("  --no-checkm8              Refuse to run checkm8 (gaster) — if the\n");
-    printf("                            connected device isn't already reporting a\n");
-    printf("                            pwned DFU serial string, fail instead of\n");
-    printf("                            attempting the exploit. For iterating on the\n");
-    printf("                            post-exploit send flow against an already-\n");
-    printf("                            pwned device without spawning gaster again.\n");
+    printf("  --no-pwn                  Never attempt to run a pwntool (gaster/\n");
+    printf("                            blackb0x-pwn) at all — if the connected device\n");
+    printf("                            isn't already reporting a pwned DFU serial\n");
+    printf("                            string, fail instead of attempting the exploit.\n");
+    printf("                            For iterating on the post-exploit send flow\n");
+    printf("                            against an already-pwned device without\n");
+    printf("                            spawning a pwntool again.\n");
 #if defined(__APPLE__)
     printf("  --pwntool <gaster|blackb0x-pwn>\n");
     printf("                            Which tool runs the checkm8 exploit\n");
@@ -77,15 +79,28 @@ void printCliUsage(const char* argv0) {
     printf("                            patching/entrypoint.c or earlier in the chain.\n");
     printf("                            The device will NOT be jailbroken by a run\n");
     printf("                            using this flag.\n");
-    printf("  --no-pwn                  DIAGNOSTIC: send the stock iBSS/iBEC exactly as\n");
-    printf("                            downloaded from Apple (still runs checkm8 first --\n");
-    printf("                            SecureROM's own signature check still needs\n");
-    printf("                            bypassing to accept any file at all -- but no\n");
-    printf("                            boot-args/KASLR/ticket-check patches applied to\n");
-    printf("                            the bootloader itself) -- to check whether a boot\n");
-    printf("                            failure is in blackb0x's own iBSS/iBEC patches or\n");
-    printf("                            elsewhere in the chain. The device will NOT be\n");
-    printf("                            jailbroken by a run using this flag.\n");
+    printf("  --stock-recovery          DIAGNOSTIC: send the stock iBSS/iBEC exactly\n");
+    printf("                            as downloaded from Apple (still runs checkm8\n");
+    printf("                            first -- SecureROM's own signature check still\n");
+    printf("                            needs bypassing to accept any file at all -- but\n");
+    printf("                            no boot-args/KASLR/ticket-check patches applied\n");
+    printf("                            to the bootloader itself) -- to check whether a\n");
+    printf("                            boot failure is in blackb0x's own iBSS/iBEC\n");
+    printf("                            patches or elsewhere in the chain. The device\n");
+    printf("                            will NOT be jailbroken by a run using this flag.\n");
+    printf("  --stock-firmware          DIAGNOSTIC: keep blackb0x's own patched\n");
+    printf("                            iBSS/iBEC, but send a stock kernelcache (no\n");
+    printf("                            tfp0/AMFI/sandbox patches) and stock ramdisk\n");
+    printf("                            (same as --stock-ramdisk) -- to check whether\n");
+    printf("                            blackb0x's own patched bootloader can still\n");
+    printf("                            boot an otherwise-unmodified OS. If this boots\n");
+    printf("                            fine, the iBSS/iBEC patches are confirmed OK\n");
+    printf("                            and the failure is in blackb0x's own kernel/\n");
+    printf("                            ramdisk patches specifically; if it fails the\n");
+    printf("                            same way, the iBSS/iBEC patches themselves are\n");
+    printf("                            implicated. Combine with --stock-recovery for a\n");
+    printf("                            fully-stock suite end to end. The device will\n");
+    printf("                            NOT be jailbroken by a run using this flag.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -114,14 +129,16 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.tetherBoot = true;
         } else if (arg == "--dry-run") {
             options.dryRun = true;
-        } else if (arg == "--no-checkm8") {
-            options.noCheckm8 = true;
+        } else if (arg == "--no-pwn") {
+            options.noPwn = true;
         } else if (arg == "--dont-check-firmware-sums") {
             options.dontCheckFirmwareSums = true;
         } else if (arg == "--stock-ramdisk") {
             options.stockRamdisk = true;
-        } else if (arg == "--no-pwn") {
-            options.noPwn = true;
+        } else if (arg == "--stock-recovery") {
+            options.stockRecovery = true;
+        } else if (arg == "--stock-firmware") {
+            options.stockFirmware = true;
         } else if (arg == "--pwntool") {
             std::string value = nextArg("--pwntool");
 #if defined(__APPLE__)
@@ -142,6 +159,19 @@ CliOptions parseCliOptions(int argc, char** argv) {
             printCliUsage(argv[0]);
             exit(2);
         }
+    }
+    // --stock-firmware already implies stock ramdisk (see
+    // downloadAndPatchComponents()'s own `stockRamdisk || stockFirmware`
+    // check) -- not an error, just redundant, so warn rather than reject.
+    // --stock-recovery is NOT redundant with --stock-firmware: --stock-
+    // firmware deliberately keeps blackb0x's own patched iBSS/iBEC and
+    // only stocks the kernel/ramdisk (isolating whether the *bootloader*
+    // patches themselves are the problem); combining both flags is how
+    // you get a fully-stock suite end to end, a real, distinct diagnostic
+    // of its own, not a redundant restatement. --no-pwn is unrelated to
+    // either -- it controls whether a pwntool runs at all.
+    if (options.stockFirmware && options.stockRamdisk) {
+        fprintf(stderr, "--stock-ramdisk is redundant with --stock-firmware\n");
     }
     return options;
 }
@@ -235,11 +265,13 @@ bool waitForDFUMode(DeviceManager& deviceManager, uint64_t ecid, AppleTVDevice& 
 // device-model branching from the original, not simplified. `dryRun` skips
 // the actual SHAtter/checkm8 USB call (the point where this function stops
 // being observation and starts writing exploit payloads into the device),
-// printing what would have run instead. `noCheckm8` only gates the
-// AppleTV3,2/checkm8 branch below (the one that actually spawns gaster) —
-// SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that never
-// touches gaster at all, so there's nothing for this flag to refuse there.
-bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noCheckm8,
+// printing what would have run instead. `noPwn` only gates the
+// AppleTV3,2/checkm8 branch below (the one that actually spawns a pwntool)
+// — SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that never
+// touches a pwntool at all, so there's nothing for this flag to refuse
+// there. (Was named noCheckm8/--no-checkm8; renamed once "pwntool" became
+// the general term for gaster/blackb0x-pwn both.)
+bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noPwn,
                    const std::string& pwnTool) {
     if (device.pwnedDFU) return true;
 
@@ -266,14 +298,24 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
     }
 
     if (device.deviceModel == "AppleTV3,2") {
-        if (noCheckm8) {
+        if (noPwn) {
+            // Not a hard failure: proceed straight into the rest of the
+            // boot chain (iBSS/iBEC/etc.) without ever having run a
+            // pwntool at all, even though the device isn't (as far as
+            // blackb0x can tell) already in pwned DFU. Useful when the
+            // device might already accept unsigned code through some path
+            // blackb0x's own pwnedDFU detection doesn't know about, or
+            // just to see how far the rest of the send flow gets on its
+            // own -- if SecureROM's signature check was never actually
+            // bypassed, that will surface naturally as a real failure
+            // further down (e.g. sendiBSS/sendiBEC), not here.
             fprintf(stderr,
-                    "--no-checkm8: device is not already in pwned DFU (no PWND: in its serial string) — "
-                    "refusing to run checkm8/%s. Pwn it separately first (e.g. `%s pwn`%s), or drop "
-                    "--no-checkm8 to let blackb0x do it.\n",
-                    pwnTool.c_str(), pwnTool.c_str(),
-                    pwnTool == "blackb0x-pwn" ? " — note blackb0x-pwn's own verb is `checkm8`, not `pwn`" : "");
-            return false;
+                    "--no-pwn: device is not already in pwned DFU (no PWND: in its serial string) -- "
+                    "skipping %s and proceeding into the rest of the boot chain anyway. If SecureROM's "
+                    "signature check was never actually bypassed, expect a real failure further down "
+                    "(e.g. sending iBSS/iBEC), not here.\n",
+                    pwnTool.c_str());
+            return true;
         }
         if (dryRun) {
             printf("(dry run) Would try checkm8\n");
@@ -310,7 +352,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
                                                               const std::string& buildToRequest,
                                                               bool onlyBootComponents,
                                                               bool dontCheckFirmwareSums, bool stockRamdisk,
-                                                              bool noPwn) {
+                                                              bool stockRecovery, bool stockFirmware) {
     patcher.onlyBootComponents = onlyBootComponents;
     patcher.dontCheckFirmwareSums = dontCheckFirmwareSums;
 
@@ -372,8 +414,14 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
         patchFn(localPath);
     };
 
+    // stockRecovery, not stockFirmware, gates iBSS/iBEC: --stock-firmware
+    // deliberately keeps blackb0x's own patched bootloader and only stocks
+    // the kernel/ramdisk it hands off to (see that flag's own comment in
+    // Cli.hpp) -- --stock-recovery is the complementary test (stock
+    // bootloader, blackb0x's own patched kernel/ramdisk), not something
+    // --stock-firmware also implies.
     downloadAndPatch("iBSS", manifest->iBSSPath, [&](const std::string& path) {
-        if (noPwn) {
+        if (stockRecovery) {
             patcher.useStockIBSS(path);
         } else {
             patcher.patchiBSS(path);
@@ -381,7 +429,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     });
 
     downloadAndPatch("iBEC", manifest->iBECPath, [&](const std::string& path) {
-        if (noPwn) {
+        if (stockRecovery) {
             patcher.useStockIBEC(path);
             return;
         }
@@ -395,7 +443,11 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     });
 
     downloadAndPatch("KernelCache", manifest->kernelCachePath, [&](const std::string& path) {
-        patcher.patchKernel(path, manifest->productVersion);
+        if (stockFirmware) {
+            patcher.useStockKernel(path);
+        } else {
+            patcher.patchKernel(path, manifest->productVersion);
+        }
     });
 
     downloadAndPatch("DeviceTree", manifest->deviceTreePath,
@@ -403,7 +455,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 
     if (!onlyBootComponents) {
         downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath, [&](const std::string& path) {
-            if (stockRamdisk) {
+            if (stockRamdisk || stockFirmware) {
                 patcher.useStockRamdisk(path);
             } else {
                 patcher.patchRamdisk(path);
@@ -667,23 +719,35 @@ int runCli(const CliOptions& options) {
         }
     }
 
-    if (!checkExploit(deviceManager, device, options.dryRun, options.noCheckm8, options.pwnTool)) {
+    if (!checkExploit(deviceManager, device, options.dryRun, options.noPwn, options.pwnTool)) {
         return 1;
     }
 
-    if (options.stockRamdisk || options.noPwn) {
-        fprintf(stderr, "DIAGNOSTIC run:%s%s -- the device will NOT be jailbroken even if everything "
+    // Which flags in this run guarantee the device stays non-jailbroken
+    // (any use of unpatched/stock content) -- --no-pwn is deliberately NOT
+    // one of these: it only skips re-running the exploit, which is
+    // perfectly compatible with a real, successful jailbreak if the
+    // device was already pwned by a separate run.
+    std::vector<std::string> stockFlags;
+    if (options.stockFirmware) stockFlags.push_back("--stock-firmware (patched bootloader, stock kernel/ramdisk)");
+    if (options.stockRecovery) stockFlags.push_back("--stock-recovery (stock iBSS/iBEC)");
+    if (options.stockRamdisk && !options.stockFirmware) stockFlags.push_back("--stock-ramdisk (stock RestoreRamdisk)");
+    if (!stockFlags.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < stockFlags.size(); i++) {
+            joined += (i ? ", " : " ") + stockFlags[i];
+        }
+        fprintf(stderr, "DIAGNOSTIC run:%s -- the device will NOT be jailbroken even if everything "
                         "below succeeds.\n",
-                options.stockRamdisk ? " --stock-ramdisk (stock RestoreRamdisk)" : "",
-                options.noPwn ? " --no-pwn (stock iBSS/iBEC)" : "");
+                joined.c_str());
     }
 
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
 
-    auto components =
-        downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
-                                    options.dontCheckFirmwareSums, options.stockRamdisk, options.noPwn);
+    auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
+                                                   options.dontCheckFirmwareSums, options.stockRamdisk,
+                                                   options.stockRecovery, options.stockFirmware);
     if (!components) {
         fprintf(stderr, "Failed to download/patch firmware components.\n");
         return 1;
@@ -698,11 +762,14 @@ int runCli(const CliOptions& options) {
         return 0;
     }
 
-    if (options.stockRamdisk || options.noPwn) {
-        printf("\nDone. DIAGNOSTIC run (%s%s%s) -- the Apple TV should reboot into a stock, "
+    if (!stockFlags.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < stockFlags.size(); i++) {
+            joined += (i ? ", " : "") + stockFlags[i];
+        }
+        printf("\nDone. DIAGNOSTIC run (%s) -- the Apple TV should reboot into a stock, "
                "non-jailbroken state if this run succeeded.\n",
-               options.stockRamdisk ? "--stock-ramdisk" : "", options.stockRamdisk && options.noPwn ? ", " : "",
-               options.noPwn ? "--no-pwn" : "");
+               joined.c_str());
     } else {
         printf("\nDone. %s\n", tetherBoot ? "The Apple TV should now boot the tethered jailbreak."
                                            : "The Apple TV should now reboot into the jailbroken system.");

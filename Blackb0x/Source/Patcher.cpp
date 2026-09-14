@@ -148,7 +148,7 @@ bool Patcher::useStockIBSS(const std::string& path) {
     std::string outPath = outputPathFor(path);
 
     fprintf(stderr,
-            "--no-pwn: decrypting the stock iBSS exactly as downloaded from Apple -- no boot-args/"
+            "--stock-recovery: decrypting the stock iBSS exactly as downloaded from Apple -- no boot-args/"
             "KASLR/ticket-check patches applied.\n");
 
     decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
@@ -224,7 +224,7 @@ bool Patcher::useStockIBEC(const std::string& path) {
     std::string outPath = outputPathFor(path);
 
     fprintf(stderr,
-            "--no-pwn: decrypting the stock iBEC exactly as downloaded from Apple -- no boot-args/"
+            "--stock-recovery: decrypting the stock iBEC exactly as downloaded from Apple -- no boot-args/"
             "KASLR/ticket-check patches applied.\n");
 
     decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
@@ -308,6 +308,30 @@ bool Patcher::patchKernel(const std::string& path, const std::string& productVer
 
     std::error_code ec;
     fs::remove(decPath, ec);
+
+    outputs_.kernel = outPath;
+    checkPatching();
+    return true;
+}
+
+// See Patcher.hpp's own comment. Same decrypt()-only pattern as
+// useStockIBSS()/useStockIBEC()/useStockRamdisk() -- no patch_kernel()
+// call at all.
+bool Patcher::useStockKernel(const std::string& path) {
+    const FirmwareKeyPair* k = keyFor("Kernelcache");
+    if (!k) {
+        fprintf(stderr, "useStockKernel: no Kernelcache keys loaded\n");
+        return false;
+    }
+
+    std::string outPath = outputPathFor(path);
+
+    fprintf(stderr,
+            "--stock-firmware: decrypting the stock kernelcache exactly as downloaded from Apple -- "
+            "no tfp0/AMFI/sandbox patches applied.\n");
+
+    decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
+            const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE", nullptr);
 
     outputs_.kernel = outPath;
     checkPatching();

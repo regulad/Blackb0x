@@ -23,7 +23,13 @@ struct CliOptions {
     std::string udid;     // empty = not specified
     bool tetherBoot = false;
     bool dryRun = false;
-    bool noCheckm8 = false;
+    // Never attempt to run a pwntool (gaster/blackb0x-pwn) at all -- if the
+    // connected device isn't already reporting a pwned DFU serial string,
+    // fail instead of attempting the exploit. For iterating on the
+    // post-exploit send flow against an already-pwned device without
+    // spawning a pwntool again. (Was named --no-checkm8; renamed once
+    // "pwntool" became the general term for gaster/blackb0x-pwn both.)
+    bool noPwn = false;
     bool dontCheckFirmwareSums = false;
     // Sends the stock RestoreRamdisk exactly as downloaded from Apple
     // instead of the blackb0x-patched dist/ one -- a diagnostic for
@@ -37,8 +43,23 @@ struct CliOptions {
     // accept any file at all), but no boot-args/KASLR/ticket-check
     // patches get applied to the bootloader itself. Same diagnostic
     // purpose as stockRamdisk above, orthogonal to it (see
-    // Patcher::useStockIBSS()/useStockIBEC()'s own comment).
-    bool noPwn = false;
+    // Patcher::useStockIBSS()/useStockIBEC()'s own comment). (Was named
+    // --no-pwn; renamed to avoid colliding with the new, differently-
+    // scoped --no-pwn above once that name became available.)
+    bool stockRecovery = false;
+    // Deliberately keeps blackb0x's own patched iBSS/iBEC (does NOT imply
+    // stockRecovery above -- that's a separate, complementary test), but
+    // sends a stock kernelcache (see Patcher::useStockKernel()) and stock
+    // ramdisk (same as stockRamdisk above) -- devicetree is already always
+    // sent unmodified either way. The point: check whether blackb0x's own
+    // patched bootloader can still boot an otherwise-unmodified OS. If
+    // this boots fine, the iBSS/iBEC patches are confirmed OK and the
+    // failure is in blackb0x's own kernel/ramdisk patches specifically; if
+    // it fails the same way, the iBSS/iBEC patches themselves are
+    // implicated instead. Combine with stockRecovery for a fully-stock
+    // suite end to end (checkm8/pwnTool still runs regardless, unless
+    // noPwn above also skips it).
+    bool stockFirmware = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or
     // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms

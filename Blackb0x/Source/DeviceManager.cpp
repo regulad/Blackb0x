@@ -1234,6 +1234,16 @@ int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
 // accumulator, not a lambda capture: irecv_event_cb_t's signature has no
 // user_data parameter, matching this file's own existing progress_cb
 // convention below.
+//
+// IMPORTANT: the device only ever streams this splash/banner ONCE per
+// Recovery-mode boot session -- confirmed directly (real run): only the
+// very first connection after landing in Recovery mode gets it, every
+// later reconnect in that same session (including from this function's
+// own repeated polling below) reads back nothing at all. So within the
+// polling loop below, only the very first captureConsoleLog() call that
+// happens to land after the device has actually re-entered Recovery mode
+// is expected to return anything -- every later poll in the same run
+// coming back empty is normal, not a sign the capture mechanism broke.
 static std::string g_consoleCaptureBuffer;
 static int consoleReceivedCallback(irecv_client_t /*client*/, const irecv_event_t* event) {
     if (event->type == IRECV_RECEIVED && event->data && event->size > 0) {
