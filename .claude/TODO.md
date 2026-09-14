@@ -495,17 +495,22 @@ today only warns (`outSizeWarning`/`bake-all-ramdisks`' own "OK (with size
 warning...)" summary line) rather than failing the bake, since some
 devices/firmwares may tolerate more or less — but a bake that's already
 over 64MiB has no margin left at all for whichever device's real limit
-turns out to be at or below that. `kNeverStageDebs` (`shouldSkipStagingDeb()`,
-`BakeRamdisk.cpp` ~line 798) already excludes the largest known offenders
-by real, checked size (org.xbmc.kodi-atv2 ~40MB, odcctools ~7.7MB,
-gettext ~3.2MB, curl ~0.7MB, com.nito.nitotv ~1.65MB) via a real
-dependency-closure audit proving each is safe to drop. Worth a fresh pass
-once item 6's full bake sweep exists to measure real per-tuple final
-sizes across every known `(device, buildID)` combination (not just
-whichever were spot-baked so far) and identify which tuples are actually
-closest to or over the watermark, then repeat the same audit technique
-(`ar`/`tar` control-file inspection + transitive-closure computation
-against `postinstall.sh`'s real bootstrap set) to find further packages
-safe to exclude or move to network-only (staged in `apt-lists/` but not
+turns out to be at or below that. `kNeverStageDebs`
+(`shouldSkipStagingDeb()`, `BakeRamdisk.cpp` ~line 798) already excludes
+the largest known offenders — org.xbmc.kodi-atv2 (~40MB), odcctools
+(~7.7MB), gettext (~3.2MB), curl (~0.7MB), com.nito.nitotv (~1.65MB) —
+each already proven safe to drop via a real dependency-closure audit
+(`ar`/`tar` control-file inspection against every vendored `.deb`'s own
+Depends:/Pre-Depends:, checked to confirm nothing in `postinstall.sh`'s
+real bootstrap closure needs them). That audit is done and closed for
+this list — nothing here calls it back into question. What's actually
+open: whether this list is complete. Worth a fresh pass once item 6's
+full bake sweep exists to measure real per-tuple final sizes across
+every known `(device, buildID)` combination (not just whichever were
+spot-baked so far), identify which tuples are actually closest to or
+over the watermark, and — only if some still are even with the current
+exclusion list — run the same audit technique against whatever's left to
+find further, currently-unexamined candidates safe to exclude or move to
+network-only (staged in `apt-lists/` but not
 `private/var/cache/apt/archives/`, same mechanism `kNeverStageDebs`
-already uses) for whichever tuples need it.
+already uses).
