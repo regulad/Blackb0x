@@ -892,11 +892,25 @@ target_include_directories(xpwn BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
 # target_compile_options() calls above only apply to the dmg/xpwn library
 # targets themselves, not these separate executables that merely link
 # against them, so each needs the identical treatment.
-foreach(t dmg-bin ipsw xpwntool imagetool dripwn)
+#
+# blackb0x_xpwntool (our own target wrapping Blackb0x/Libraries/xpwntool.c,
+# declared far above — NOT the same target as xpwn's own "xpwntool" CLI
+# tool in this list) needs it too, for the exact same reason: its
+# transitively-included Blackb0x/Libraries/libxpwntool/img3.h has its own
+# bare `#include <openssl/aes.h>`. This was silently getting away without
+# it on Linux dev boxes that happen to have a real system libssl-dev
+# installed (AES_KEY's struct layout has stayed ABI-stable across the
+# whole OpenSSL-compatible-API ecosystem for decades, wolfSSL's shim
+# included, so a real system openssl/aes.h resolving here instead of
+# wolfSSL's shim went unnoticed) — confirmed as a real, not hypothetical,
+# bug on a real macOS build, which has no such fallback header anywhere on
+# its default include path and failed outright.
+foreach(t dmg-bin ipsw xpwntool imagetool dripwn blackb0x_xpwntool)
     target_include_directories(${t} PRIVATE ${DEPS_INCLUDE})
     target_include_directories(${t} BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
     target_compile_options(${t} PRIVATE -include ${DEPS_INCLUDE}/wolfssl/options.h)
 endforeach()
+add_dependencies(blackb0x_xpwntool wolfssl_ext)
 
 # ---------------------------------------------------------------------------
 # gaster: the actual checkm8 implementation DeviceManager.cpp's checkm8()

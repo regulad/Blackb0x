@@ -46,7 +46,14 @@ fresh clone + build, not just assumed):
   generator you use for the top-level build.
 - **CMake ≥3.16.**
 - **autoconf, automake, libtool, pkg-config** — for the autotools-based dependencies'
-  own `./configure`/`autoreconf` steps.
+  own `./configure`/`autoreconf` steps. On Linux these mostly come along for free —
+  most distros' base/`build-essential`-style GCC toolchain package pulls in `libtool`
+  transitively as a dependency of something else in that group. **macOS/Homebrew
+  doesn't bundle any of the four with anything** — install them explicitly:
+  `brew install cmake autoconf automake libtool pkg-config`. Confirmed on a real
+  macOS build attempt: without an explicit `brew install libtool`, `autoreconf`/
+  `autogen.sh` steps in the vendored dependencies fail outright, the same way a
+  from-scratch Linux distro missing that package would.
 - **`xxd`** (usually in a `vim-common`/`xxd`/`vim` package) — used to embed `gaster`'s
   exploit payload binaries as C arrays at build time.
 
