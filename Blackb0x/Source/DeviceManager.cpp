@@ -60,6 +60,7 @@ static void get_data(irecv_client_t client, char* buffer, unsigned long length);
 static void request_image_validation(irecv_client_t client);
 static int msleep(long msec);
 static const char* mode_to_str(int mode);
+static bool serialStringIndicatesRealDFU(const char* serialString);
 static int send_data(irecv_client_t client, unsigned char* data, size_t size);
 static bool commandExistsOnPath(const char* name);
 static int runGaster(const std::vector<std::string>& args, int timeoutSeconds = 0);
@@ -971,6 +972,30 @@ static const char* mode_to_str(int mode) {
     }
 }
 
+// irecv_get_mode()'s own PID-based detection is a well-documented,
+// multi-year bug/quirk across libirecovery/idevicerestore for exactly
+// the DFU<->Recovery transition this project cares about -- confirmed
+// via real GitHub reports of the identical symptom (idevicerestore#78,
+// libirecovery#50, tr4mpass#61: irecv_get_mode() reports DFU_MODE right
+// after a reconnect that's actually still fully functional as Recovery
+// mode underneath, serial string included) and idevicerestore's own
+// source carrying a literal "TODO: verify if it actually goes from
+// 0x1222 -> 0x1227" comment on this exact transition. Confirmed directly
+// on real hardware here too: --stock-securom's iBSS send silently took
+// the wrong wire protocol (irecv_send_buffer()'s DFU-vs-Recovery branch
+// is chosen by the SAME misdetected client->mode) because of this.
+//
+// The device's own serial string is a more trustworthy signal: real
+// SecureROM DFU mode's serial string embeds "SRTG:[iBoot-x.x.x]" (the
+// running SecureROM/iBoot build identifier); Recovery mode's has no such
+// field, carrying "SRNM:[<serial>]" (the device's real hardware serial
+// number) instead. Confirmed against real captures of both:
+//   DFU:      CPID:8010 CPRV:11 CPFM:03 SCEP:01 BDID:0C ECID:... IBFL:3C SRTG:[iBoot-2696.0.0.1.33]
+//   Recovery: CPID:8947 CPRV:00 CPFM:03 SCEP:10 BDID:00 ECID:000002713C84D50E IBFL:1B SRNM:[F6KM4D1TFF54]
+static bool serialStringIndicatesRealDFU(const char* serialString) {
+    return serialString && strstr(serialString, "iBoot") != nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // iRecovery functions (shared)
 // ---------------------------------------------------------------------------
@@ -1124,13 +1149,17 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
         // entirely -- but iBSS can only ever be accepted in DFU mode
         // (Recovery-mode iBoot has no use for another iBSS), pwned or not,
         // so that gate still needs a DFU-mode replacement here rather than
-        // no gate at all.
-        int mode = 0;
-        irecv_get_mode(client, &mode);
-        if (mode != IRECV_K_DFU_MODE) {
-            fprintf(stderr, "sendiBSS: device is not in DFU mode (currently: %s) -- iBSS can only be sent to a "
-                             "device in DFU mode.\n",
-                    mode_to_str(mode));
+        // no gate at all. serialStringIndicatesRealDFU(), not
+        // irecv_get_mode() -- see that function's own comment for why.
+        const struct irecv_device_info* dfuCheckInfo = irecv_get_device_info(client);
+        const char* dfuCheckSerial = dfuCheckInfo ? dfuCheckInfo->serial_string : nullptr;
+        if (!serialStringIndicatesRealDFU(dfuCheckSerial)) {
+            int mode = 0;
+            irecv_get_mode(client, &mode);
+            fprintf(stderr,
+                    "sendiBSS: device is not in DFU mode -- iBSS can only be sent to a device in DFU mode. "
+                    "(irecv_get_mode() reports: %s; serial string: %s)\n",
+                    mode_to_str(mode), dfuCheckSerial ? dfuCheckSerial : "(none)");
             irecv_close(client);
             return -1;
         }
