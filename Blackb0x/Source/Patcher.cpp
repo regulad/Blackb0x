@@ -45,6 +45,25 @@ static std::string prebootPathFor(const std::string& path) { return replaceExten
 static std::string downgradePathFor(const std::string& path) { return replaceExtension(path, "downgrade"); }
 static std::string outputPathFor(const std::string& path) { return withoutExtension(path); }
 
+// See Patcher.hpp's own comment on why this is a free function, not a
+// Patcher method -- patchRamdisk() below is just its first caller.
+bool ramdiskBakeNeeded(const std::string& deviceModel, const std::string& buildID, bool dontCheckFirmwareSums) {
+    // Matches bake-all-ramdisks' own naming convention exactly (see
+    // BakeAllRamdisks.cpp) -- both sides need to agree on this without a
+    // round trip, hence the plain, duplicated (not shared-header) format
+    // string on each side.
+    const std::string patchedDMG = "dist/" + deviceModel + "_" + buildID + "-Ramdisk.dmg";
+    if (!fs::exists(patchedDMG)) return true;
+    if (dontCheckFirmwareSums) return false;
+
+    std::string storedHash;
+    {
+        std::ifstream sumIn(sumFileFor(patchedDMG));
+        if (sumIn) std::getline(sumIn, storedHash);
+    }
+    return storedHash != ramdiskOverlayContentHash();
+}
+
 // ---------------------------------------------------------------------------
 // Patcher
 // ---------------------------------------------------------------------------
@@ -411,26 +430,26 @@ bool Patcher::useStockKernel(const std::string& path, bool stockRecovery) {
 // same patched output is valid for every device on a given firmware build.
 // This just checks whether bake-all-ramdisks has already produced the
 // dist/ entry this firmware needs, and tells the user to run it if not.
-bool Patcher::patchRamdisk(const std::string& path) {
+bool Patcher::patchRamdisk() {
     const FirmwareKeyPair* k = keyFor("RestoreRamdisk");
     if (!k) {
         fprintf(stderr, "patchRamdisk: no RestoreRamdisk keys loaded\n");
         return false;
     }
 
-    // Matches bake-all-ramdisks' own naming convention exactly (see
-    // BakeAllRamdisks.cpp) — both sides need to agree on this without a
-    // round trip, hence the plain, duplicated (not shared-header) format
-    // string on each side.
     const std::string patchedDMG = "dist/" + deviceModel_ + "_" + buildID_ + "-Ramdisk.dmg";
     if (!fs::exists(patchedDMG)) {
-        // dist/ has *something* in it (runCli() already checked that up
-        // front) — just not this specific device+firmware. That's not a
-        // recoverable "try the next component" failure the way a flaky
-        // download is: there is no ramdisk to send this device no matter
-        // what else this run does, so stop hard here instead of limping on
-        // to "Not all required components patched successfully", which
-        // would leave the real cause one level removed from what's
+        // dist/ may have *something* in it (or, since Cli.cpp's runCli() can
+        // now self-bake on demand, may still be entirely empty at this
+        // point) — either way, not this specific device+firmware, and
+        // Cli.cpp's downloadAndPatchComponents() already tried a background
+        // bake-all-ramdisks run for exactly this combination if
+        // canSelfBakeRamdisk() said that was safe (see its own comment).
+        // That's not a recoverable "try the next component" failure the way
+        // a flaky download is: there is no ramdisk to send this device no
+        // matter what else this run does, so stop hard here instead of
+        // limping on to "Not all required components patched successfully",
+        // which would leave the real cause one level removed from what's
         // actually printed.
         fprintf(stderr,
                 "blackb0x: PANIC: no baked ramdisk for %s %s (%s doesn't exist).\n"
@@ -447,27 +466,26 @@ bool Patcher::patchRamdisk(const std::string& path) {
     // if ramdisk/ has been edited since this was baked, its .sum sidecar
     // (written by bake-all-ramdisks) won't match the overlay's current
     // hash. --dont-check-firmware-sums bypasses this entirely (see
-    // dontCheckFirmwareSums's own comment in Patcher.hpp).
+    // dontCheckFirmwareSums's own comment in Patcher.hpp). Same check
+    // ramdiskBakeNeeded() above makes (Cli.cpp's downloadAndPatchComponents()
+    // already ran it once, before this dist/ entry may even have existed,
+    // to decide whether to kick off a background bake) -- re-run here rather
+    // than trusted from that earlier call, since this is the actual
+    // authoritative gate on using patchedDMG at all, and a background bake
+    // may have just changed the answer.
     if (dontCheckFirmwareSums) {
         fprintf(stderr,
                 "patchRamdisk: --dont-check-firmware-sums set — using %s as-is without checking "
                 "whether it still matches the current ramdisk/ overlay.\n",
                 patchedDMG.c_str());
-    } else {
-        std::string storedHash;
-        {
-            std::ifstream sumIn(sumFileFor(patchedDMG));
-            if (sumIn) std::getline(sumIn, storedHash);
-        }
-        if (storedHash != ramdiskOverlayContentHash()) {
-            fprintf(stderr,
-                    "patchRamdisk: %s is stale — the ramdisk/ overlay has changed since this was baked.\n"
-                    "Re-run this (as root) before using blackb0x against this firmware:\n"
-                    "  sudo ./bake-all-ramdisks\n"
-                    "Or pass --dont-check-firmware-sums to use it anyway.\n",
-                    patchedDMG.c_str());
-            return false;
-        }
+    } else if (ramdiskBakeNeeded(deviceModel_, buildID_, /*dontCheckFirmwareSums=*/false)) {
+        fprintf(stderr,
+                "patchRamdisk: %s is stale — the ramdisk/ overlay has changed since this was baked.\n"
+                "Re-run this (as root) before using blackb0x against this firmware:\n"
+                "  sudo ./bake-all-ramdisks\n"
+                "Or pass --dont-check-firmware-sums to use it anyway.\n",
+                patchedDMG.c_str());
+        return false;
     }
 
     outputs_.ramdisk = patchedDMG;

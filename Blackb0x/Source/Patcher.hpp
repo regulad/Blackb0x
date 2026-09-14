@@ -53,6 +53,17 @@
 
 #include "IPSW.hpp"
 
+// Whether dist/<deviceModel>_<buildID>-Ramdisk.dmg needs a fresh bake:
+// either it doesn't exist at all yet, or (unless dontCheckFirmwareSums
+// bypasses this) its .sum sidecar doesn't match ramdiskOverlayContentHash()
+// -- the exact same two checks Patcher::patchRamdisk() itself makes before
+// trusting that file, factored out here so Cli.cpp's
+// downloadAndPatchComponents() can ask the same question up front (before a
+// device's own Patcher instance has even loaded keys for it) to decide
+// whether to kick off a background bake-all-ramdisks run. See either call
+// site's own comment for how the answer is used.
+bool ramdiskBakeNeeded(const std::string& deviceModel, const std::string& buildID, bool dontCheckFirmwareSums);
+
 struct PatchedComponents {
     std::optional<std::string> iBSS;
     std::optional<std::string> iBECDowngrade;
@@ -92,7 +103,15 @@ public:
     bool patchiBSS(const std::string& path);
     bool patchiBEC(const std::string& path, const std::string& flags = "", bool ticket = true);
     bool patchKernel(const std::string& path, const std::string& productVersion);
-    bool patchRamdisk(const std::string& path);
+    // No path parameter (unlike patchiBSS()/patchiBEC()/patchKernel() above)
+    // -- this never had one that actually did anything: it only ever looks
+    // at dist/<deviceModel_>_<buildID_>-Ramdisk.dmg, built from
+    // loadKeysForDevice()/setBuildID()'s own member variables, not from any
+    // argument. Cli.cpp's downloadAndPatchComponents() used to download
+    // RestoreRamdisk from Apple first and pass its local path in here
+    // unused -- that download has always been wasted work on this path and
+    // is no longer done at all; see its own comment for what replaced it.
+    bool patchRamdisk();
 
     // --stock-ramdisk (Cli.hpp's CliOptions): decrypts and sends the
     // RestoreRamdisk exactly as downloaded from Apple -- no /blackb0x

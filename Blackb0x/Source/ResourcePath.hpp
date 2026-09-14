@@ -46,6 +46,16 @@ std::string resolveGasterPath();
 // resolution strategy as resolveGasterPath() above.
 std::string resolvePwnPath();
 
+// Resolves the path to the `bake-all-ramdisks` binary (see CMakeLists.txt --
+// built as its own executable, landing alongside blackb0x itself; Linux-only
+// for now, see that target's own comment there): $BLACKB0X_BAKE_ALL_RAMDISKS
+// if set, otherwise "bake-all-ramdisks" alongside blackb0x's own executable,
+// same resolution strategy as resolveGasterPath()/resolvePwnPath() above.
+// Used by Cli.cpp to self-bake a missing/stale dist/ ramdisk on demand
+// instead of requiring a separate manual `sudo ./bake-all-ramdisks` step
+// first -- see canSelfBakeRamdisk() there for when that's actually attempted.
+std::string resolveBakeAllRamdisksPath();
+
 // Resolves the loose .deb root: $BLACKB0X_DEBS_DIR if set, otherwise
 // "Blackb0x/Debs" relative to the current working directory. bakeRamdisk()'s
 // stageDebcache() (BakeRamdisk.cpp) copies exactly the subset
