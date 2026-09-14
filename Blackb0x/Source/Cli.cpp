@@ -400,7 +400,8 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
                                                               const std::string& buildToRequest,
                                                               bool onlyBootComponents,
                                                               bool dontCheckFirmwareSums, bool stockRamdisk,
-                                                              bool stockRecovery, bool stockFirmware) {
+                                                              bool stockRecovery, bool stockFirmware,
+                                                              bool stockSecurom) {
     patcher.onlyBootComponents = onlyBootComponents;
     patcher.dontCheckFirmwareSums = dontCheckFirmwareSums;
 
@@ -470,7 +471,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     // --stock-firmware also implies.
     downloadAndPatch("iBSS", manifest->iBSSPath, [&](const std::string& path) {
         if (stockRecovery) {
-            patcher.useStockIBSS(path);
+            patcher.useStockIBSS(path, stockSecurom);
         } else {
             patcher.patchiBSS(path);
         }
@@ -478,7 +479,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 
     downloadAndPatch("iBEC", manifest->iBECPath, [&](const std::string& path) {
         if (stockRecovery) {
-            patcher.useStockIBEC(path);
+            patcher.useStockIBEC(path, stockSecurom);
             return;
         }
         // Verbatim version heuristic from the original setIBECPath: — iBEC
@@ -801,7 +802,8 @@ int runCli(const CliOptions& options) {
 
     auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
                                                    options.dontCheckFirmwareSums, options.stockRamdisk,
-                                                   options.stockRecovery, options.stockFirmware);
+                                                   options.stockRecovery, options.stockFirmware,
+                                                   options.stockSecurom);
     if (!components) {
         fprintf(stderr, "Failed to download/patch firmware components.\n");
         return 1;

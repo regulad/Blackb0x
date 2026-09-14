@@ -138,7 +138,22 @@ bool Patcher::patchiBSS(const std::string& path) {
 // patchiBSS()'s two *patched* outputs to keep) entirely -- there's only
 // ever one output here, the plain decrypted file, since nothing about it
 // differs by device model when unpatched.
-bool Patcher::useStockIBSS(const std::string& path) {
+bool Patcher::useStockIBSS(const std::string& path, bool stockSecurom) {
+    if (stockSecurom) {
+        // See this method's own comment in Patcher.hpp -- a genuinely
+        // un-pwned device's SecureROM verifies the img3 signature over the
+        // original encrypted bytes; decrypt()ing first (even without any
+        // patch applied) would invalidate that signature before it's ever
+        // checked.
+        fprintf(stderr,
+                "--stock-securom: sending the original downloaded iBSS untouched (still encrypted, still "
+                "img3-wrapped) -- decrypting it first would invalidate Apple's own signature before a real "
+                "SecureROM ever gets to check it.\n");
+        outputs_.iBSS = path;
+        checkPatching();
+        return true;
+    }
+
     const FirmwareKeyPair* k = keyFor("iBSS");
     if (!k) {
         fprintf(stderr, "useStockIBSS: no iBSS keys loaded\n");
@@ -214,7 +229,21 @@ bool Patcher::patchiBEC(const std::string& path, const std::string& flags, bool 
 // jailbreak boot); with no patching happening, both outputs are the exact
 // same plain decrypted file, so both PatchedComponents fields just point
 // at it.
-bool Patcher::useStockIBEC(const std::string& path) {
+bool Patcher::useStockIBEC(const std::string& path, bool stockSecurom) {
+    if (stockSecurom) {
+        // Same reasoning as useStockIBSS() above -- a stock, unpatched
+        // iBSS verifies iBEC's img3 signature the same way SecureROM
+        // verifies iBSS's, over the original encrypted bytes.
+        fprintf(stderr,
+                "--stock-securom: sending the original downloaded iBEC untouched (still encrypted, still "
+                "img3-wrapped) -- decrypting it first would invalidate Apple's own signature before a real "
+                "iBSS ever gets to check it.\n");
+        outputs_.iBECDowngrade = path;
+        outputs_.iBECBoot = path;
+        checkPatching();
+        return true;
+    }
+
     const FirmwareKeyPair* k = keyFor("iBEC");
     if (!k) {
         fprintf(stderr, "useStockIBEC: no iBEC keys loaded\n");

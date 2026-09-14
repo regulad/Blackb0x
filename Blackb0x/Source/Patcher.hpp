@@ -96,8 +96,23 @@ public:
     // blackb0x's own iBSS/iBEC patches; if it fails the same way, the
     // failure is elsewhere (ramdisk, kernelcache, devicetree, or the boot
     // trigger itself).
-    bool useStockIBSS(const std::string& path);
-    bool useStockIBEC(const std::string& path);
+    // stockSecurom (--stock-securom, Cli.hpp's CliOptions): decrypt()ing
+    // still produces a bare, decrypted, unwrapped binary (the img3
+    // container gets stripped) -- fine for the checkm8-shaped soft-DFU
+    // upload path (boot_client() in DeviceManager.cpp), which sends raw
+    // post-verification bytes since checkm8 skips SecureROM's check
+    // entirely. But sendiBSS()'s --stock-securom route sends this to a
+    // device whose SecureROM was never exploited via the *standard* DFU
+    // protocol, which hands the received bytes to SecureROM's own image
+    // loader -- that loader expects (and cryptographically verifies) a
+    // real img3 container, computed over the ORIGINAL encrypted bytes as
+    // signed by Apple. A decrypted/unwrapped binary fails that check
+    // immediately regardless of its content. So when stockSecurom is set,
+    // skip decrypt() entirely and point straight at the original
+    // downloaded file, untouched -- still encrypted, still img3-wrapped,
+    // exactly as Apple shipped and signed it.
+    bool useStockIBSS(const std::string& path, bool stockSecurom = false);
+    bool useStockIBEC(const std::string& path, bool stockSecurom = false);
 
     // --stock-firmware (Cli.hpp's CliOptions): the kernelcache half of the
     // same idea -- decrypts and sends the kernelcache exactly as
