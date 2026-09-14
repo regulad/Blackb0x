@@ -452,8 +452,26 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     std::optional<PatchedComponents> result;
     patcher.onComponentsReady = [&](const PatchedComponents& c) { result = c; };
 
-    auto downloadAndPatch = [&](const char* label, const std::string& remotePath, auto&& patchFn) {
-        if (remotePath.empty()) return;
+    // required=false for the genuinely-optional components (RestoreLogo,
+    // loaded-by-iBoot entries -- some builds' manifests just don't have
+    // them, see their own call sites below): silently skipping those is
+    // correct, expected behavior, not a bug. For every other (required)
+    // component, an empty remotePath means BuildManifest.plist itself
+    // has no Path for it at all -- a real, surprising problem
+    // (Patcher::missingRequiredComponents() would otherwise report this
+    // component as "missing" with no explanation anywhere in the output
+    // at all, since neither the download-failure nor the patch-failure
+    // branches below ever ran).
+    auto downloadAndPatch = [&](const char* label, const std::string& remotePath, auto&& patchFn,
+                                 bool required = true) {
+        if (remotePath.empty()) {
+            if (required) {
+                fprintf(stderr,
+                        "%s: BuildManifest.plist has no Path for this component -- can't download it at all.\n",
+                        label);
+            }
+            return;
+        }
         std::string localPath = workDir + "/" + fs::path(remotePath).filename().string();
         printf("Downloading %s...\n", label);
         // The underlying progress callback fires far more often than the
@@ -517,12 +535,16 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     downloadAndPatch("DeviceTree", manifest->deviceTreePath,
                       [&](const std::string& path) { patcher.setDeviceTreePath(path); });
 
-    // Only present in some builds' manifests at all (see
-    // ManifestInfo::restoreLogoPath's own comment) -- downloadAndPatch()
-    // already skips the callback entirely when the path is empty, so
-    // this is a no-op wherever it's absent.
-    downloadAndPatch("RestoreLogo", manifest->restoreLogoPath,
-                      [&](const std::string& path) { patcher.setRestoreLogoPath(path); });
+    // required=false: confirmed genuinely optional, not just "usually
+    // present" -- idevicerestore's own recovery_send_applelogo() checks
+    // build_identity_has_component() first and returns success outright
+    // if the manifest doesn't have one at all (see
+    // ManifestInfo::restoreLogoPath's own comment). downloadAndPatch()
+    // skips the callback entirely when the path is empty either way, so
+    // this is a silent no-op wherever it's absent -- correctly so here.
+    downloadAndPatch(
+        "RestoreLogo", manifest->restoreLogoPath, [&](const std::string& path) { patcher.setRestoreLogoPath(path); },
+        /*required=*/false);
 
     // Almost always empty (see ManifestInfo::loadedByIBootComponents' own
     // comment) -- one downloadAndPatch() call per manifest entry flagged
