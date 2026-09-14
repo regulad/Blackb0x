@@ -599,9 +599,11 @@ static int do_install(void) {
 }
 
 /* SecureROM/iBoot apparently clears the `auto-boot` NVRAM variable to 0
- * once a real (unsigned, DFU-pushed) payload has actually been executed —
- * meaning a plain reboot(2) after this ramdisk finishes would otherwise
- * leave the device sitting at the iBoot/DFU prompt instead of continuing
+ * once ANY payload has been executed via DFU/USB boot — signed or not,
+ * this isn't specific to unsigned/exploit payloads, just a general "a USB
+ * boot session happened" signal — meaning a plain reboot(2) after this
+ * ramdisk finishes would otherwise leave the device sitting at the
+ * iBoot/DFU prompt instead of continuing
  * into the real, already-installed OS on NAND, needing a second manual
  * boot. Setting it back to 1 right before every reboot is exactly what the
  * ssh-rd-derived rc.boot this replaced also did (see Blackb0x/Misc/README.md's
