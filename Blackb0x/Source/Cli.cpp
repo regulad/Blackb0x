@@ -106,10 +106,13 @@ void printCliUsage(const char* argv0) {
     printf("                            un-bypassed SecureROM signature enforcement --\n");
     printf("                            ERRORS if the device already reports PWND: in its\n");
     printf("                            serial string (contradicts what this flag is for),\n");
-    printf("                            instead of skipping a pwntool. Only meaningful\n");
-    printf("                            combined with --stock-recovery/--stock-firmware --\n");
-    printf("                            blackb0x's own patched content will just fail real\n");
-    printf("                            signature verification immediately otherwise.\n");
+    printf("                            instead of skipping a pwntool. iBSS gets personalized\n");
+    printf("                            with a real, ECID-bound SHSH ticket fetched from\n");
+    printf("                            Apple's TSS server before being sent (see\n");
+    printf("                            Personalize.hpp) -- REQUIRES --stock-recovery (refuses\n");
+    printf("                            to start otherwise): that ticket is only ever valid\n");
+    printf("                            for the exact, unmodified stock component, so\n");
+    printf("                            anything blackb0x has patched can never pass.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -350,18 +353,16 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
             // function would have errored out otherwise) -- skip the
             // pwntool entirely and proceed straight into the rest of the
             // boot chain, relying on the device's own real, un-bypassed
-            // SecureROM signature verification the whole way. Only
-            // meaningful combined with --stock-recovery/--stock-firmware
-            // (sending blackb0x's own patched content to a genuinely
-            // un-exploited device will just fail signature verification
-            // immediately, telling you nothing new) -- this flag itself
-            // doesn't force that, so it's on the caller to combine them.
+            // SecureROM signature verification (backed by a real,
+            // TSS-issued personalization ticket -- see
+            // Personalize.hpp/sendiBSS()'s own comments) the whole way.
+            // runCli() already hard-refuses --stock-securom without
+            // --stock-recovery before this ever runs, so there's nothing
+            // left to caveat here.
             fprintf(stderr,
                     "--stock-securom: device confirmed not already pwned -- skipping %s entirely and "
                     "proceeding into the rest of the boot chain, relying on the device's own real "
-                    "SecureROM signature verification. Only meaningful combined with --stock-recovery/"
-                    "--stock-firmware -- blackb0x's own patched content will just fail signature "
-                    "verification immediately otherwise.\n",
+                    "SecureROM signature verification.\n",
                     pwnTool.c_str());
             return true;
         }
@@ -436,6 +437,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     }
 
     patcher.loadKeysForDevice(device.deviceModel, manifest->realBuildID);
+    patcher.setBuildIdentity(manifest->buildIdentity);
 
     std::optional<PatchedComponents> result;
     patcher.onComponentsReady = [&](const PatchedComponents& c) { result = c; };
@@ -545,12 +547,14 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
 
     printf("Sending iBSS -> ");
     fflush(stdout);
-    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurom) != 0) {
+    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurom,
+                                components.buildIdentity) != 0) {
         printf("Error\n");
         fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
-                stockSecurom ? " (--stock-securom sends the original, untouched image via the standard DFU "
-                               "route -- if this still fails, it's a real signal about the image/device/"
-                               "firmware match itself, not an artifact of this tool's own delivery mechanism)"
+                stockSecurom ? " (--stock-securom personalizes the image with a real TSS-issued SHSH ticket "
+                               "before sending it via the standard DFU route -- if this still fails, it's a "
+                               "real signal about the image/device/firmware match itself, not an artifact of "
+                               "this tool's own delivery mechanism)"
                              : "");
         return false;
     }
@@ -631,6 +635,22 @@ int runCli(const CliOptions& options) {
     if (options.help) {
         printCliUsage("blackb0x");
         return 0;
+    }
+
+    // --stock-securom without --stock-recovery would send blackb0x's own
+    // PATCHED iBSS through personalizeIMG3Component() (Personalize.cpp) --
+    // the TSS ticket that fetches is only ever valid for the exact,
+    // unmodified component digest BuildManifest.plist lists, so stitching
+    // it into anything blackb0x has patched can never pass a real
+    // SecureROM's verification, regardless of how correctly everything
+    // else here behaves. Refuse outright rather than attempting (and
+    // failing) a combination that can never do anything else.
+    if (options.stockSecurom && !options.stockRecovery) {
+        fprintf(stderr,
+                "--stock-securom requires --stock-recovery: personalizing anything other than the "
+                "unmodified, stock iBSS (useStockIBSS()'s own output) against a real TSS ticket can never "
+                "pass a genuine SecureROM's signature check. Pass --stock-recovery --stock-securom together.\n");
+        return 1;
     }
 
     printf("blackb0x (regulad's portable port) — Apple TV 2/3 jailbreak tool\n");

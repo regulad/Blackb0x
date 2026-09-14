@@ -67,11 +67,13 @@ struct CliOptions {
     // proceeding -- an already-pwned device contradicts what this flag is
     // for, so silently continuing would give a meaningless result. If the
     // device is confirmed not pwned, skips the pwntool and proceeds into
-    // the rest of the boot chain regardless, relying entirely on the
-    // device's own real signature verification -- only a meaningful test
-    // combined with stockRecovery/stockFirmware above (blackb0x's own
-    // patched content will just fail that verification immediately
-    // otherwise, telling you nothing new).
+    // the rest of the boot chain, personalizing iBSS with a real,
+    // ECID-bound SHSH ticket fetched from Apple's TSS server before
+    // sending it (see Personalize.hpp/DeviceManager::sendiBSS()) --
+    // requires stockRecovery (runCli() refuses to start otherwise): that
+    // ticket is only ever valid for the exact, unmodified stock
+    // component BuildManifest.plist lists, so anything blackb0x has
+    // patched can never pass a real SecureROM's check regardless.
     bool stockSecurom = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or

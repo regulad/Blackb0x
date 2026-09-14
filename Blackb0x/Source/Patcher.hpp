@@ -45,6 +45,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -57,6 +58,13 @@ struct PatchedComponents {
     std::optional<std::string> kernel;
     std::optional<std::string> ramdisk;
     std::optional<std::string> deviceTree;
+
+    // --stock-securom (Cli.hpp's CliOptions): the matching BuildManifest.plist
+    // identity (IPSW.hpp's ManifestInfo::buildIdentity, passed through
+    // unchanged) -- sendComponentsToDevice()/DeviceManager::sendiBSS() need
+    // this to personalize iBSS with a real TSS-issued SHSH ticket. Unset
+    // (nullptr) whenever stockSecurom isn't in play.
+    std::shared_ptr<void> buildIdentity;
 };
 
 class Patcher {
@@ -162,6 +170,9 @@ public:
     bool useStockKernel(const std::string& path, bool stockRecovery = false);
 
     void setDeviceTreePath(const std::string& path);
+
+    // See PatchedComponents::buildIdentity's own comment.
+    void setBuildIdentity(std::shared_ptr<void> identity) { outputs_.buildIdentity = std::move(identity); }
 
     bool onlyBootComponents = false;
 

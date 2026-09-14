@@ -12,6 +12,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -34,6 +35,14 @@ struct ManifestInfo {
     std::string kernelCachePath;
     std::string deviceTreePath;
     std::string restoreRamdiskPath;  // empty if onlyBootComponents
+
+    // The matching BuildIdentity dict (a plist_t, type-erased as
+    // shared_ptr<void> with plist_free as its deleter so this header
+    // doesn't need <plist/plist.h> itself) -- only Personalize.cpp reads
+    // this, for --stock-securom's TSS personalization
+    // (tss_parameters_add_from_manifest() needs the raw identity dict,
+    // not just the handful of fields already pulled out above).
+    std::shared_ptr<void> buildIdentity;
 };
 
 // Parses BuildManifest.plist (already downloaded to `manifestPath`) for the

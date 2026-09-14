@@ -19,6 +19,7 @@
 //
 
 #include "DeviceManager.hpp"
+#include "Personalize.hpp"
 #include "ResourcePath.hpp"
 #include "SHAtter.h"
 
@@ -37,6 +38,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
@@ -1079,7 +1081,8 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid) {
 // sendComponentsToDevice(), which already knows exactly when each one
 // starts and what its result was) — these stay quiet on success and only
 // report genuine, otherwise-unexplained failures.
-int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool stockRecovery, bool stockSecurom) {
+int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool stockRecovery, bool stockSecurom,
+                             std::shared_ptr<void> buildIdentity) {
     irecv_client_t client = get_tv(ecid);
     if (!client) {
         return -1;
@@ -1130,7 +1133,31 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
             return -1;
         }
 
-        irecv_error_t err = irecv_send_file(client, iBSSpath.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+        // A real, un-pwned SecureROM also needs a live, ECID/nonce-bound
+        // SHSH ticket for iBSS before it will accept it at all -- see
+        // Personalize.hpp's own comment. The nonce is read here, from
+        // this same DFU-mode session, since it's what the ticket has to
+        // be bound to.
+        const struct irecv_device_info* info = irecv_get_device_info(client);
+        auto personalized = personalizeIMG3Component("iBSS", iBSSpath, buildIdentity, ecid, info->ap_nonce,
+                                                       info->ap_nonce_size);
+        if (!personalized) {
+            irecv_close(client);
+            return -1;
+        }
+
+        std::string personalizedPath = iBSSpath + ".personalized";
+        {
+            std::ofstream out(personalizedPath, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                fprintf(stderr, "sendiBSS: failed to write %s\n", personalizedPath.c_str());
+                irecv_close(client);
+                return -1;
+            }
+            out.write(reinterpret_cast<const char*>(personalized->data()), personalized->size());
+        }
+
+        irecv_error_t err = irecv_send_file(client, personalizedPath.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
         irecv_close(client);
         return (err == IRECV_E_SUCCESS) ? 0 : -1;
     }

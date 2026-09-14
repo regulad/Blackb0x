@@ -140,6 +140,37 @@ add_library(blackb0x_xpwntool STATIC
     Blackb0x/Libraries/xpwntool.c)
 target_include_directories(blackb0x_xpwntool PUBLIC Blackb0x/Libraries)
 
+# idevicerestore's own img3.c/img3.h (src/img3.c, src/img3.h at
+# libimobiledevice/idevicerestore's current HEAD), copied in nearly
+# unchanged (see the file's own header comment for the diff) — the one
+# piece --stock-securom's personalization needs that libtatsu itself
+# doesn't provide: stitching a TSS-response SHSH/ECID/CERT blob into an
+# existing img3 file's own tags (img3_stitch_component()). Kept as its
+# own small static library rather than folded into blackb0x's own
+# sources, matching cbpatcher/iboot32patcher/blackb0x_xpwntool above.
+add_library(idevicerestore_img3 STATIC
+    Blackb0x/Libraries/idevicerestore_img3.c)
+target_include_directories(idevicerestore_img3 PUBLIC Blackb0x/Libraries)
+
+# See deps::tatsu's own comment (near add_deps_imported_lib(tatsu ...)
+# below) for why this exists: a handful of libplist convenience functions
+# (plist_dict_copy_*()/plist_dict_get_bool()/plist_dict_get_uint()/
+# plist_new_int()/plist_write_to_stream()) that libtatsu.a's tss.o calls
+# but the historically-pinned libplist (deps::plist, third_party/libplist)
+# doesn't implement -- faithfully ported from libplist-modern's own
+# src/plist.c (see the file's own header comment for exactly which
+# functions and the one behavioral simplification), built entirely on
+# primitives deps::plist already has (plist_dict_get_item()/
+# plist_dict_set_item()/plist_copy()/plist_get_*_val()/etc. -- confirmed
+# unchanged across this whole version range already, per
+# libimobiledevice_glue_ext's own comment above).
+add_library(plist_compat STATIC
+    Blackb0x/Libraries/libplist_compat.c)
+# target_link_libraries(plist_compat PUBLIC deps::plist)/add_dependencies
+# happen below, near add_deps_imported_lib(plist ...) -- same
+# "target must exist first" reason as blackb0x_xpwntool's own PUBLIC xpwn
+# link a few lines up.
+
 # NOTE on provenance: Blackb0x/Libraries/xpwntool.c and libxpwntool/*.h were
 # confirmed (by direct content diff) to come from zzanehip/xpwntool-swift @
 # 58b69c595c (2020-09-13) — decrypt()'s body is byte-identical, only include
@@ -748,6 +779,43 @@ ExternalProject_Add(libirecovery_ext
     INSTALL_COMMAND make install
 )
 
+# libtatsu: libimobiledevice's own TSS (Apple signing server) request/
+# response client -- used by --stock-securom (DeviceManager.cpp's
+# sendiBSS()) to personalize a stock iBSS/iBEC with a real, ECID-bound
+# SHSH ticket before sending it, the same way idevicerestore does for a
+# genuine (non-exploited) DFU restore. Its own configure.ac
+# PKG_CHECK_MODULES for "libplist-2.0" (not the historical "libplist"
+# pkg-config name) is why this needs AUTOTOOLS_ENV_WITH_MODERN, same
+# reasoning as libirecovery_ext's own comment above -- the actual linked
+# libplist.a at blackb0x's final link step is still the historical one
+# (deps::plist), just like libimobiledevice_glue_ext.
+#
+# CPPFLAGS=-I${DEPS_MODERN_PREFIX}/include: unlike libirecovery_ext/
+# libimobiledevice_glue_ext above, libtatsu's own tss.c genuinely
+# #includes <plist/plist.h> and calls current-API functions the
+# historically-pinned libplist doesn't have (plist_dict_copy_bool(),
+# plist_write_to_stream(), etc.) -- confirmed as a real build failure
+# ("implicit declaration of function 'plist_dict_copy_bool'") without
+# this. Its own Makefile.am orders AM_CFLAGS as
+# "$(libcurl_CFLAGS) $(libplist_CFLAGS)", and libcurl_CFLAGS's
+# pkg-config-derived -I${DEPS_INCLUDE} (where curl_ext, and also the
+# HISTORICAL libplist_ext, both install) sorts before libplist_CFLAGS's
+# -I${DEPS_MODERN_PREFIX}/include -- so `#include <plist/plist.h>`
+# silently resolves to the historical, too-old header that also happens
+# to live under DEPS_INCLUDE, never reaching the modern one at all. An
+# explicit, earlier CPPFLAGS override (same shape as libfragmentzip_ext's
+# own CPPFLAGS workaround above) wins that shadowing outright.
+ExternalProject_Add(libtatsu_ext
+    DEPENDS         libplist_modern_ext curl_ext
+    SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libtatsu
+    BUILD_IN_SOURCE 1
+    CONFIGURE_COMMAND ${AUTOTOOLS_ENV_WITH_MODERN} ./autogen.sh --prefix=${DEPS_PREFIX}
+                        --enable-static --disable-shared
+                        CPPFLAGS=-I${DEPS_MODERN_PREFIX}/include
+    BUILD_COMMAND   ${AUTOTOOLS_ENV_WITH_MODERN} make -j
+    INSTALL_COMMAND make install
+)
+
 # CFLAGS/CXXFLAGS=-DCUSTOM_LOGGING: libgeneral's own include/libgeneral/
 # macros.h unconditionally #defines bare, unscoped function-like macros
 # named log/info/warning/error (its own printf-wrapper logging helpers)
@@ -813,6 +881,9 @@ function(add_deps_imported_lib name libfile)
 endfunction()
 
 add_deps_imported_lib(plist          libplist.a)
+target_link_libraries(plist_compat PUBLIC deps::plist)
+add_dependencies(plist_compat deps::plist)
+
 add_deps_imported_lib(usbmuxd        libusbmuxd.a)
 add_deps_imported_lib(imobiledevice  libimobiledevice.a)
 add_deps_imported_lib(irecovery      libirecovery-1.0.a)
@@ -859,6 +930,23 @@ add_dependencies(deps::curl curl_ext wolfssl_ext)
 # ZLIB::ZLIB, since curl is built with CURL_ZLIB=ON for gzip/deflate
 # transfer-encoding support.
 set_target_properties(deps::curl PROPERTIES INTERFACE_LINK_LIBRARIES "deps::wolfssl;ZLIB::ZLIB")
+
+add_deps_imported_lib(tatsu          libtatsu.a)
+add_dependencies(deps::tatsu libtatsu_ext)
+# Same shape as deps::curl above — libtatsu.a's own TSS-over-HTTPS
+# requests go through libcurl, so any consumer of deps::tatsu needs
+# deps::curl's own symbols (and transitively wolfssl/zlib) available too.
+# libplist_compat (see Blackb0x/Libraries/libplist_compat.c) supplies the
+# handful of newer libplist convenience functions tss.o itself calls that
+# the historically-pinned deps::plist doesn't implement — linking two
+# real copies of libplist (historical + libplist_modern_ext's -2.0
+# archive) was tried first and produces genuine duplicate-symbol link
+# errors for their shared core API (plist_new_dict()/plist_free()/etc.
+# all live in the same object file as the newer functions in both
+# archives, so there's no way to pull only the new ones) — a small,
+# faithfully-ported compat shim avoids that architecturally rather than
+# fighting it with symbol renaming.
+set_target_properties(deps::tatsu PROPERTIES INTERFACE_LINK_LIBRARIES "deps::curl;plist_compat")
 
 foreach(t plist usbmuxd imobiledevice irecovery imobiledevice_glue general fragmentzip)
     add_dependencies(deps::${t} ${t}_ext)
@@ -1208,6 +1296,7 @@ add_executable(blackb0x
     Blackb0x/Source/IPSW.cpp
     Blackb0x/Source/IPSWDownloader.cpp
     Blackb0x/Source/Patcher.cpp
+    Blackb0x/Source/Personalize.cpp
     Blackb0x/Source/ResourcePath.cpp)
 
 target_include_directories(blackb0x PRIVATE third_party/xpwn/includes)
@@ -1216,6 +1305,7 @@ target_link_libraries(blackb0x PRIVATE
     cbpatcher
     iboot32patcher
     blackb0x_xpwntool
+    idevicerestore_img3
     xpwn
     deps::irecovery
     deps::imobiledevice_glue
@@ -1223,6 +1313,7 @@ target_link_libraries(blackb0x PRIVATE
     deps::usbmuxd
     deps::plist
     deps::fragmentzip
+    deps::tatsu
     deps::general
     deps::wolfssl
     deps::usb
@@ -1278,6 +1369,7 @@ endif()
 add_dependencies(blackb0x
     libplist_ext libusbmuxd_ext libimobiledevice_ext
     libirecovery_ext libimobiledevice_glue_ext libgeneral_ext libfragmentzip_ext
+    libtatsu_ext
     wolfssl_ext libusb_ext libzip_ext curl_ext bzip2_ext libpng_ext zlib_ext)
 
 # ---------------------------------------------------------------------------

@@ -190,6 +190,10 @@ std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool 
     info.deviceTreePath = componentPath("DeviceTree");
     if (!onlyBootComponents) info.restoreRamdiskPath = componentPath("RestoreRamDisk");
 
+    // plist_copy(): `identity` is a subtree of `root`, freed below --
+    // detach an independent copy so it outlives this function.
+    info.buildIdentity = std::shared_ptr<void>(plist_copy(identity), plist_free);
+
     plist_free(root);
     return info;
 }

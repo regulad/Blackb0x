@@ -56,3 +56,6 @@
 [submodule "third_party/p0sixspwn"]
 	path = third_party/p0sixspwn
 	url = https://github.com/beiyexertz/p0sixspwn.git
+[submodule "third_party/libtatsu"]
+	path = third_party/libtatsu
+	url = https://github.com/libimobiledevice/libtatsu.git

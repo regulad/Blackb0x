@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -117,10 +118,16 @@ public:
     //     shaped around checkm8's own post-exploit memory-corruption state,
     //     not the real DFU protocol, so it has no reason to work against a
     //     device whose SecureROM was never exploited (see boot_client()'s
-    //     own comment). The standard route is at least a real attempt,
-    //     even though a genuinely un-pwned SecureROM is still free to
-    //     reject the content on signature-verification grounds.
-    int sendiBSS(const std::string& path, uint64_t ecid, bool stockRecovery = false, bool stockSecurom = false);
+    //     own comment). Before sending, the file also gets personalized
+    //     with a real, ECID/nonce-bound SHSH ticket fetched from Apple's
+    //     TSS server (see Personalize.hpp's personalizeIMG3Component()) --
+    //     a genuinely un-pwned SecureROM's signature check requires this
+    //     regardless of how correct the delivery protocol is. buildIdentity
+    //     is the matching BuildManifest.plist identity (IPSW.hpp's
+    //     ManifestInfo::buildIdentity) that personalization needs; ignored
+    //     unless stockSecurom is set.
+    int sendiBSS(const std::string& path, uint64_t ecid, bool stockRecovery = false, bool stockSecurom = false,
+                 std::shared_ptr<void> buildIdentity = nullptr);
     int sendiBEC(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
