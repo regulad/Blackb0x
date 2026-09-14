@@ -301,6 +301,22 @@ native there instead of a bolted-on Linux kernel driver:
 No code started here — this is scoping notes only, to pick up whenever
 this is prioritized.
 
+**The build system didn't enforce this scope decision until a real macOS
+build proved it needed to.** A plain `cmake --build` (no explicit target =
+build everything) tried to compile `bake-all-ramdisks` on macOS too, and
+failed for real, concrete reasons that confirm porting it is genuinely
+more than a recompile: `third_party/xpwn/includes/hfs/hfsplus.h` (vendored,
+not ours to edit) uses the `register` storage-class specifier, removed
+from the language in C++17 — GCC only warns, Clang (macOS's default) hard-
+errors; and `BakeRamdisk.cpp`'s own `st.st_atim`/`st.st_mtim` (Linux/glibc
+`struct stat` field names) don't exist on Darwin at all (BSD/macOS spells
+the same fields `st_atimespec`/`st_mtimespec`). Neither is fixed — that's
+this section's own still-not-started work — but `CMakeLists.txt` now
+wraps the whole `add_executable(bake-all-ramdisks ...)` block in
+`if(NOT APPLE)` so a plain macOS build of the rest of the project
+(`blackb0x`, `gaster`, `blackb0x-pwn`) isn't blocked by a target nobody
+had actually scoped for that platform yet.
+
 ### 4b. `blackb0x-pwn`: Blackb0x's own original checkm8/SHAtter, standalone and IOKit-only
 
 Added: a new `if(APPLE)`-gated executable target (`CMakeLists.txt`,
