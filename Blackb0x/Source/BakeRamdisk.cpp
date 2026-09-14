@@ -2544,6 +2544,33 @@ bool bakeRamdisk(const std::string& path, const std::string& key, const std::str
                   const std::string& productVersion, const std::string& outputPath,
                   const std::string& entrypointBinaryPath, bool& outSizeWarning) {
     outSizeWarning = false;
+
+    // Real root is required on BOTH platforms, for different reasons — and
+    // this needs to fail loudly up front rather than incidentally. On
+    // Linux, the loop-mount below needs CAP_SYS_ADMIN and fails with its
+    // own clear error if it isn't root (see the "are we running as root?"
+    // hint further down). On macOS there's no mount to fail on — hdiutil
+    // attach/create work fine unprivileged — but every chown() this file
+    // calls while staging content (root:wheel for most of the tree,
+    // mobile:staff for a few paths, and preserving each original file's
+    // real owner while copying the pristine ramdisk's own content) targets
+    // an arbitrary uid, which chown(2) silently refuses for a non-root
+    // caller on any POSIX system, Darwin included, without the syscall
+    // itself failing loudly. Left unchecked, that would silently bake a
+    // ramdisk with the wrong ownership instead of failing — worse than
+    // just requiring root outright.
+    if (geteuid() != 0) {
+#if defined(__APPLE__)
+        fprintf(stderr,
+                "bakeRamdisk: must run as root — chown() to root:wheel/mobile:staff (and to preserve the "
+                "original ramdisk's own file ownership) requires real root on macOS too, even though hdiutil "
+                "itself doesn't\n");
+#else
+        fprintf(stderr, "bakeRamdisk: must run as root — loop-mounting a real HFS+ image needs CAP_SYS_ADMIN\n");
+#endif
+        return false;
+    }
+
     std::string decDMG = decryptedDMGFor(path);
     const std::string& patchedDMG = outputPath;
 
