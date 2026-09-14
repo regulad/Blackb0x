@@ -2404,3 +2404,34 @@ this project's actual platform recommendation:
   confirmed-reliable way to actually run this tool's checkm8 step, despite
   Linux being the platform this project was originally, and still is,
   primarily developed on.
+
+## Real-hardware fact: the Apple TV never attempts a normal boot while USB is connected
+
+Confirmed directly on real hardware: an Apple TV 2/3 with a USB cable
+plugged in never boots normally on its own, even sitting idle outside any
+blackb0x run — it stays parked wherever DFU/Recovery/checkm8 activity last
+left it until the cable is unplugged, at which point it boots tvOS
+normally and runs fine (ruling out NAND/hardware health as an explanation
+for anything observed with USB attached). Two practical consequences:
+
+- Every boot the device performs *while connected to run blackb0x at all*
+  is therefore an abnormal one from the device's own perspective — it
+  never gets a clean software shutdown first, since blackb0x's own
+  `checkDeviceLeftRecoveryModeAfterBoot()` failure path (DeviceManager.cpp)
+  always ends with the device sitting in Recovery mode, not powered off
+  cleanly. The `[NAND] s_cxt_boot:88 sftl: error, unclean shutdown;
+  adopted N spans` line every real `sendKernelCache()`/
+  `sendStockRestoreTail()` console capture has shown so far is consistent
+  with this alone — a normal boot with the cable unplugged doesn't go
+  through this same path at all, so its presence here isn't itself
+  evidence of NAND corruption or failing hardware; don't chase it as a
+  root cause without checking whether it also happens on a genuinely
+  cable-unplugged boot (real console access would be needed to know, and
+  isn't available here anyway once the cable's out).
+- When isolating a boot failure, "unplug it, does it still boot fine
+  normally?" is a fast, real way to confirm the device itself is healthy
+  independent of whatever blackb0x is doing over USB — already used once
+  to rule out a hardware-failure theory for a persistent post-`bootx`
+  "Boot Failure Count" increment (the device booted and ran fine unplugged
+  in between blackb0x attempts, ruling out failing NAND as the cause of
+  that failure).
