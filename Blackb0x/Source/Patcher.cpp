@@ -169,7 +169,19 @@ bool Patcher::useStockIBSS(const std::string& path, bool stockSecurom) {
 
     const FirmwareKeyPair* k = keyFor("iBSS");
     if (!k) {
-        fprintf(stderr, "useStockIBSS: no iBSS keys loaded\n");
+        // --stock-recovery without --stock-securom deliberately isn't
+        // refused outright for this (see Cli.hpp's own comment on
+        // stockRecovery) -- loadKeysForDevice() already resolved "latest"
+        // to buildID_ and genuinely tried Blackb0x/ImageKeys/<device>_
+        // <buildID_>.keys for it (see keysForDevice()'s own "cannot open"
+        // line just above this one in the log); this build simply isn't
+        // one blackb0x ships local decryption keys for (it only ever
+        // pins kJailbreakTargetBuild's), not a bug. Drop a real .keys file
+        // for this build at that exact path and rerun to get past this.
+        fprintf(stderr,
+                "useStockIBSS: no iBSS keys loaded for %s %s -- this build has no Blackb0x/ImageKeys/ entry, so "
+                "the stock iBSS can't be decrypted for the checkm8/boot_client() upload path.\n",
+                deviceModel_.c_str(), buildID_.c_str());
         return false;
     }
 

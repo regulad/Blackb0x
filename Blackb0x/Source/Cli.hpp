@@ -56,6 +56,20 @@ struct CliOptions {
     // requests whatever build Apple currently signs ("latest") instead of
     // this project's own fixed jailbreak-target build -- see runCli()'s
     // buildToRequest comment.
+    //
+    // Deliberately NOT required to also carry stockSecurom: useStockIBSS()
+    // still needs a real local .keys entry to decrypt the stock iBSS for
+    // checkm8's boot_client() path when stockSecurom isn't set, and
+    // blackb0x only ever ships one for kJailbreakTargetBuild, essentially
+    // never whatever "latest" resolves to -- but that's a per-build data
+    // gap, not an incoherent combination, and it's a legitimate
+    // troubleshooting run in its own right (does checkm8 + a stock
+    // iBEC/kernel/ramdisk/ticket chain work at all, independent of
+    // whether iBSS itself is stock or blackb0x-patched). So this is left
+    // to fail at runtime with a specific "no iBSS keys loaded for <device>
+    // <build>" (Patcher::useStockIBSS()) rather than refused upfront here
+    // -- drop a real .keys file for that build under Blackb0x/ImageKeys/
+    // and rerun to get past it.
     bool stockRecovery = false;
     // Sends a stock kernelcache (see Patcher::useStockKernel()) and stock
     // ramdisk (same as stockRamdisk above) -- devicetree is already always
