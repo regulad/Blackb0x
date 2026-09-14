@@ -1102,6 +1102,22 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
         // ramdisk, kernelcache) already uses instead, so this is at least
         // a real attempt at real DFU-protocol delivery rather than one
         // that fails at the USB state-machine level regardless of content.
+        //
+        // Skipping boot_client() also means skipping its own "PWND:[" gate
+        // entirely -- but iBSS can only ever be accepted in DFU mode
+        // (Recovery-mode iBoot has no use for another iBSS), pwned or not,
+        // so that gate still needs a DFU-mode replacement here rather than
+        // no gate at all.
+        int mode = 0;
+        irecv_get_mode(client, &mode);
+        if (mode != IRECV_K_DFU_MODE) {
+            fprintf(stderr, "sendiBSS: device is not in DFU mode (currently: %s) -- iBSS can only be sent to a "
+                             "device in DFU mode.\n",
+                    mode_to_str(mode));
+            irecv_close(client);
+            return -1;
+        }
+
         irecv_error_t err = irecv_send_file(client, iBSSpath.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
         irecv_close(client);
         return (err == IRECV_E_SUCCESS) ? 0 : -1;
