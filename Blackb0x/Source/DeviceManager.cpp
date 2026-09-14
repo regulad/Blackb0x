@@ -1221,6 +1221,34 @@ int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
     return result;
 }
 
+// Reads whatever the device is currently streaming on its console/serial-
+// like interface -- the exact same mechanism `irecovery -s`'s own passive
+// read uses (irecv_receive() bulk-reads endpoint 0x81 on interface 1,
+// alternate setting 1, then switches back to interface 0 for normal DFU/
+// Recovery commands). iBoot prints its full startup banner -- including
+// "Boot Failure Count: N Panic Fail Count: N" -- here unconditionally on
+// every boot, not behind any getenv variable; this is the only way to see
+// it (confirmed: no boot-count/failure-count-shaped getenv variable
+// anywhere in libirecovery, and this exact banner is what a real
+// `irecovery -s` capture showed after a real 'bootx' attempt). Global
+// accumulator, not a lambda capture: irecv_event_cb_t's signature has no
+// user_data parameter, matching this file's own existing progress_cb
+// convention below.
+static std::string g_consoleCaptureBuffer;
+static int consoleReceivedCallback(irecv_client_t /*client*/, const irecv_event_t* event) {
+    if (event->type == IRECV_RECEIVED && event->data && event->size > 0) {
+        g_consoleCaptureBuffer.append(event->data, (size_t)event->size);
+    }
+    return 0;
+}
+static std::string captureConsoleLog(irecv_client_t client) {
+    g_consoleCaptureBuffer.clear();
+    irecv_event_subscribe(client, IRECV_RECEIVED, consoleReceivedCallback, nullptr);
+    irecv_receive(client);
+    irecv_event_unsubscribe(client, IRECV_RECEIVED);
+    return g_consoleCaptureBuffer;
+}
+
 // 'bootx' is the actual boot trigger for the whole chain (ramdisk/
 // devicetree's own commands just stage data for the kernel to use once it
 // boots) -- but sendFileThenCommand()'s own success only means the USB
@@ -1269,6 +1297,20 @@ static bool checkDeviceLeftRecoveryModeAfterBoot(uint64_t ecid) {
                 "sendKernelCache: still responding in Recovery mode after %ds. Raw mode: 0x%04x. Serial "
                 "string: %s\n",
                 i, mode, (info && info->serial_string) ? info->serial_string : "(none)");
+
+        std::string console = captureConsoleLog(check);
+        if (!console.empty()) {
+            fprintf(stderr, "sendKernelCache: console output:\n%s\n", console.c_str());
+            size_t pos = console.find("Boot Failure Count:");
+            if (pos != std::string::npos) {
+                fprintf(stderr,
+                        "sendKernelCache: *** iBoot reports a boot failure count -- this is iBoot's own "
+                        "startup banner, meaning the device actually reset and iBoot ran its own boot "
+                        "sequence again. If this count is going UP across repeated attempts with this "
+                        "same kernelcache/ramdisk/devicetree, that's strong evidence iBoot itself is "
+                        "rejecting the boot, not a fluke. ***\n");
+            }
+        }
         irecv_close(check);
     }
     fprintf(stderr,
