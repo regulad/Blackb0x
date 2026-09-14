@@ -1255,6 +1255,16 @@ int DeviceManager::sendRestoreLogo(const std::string& path, uint64_t ecid) {
         fprintf(stderr, "sendRestoreLogo: device did not reconnect for %s\n", path.c_str());
         return -1;
     }
+    // Every upload right after a successfully-acknowledged APTicket has
+    // failed so far, regardless of which component or how long we wait
+    // first -- ruling out both timing and ordering. Before guessing a
+    // fourth fix, confirm directly whether this reconnect actually landed
+    // back in real Recovery mode, or something else the transfer would
+    // legitimately fail against.
+    int mode = 0;
+    irecv_get_mode(client, &mode);
+    fprintf(stderr, "sendRestoreLogo: reconnected in mode %s (raw 0x%x) for %s\n", mode_to_str(mode), mode,
+            path.c_str());
     irecv_error_t err = irecv_send_file(client, path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
     if (err != IRECV_E_SUCCESS) {
         fprintf(stderr, "sendRestoreLogo: failed to send %s: %s\n", path.c_str(), irecv_strerror(err));
