@@ -548,10 +548,9 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
     if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurom) != 0) {
         printf("Error\n");
         fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
-                stockSecurom ? " (this failure is still plausible even via the standard DFU route: "
-                               "useStockIBSS() sends a decrypted, unsigned iBSS, and a genuinely un-pwned "
-                               "SecureROM verifies signatures against the original encrypted image, not this "
-                               "one)"
+                stockSecurom ? " (--stock-securom sends the original, untouched image via the standard DFU "
+                               "route -- if this still fails, it's a real signal about the image/device/"
+                               "firmware match itself, not an artifact of this tool's own delivery mechanism)"
                              : "");
         return false;
     }
