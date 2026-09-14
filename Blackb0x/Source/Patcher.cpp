@@ -229,38 +229,19 @@ bool Patcher::patchiBEC(const std::string& path, const std::string& flags, bool 
 // jailbreak boot); with no patching happening, both outputs are the exact
 // same plain decrypted file, so both PatchedComponents fields just point
 // at it.
-bool Patcher::useStockIBEC(const std::string& path, bool stockSecurom) {
-    if (stockSecurom) {
-        // Same reasoning as useStockIBSS() above -- a stock, unpatched
-        // iBSS verifies iBEC's img3 signature the same way SecureROM
-        // verifies iBSS's, over the original encrypted bytes.
-        fprintf(stderr,
-                "--stock-securom: sending the original downloaded iBEC untouched (still encrypted, still "
-                "img3-wrapped) -- decrypting it first would invalidate Apple's own signature before a real "
-                "iBSS ever gets to check it.\n");
-        outputs_.iBECDowngrade = path;
-        outputs_.iBECBoot = path;
-        checkPatching();
-        return true;
-    }
-
-    const FirmwareKeyPair* k = keyFor("iBEC");
-    if (!k) {
-        fprintf(stderr, "useStockIBEC: no iBEC keys loaded\n");
-        return false;
-    }
-
-    std::string outPath = outputPathFor(path);
-
+bool Patcher::useStockIBEC(const std::string& path) {
+    // See this method's own comment in Patcher.hpp -- always sent
+    // untouched, unconditionally: whichever iBSS is now running
+    // (useStockIBSS()'s own unpatched output) still has its RSA check
+    // intact and verifies iBEC's img3 signature over the original
+    // encrypted bytes, same as a real SecureROM does for iBSS.
+    // Decrypting first invalidates that signature before it's ever
+    // checked, regardless of --stock-securom.
     fprintf(stderr,
-            "--stock-recovery: decrypting the stock iBEC exactly as downloaded from Apple -- no boot-args/"
-            "KASLR/ticket-check patches applied.\n");
-
-    decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(outPath.c_str()),
-            const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE", nullptr);
-
-    outputs_.iBECDowngrade = outPath;
-    outputs_.iBECBoot = outPath;
+            "--stock-recovery: sending the original downloaded iBEC untouched (still encrypted, still "
+            "img3-wrapped) -- the stock iBSS that's now running still verifies its signature.\n");
+    outputs_.iBECDowngrade = path;
+    outputs_.iBECBoot = path;
     checkPatching();
     return true;
 }
@@ -346,7 +327,21 @@ bool Patcher::patchKernel(const std::string& path, const std::string& productVer
 // See Patcher.hpp's own comment. Same decrypt()-only pattern as
 // useStockIBSS()/useStockIBEC()/useStockRamdisk() -- no patch_kernel()
 // call at all.
-bool Patcher::useStockKernel(const std::string& path) {
+bool Patcher::useStockKernel(const std::string& path, bool stockRecovery) {
+    if (stockRecovery) {
+        // See this method's own comment in Patcher.hpp -- whichever iBEC
+        // is running (useStockIBEC()'s own unpatched output, since that's
+        // the only iBEC stockRecovery ever produces) still verifies the
+        // kernelcache's img3 signature over the original encrypted bytes.
+        fprintf(stderr,
+                "--stock-firmware --stock-recovery: sending the original downloaded kernelcache untouched "
+                "(still encrypted, still img3-wrapped) -- the stock iBEC that's now running still verifies "
+                "its signature.\n");
+        outputs_.kernel = path;
+        checkPatching();
+        return true;
+    }
+
     const FirmwareKeyPair* k = keyFor("Kernelcache");
     if (!k) {
         fprintf(stderr, "useStockKernel: no Kernelcache keys loaded\n");
@@ -449,7 +444,21 @@ bool Patcher::patchRamdisk(const std::string& path) {
 // patchiBSS()/patchiBEC() decrypt their own components, and sends that
 // straight through. This is byte-for-byte what a real, unmodified Apple
 // restore would send the device.
-bool Patcher::useStockRamdisk(const std::string& path) {
+bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
+    if (stockRecovery) {
+        // See this method's own comment in Patcher.hpp -- whichever iBEC
+        // is running (useStockIBEC()'s own unpatched output, since that's
+        // the only iBEC stockRecovery ever produces) still verifies the
+        // ramdisk's img3 signature over the original encrypted bytes.
+        fprintf(stderr,
+                "--stock-ramdisk --stock-recovery: sending the original downloaded RestoreRamdisk untouched "
+                "(still encrypted, still img3-wrapped) -- the stock iBEC that's now running still verifies "
+                "its signature.\n");
+        outputs_.ramdisk = path;
+        checkPatching();
+        return true;
+    }
+
     const FirmwareKeyPair* k = keyFor("RestoreRamdisk");
     if (!k) {
         fprintf(stderr, "useStockRamdisk: no RestoreRamdisk keys loaded\n");

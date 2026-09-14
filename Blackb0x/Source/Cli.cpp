@@ -479,7 +479,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 
     downloadAndPatch("iBEC", manifest->iBECPath, [&](const std::string& path) {
         if (stockRecovery) {
-            patcher.useStockIBEC(path, stockSecurom);
+            patcher.useStockIBEC(path);
             return;
         }
         // Verbatim version heuristic from the original setIBECPath: — iBEC
@@ -493,7 +493,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 
     downloadAndPatch("KernelCache", manifest->kernelCachePath, [&](const std::string& path) {
         if (stockFirmware) {
-            patcher.useStockKernel(path);
+            patcher.useStockKernel(path, stockRecovery);
         } else {
             patcher.patchKernel(path, manifest->productVersion);
         }
@@ -505,7 +505,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     if (!onlyBootComponents) {
         downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath, [&](const std::string& path) {
             if (stockRamdisk || stockFirmware) {
-                patcher.useStockRamdisk(path);
+                patcher.useStockRamdisk(path, stockRecovery);
             } else {
                 patcher.patchRamdisk(path);
             }
