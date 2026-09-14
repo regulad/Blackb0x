@@ -91,10 +91,14 @@ fresh clone + build, not just assumed):
 - **`ssh`** — used by `scripts/push_authorized_keys.sh` to grant yourself SSH access
   to the device once it's jailbroken; see that step below.
 - **`stdbuf`** (GNU coreutils) — **required**, not optional: `blackb0x` refuses to
-  run the `checkm8` exploit at all without it. `gaster`'s own progress output only
-  gets flushed live through `stdbuf`; without it, a stuck/hanging exploit run would
-  be silently indistinguishable from a working one, which is worse than just
-  refusing to start.
+  run the checkm8 exploit (gaster or `blackb0x-pwn`, see below) at all without it.
+  Its progress output only gets flushed live through `stdbuf`; without it, a
+  stuck/hanging exploit run would be silently indistinguishable from a working
+  one, which is worse than just refusing to start. **On macOS, Homebrew's
+  `coreutils` formula installs this prefixed as `gstdbuf`**, not plain `stdbuf`
+  (avoids shadowing the BSD toolset) — `blackb0x` looks for both names, trying
+  unprefixed `stdbuf` first, so either `brew install coreutils` alone, or also
+  opting into coreutils' "gnubin" PATH shim for the unprefixed names, works.
 
 ### checkm8 on macOS: use `--pwntool blackb0x-pwn`
 
