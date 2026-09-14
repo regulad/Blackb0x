@@ -123,12 +123,16 @@ public:
     // device to accept ANY file at all (SecureROM's own signature
     // enforcement is what checkm8 bypasses, separate from iBoot's own
     // patches these skip) -- this only changes which iBSS/iBEC content
-    // gets uploaded once pwned, not whether pwning happens. Same
-    // diagnostic purpose as useStockRamdisk() above, orthogonal to it: if
-    // the device boots a fully-stock bootloader fine, the failure is in
-    // blackb0x's own iBSS/iBEC patches; if it fails the same way, the
-    // failure is elsewhere (ramdisk, kernelcache, devicetree, or the boot
-    // trigger itself).
+    // gets uploaded once pwned, not whether pwning happens. REQUIRES
+    // --stock-firmware (Cli.cpp's runCli() refuses to start otherwise) --
+    // no longer orthogonal to useStockRamdisk() above the way it once
+    // was: the resulting stock iBEC enforces real APTicket verification
+    // on whatever it loads next, and blackb0x's own patched kernel/
+    // ramdisk can never satisfy that regardless. If the fully-stock
+    // suite boots fine, the failure is in blackb0x's own iBSS/iBEC
+    // patches; if it fails the same way, the failure is elsewhere
+    // (kernelcache/ramdisk patches, devicetree, or the boot trigger
+    // itself).
     // stockSecurom (--stock-securom, Cli.hpp's CliOptions): decrypt()ing
     // still produces a bare, decrypted, unwrapped binary (the img3
     // container gets stripped) -- fine for the checkm8-shaped soft-DFU

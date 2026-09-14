@@ -470,6 +470,10 @@ bool Patcher::patchRamdisk(const std::string& path) {
 // patchiBSS()/patchiBEC() decrypt their own components, and sends that
 // straight through. This is byte-for-byte what a real, unmodified Apple
 // restore would send the device.
+// Called for either --stock-ramdisk or --stock-firmware (see Cli.cpp's
+// downloadAndPatchComponents()) -- neither message below names a
+// specific flag, since either one (or both) could be why this is
+// running.
 bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
     if (stockRecovery) {
         // See this method's own comment in Patcher.hpp -- whichever iBEC
@@ -477,9 +481,8 @@ bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
         // the only iBEC stockRecovery ever produces) still verifies the
         // ramdisk's img3 signature over the original encrypted bytes.
         fprintf(stderr,
-                "--stock-ramdisk --stock-recovery: sending the original downloaded RestoreRamdisk untouched "
-                "(still encrypted, still img3-wrapped) -- the stock iBEC that's now running still verifies "
-                "its signature.\n");
+                "useStockRamdisk: sending the original downloaded RestoreRamdisk untouched (still encrypted, "
+                "still img3-wrapped) -- the stock iBEC that's now running still verifies its signature.\n");
         outputs_.ramdisk = path;
         checkPatching();
         return true;
@@ -494,7 +497,7 @@ bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
     std::string outPath = outputPathFor(path);
 
     fprintf(stderr,
-            "--stock-ramdisk: decrypting the stock RestoreRamdisk exactly as downloaded from Apple -- "
+            "useStockRamdisk: decrypting the stock RestoreRamdisk exactly as downloaded from Apple -- "
             "skipping the blackb0x-patched dist/ ramdisk and entrypoint.c entirely, for isolating "
             "whether a boot failure is in blackb0x's own ramdisk patching or earlier in the chain.\n");
 

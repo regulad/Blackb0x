@@ -41,24 +41,34 @@ struct CliOptions {
     // of blackb0x's own patched versions -- checkm8/pwnTool still runs
     // first (SecureROM's own signature check still needs bypassing to
     // accept any file at all), but no boot-args/KASLR/ticket-check
-    // patches get applied to the bootloader itself. Same diagnostic
-    // purpose as stockRamdisk above, orthogonal to it (see
+    // patches get applied to the bootloader itself (see
     // Patcher::useStockIBSS()/useStockIBEC()'s own comment). (Was named
     // --no-pwn; renamed to avoid colliding with the new, differently-
     // scoped --no-pwn above once that name became available.)
+    //
+    // REQUIRES stockFirmware below (runCli() refuses to start otherwise):
+    // the resulting stock iBEC still enforces real APTicket verification
+    // on whatever it loads next, checkm8 or not (patch_ticket_check()
+    // only ever runs against blackb0x's own patched iBEC), and a real
+    // ticket only ever authorizes the exact, unmodified component
+    // digests BuildManifest.plist lists -- blackb0x's own patched
+    // kernel/ramdisk can never match those. This also means stockRecovery
+    // requests whatever build Apple currently signs ("latest") instead of
+    // this project's own fixed jailbreak-target build -- see runCli()'s
+    // buildToRequest comment.
     bool stockRecovery = false;
-    // Deliberately keeps blackb0x's own patched iBSS/iBEC (does NOT imply
-    // stockRecovery above -- that's a separate, complementary test), but
-    // sends a stock kernelcache (see Patcher::useStockKernel()) and stock
+    // Sends a stock kernelcache (see Patcher::useStockKernel()) and stock
     // ramdisk (same as stockRamdisk above) -- devicetree is already always
-    // sent unmodified either way. The point: check whether blackb0x's own
-    // patched bootloader can still boot an otherwise-unmodified OS. If
-    // this boots fine, the iBSS/iBEC patches are confirmed OK and the
-    // failure is in blackb0x's own kernel/ramdisk patches specifically; if
-    // it fails the same way, the iBSS/iBEC patches themselves are
-    // implicated instead. Combine with stockRecovery for a fully-stock
-    // suite end to end (checkm8/pwnTool still runs regardless, unless
-    // noPwn above also skips it).
+    // sent unmodified either way. Meaningful alone (blackb0x's own patched
+    // iBSS/iBEC, ticket checks already bypassed there, booting an
+    // otherwise-unmodified OS -- if this boots fine, the iBSS/iBEC patches
+    // are confirmed OK and the failure is in blackb0x's own kernel/ramdisk
+    // patches specifically; if it fails the same way, the iBSS/iBEC
+    // patches themselves are implicated instead) or combined with
+    // stockRecovery above for a fully-stock suite end to end (checkm8/
+    // pwnTool still runs regardless, unless noPwn above also skips it) --
+    // stockRecovery above REQUIRES this combination specifically (see its
+    // own comment for why).
     bool stockFirmware = false;
     // Like noPwn above (never attempt to run a pwntool), but for the
     // opposite scenario: a genuinely un-exploited device, still running
@@ -70,10 +80,12 @@ struct CliOptions {
     // the rest of the boot chain, personalizing iBSS with a real,
     // ECID-bound SHSH ticket fetched from Apple's TSS server before
     // sending it (see Personalize.hpp/DeviceManager::sendiBSS()) --
-    // requires stockRecovery (runCli() refuses to start otherwise): that
-    // ticket is only ever valid for the exact, unmodified stock
-    // component BuildManifest.plist lists, so anything blackb0x has
-    // patched can never pass a real SecureROM's check regardless.
+    // REQUIRES both stockRecovery and stockFirmware (runCli() refuses to
+    // start otherwise): that ticket (and the combined APTicket
+    // DeviceManager::sendStockRestoreTail() sends afterward) is only ever
+    // valid for the exact, unmodified stock components BuildManifest.plist
+    // lists, so anything blackb0x has patched can never pass a real
+    // SecureROM/iBEC's check regardless.
     bool stockSecurom = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or

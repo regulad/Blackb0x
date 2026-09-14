@@ -86,21 +86,28 @@ void printCliUsage(const char* argv0) {
     printf("                            no boot-args/KASLR/ticket-check patches applied\n");
     printf("                            to the bootloader itself) -- to check whether a\n");
     printf("                            boot failure is in blackb0x's own iBSS/iBEC\n");
-    printf("                            patches or elsewhere in the chain. The device\n");
-    printf("                            will NOT be jailbroken by a run using this flag.\n");
-    printf("  --stock-firmware          DIAGNOSTIC: keep blackb0x's own patched\n");
-    printf("                            iBSS/iBEC, but send a stock kernelcache (no\n");
+    printf("                            patches or elsewhere in the chain. REQUIRES\n");
+    printf("                            --stock-firmware (refuses to start otherwise): the\n");
+    printf("                            resulting stock iBEC still enforces real APTicket\n");
+    printf("                            verification on whatever it loads next, and a real\n");
+    printf("                            ticket can never authorize blackb0x's own patched\n");
+    printf("                            kernel/ramdisk. The device will NOT be jailbroken\n");
+    printf("                            by a run using this flag.\n");
+    printf("  --stock-firmware          DIAGNOSTIC: send a stock kernelcache (no\n");
     printf("                            tfp0/AMFI/sandbox patches) and stock ramdisk\n");
-    printf("                            (same as --stock-ramdisk) -- to check whether\n");
-    printf("                            blackb0x's own patched bootloader can still\n");
-    printf("                            boot an otherwise-unmodified OS. If this boots\n");
-    printf("                            fine, the iBSS/iBEC patches are confirmed OK\n");
+    printf("                            (same as --stock-ramdisk) -- meaningful alone\n");
+    printf("                            (keeps blackb0x's own patched iBSS/iBEC) to check\n");
+    printf("                            whether blackb0x's own patched bootloader can\n");
+    printf("                            still boot an otherwise-unmodified OS: if this\n");
+    printf("                            boots fine, the iBSS/iBEC patches are confirmed OK\n");
     printf("                            and the failure is in blackb0x's own kernel/\n");
-    printf("                            ramdisk patches specifically; if it fails the\n");
-    printf("                            same way, the iBSS/iBEC patches themselves are\n");
-    printf("                            implicated. Combine with --stock-recovery for a\n");
-    printf("                            fully-stock suite end to end. The device will\n");
-    printf("                            NOT be jailbroken by a run using this flag.\n");
+    printf("                            ramdisk patches specifically; if it fails the same\n");
+    printf("                            way, the iBSS/iBEC patches themselves are\n");
+    printf("                            implicated. Also required alongside\n");
+    printf("                            --stock-recovery for a fully-stock suite end to\n");
+    printf("                            end (see that flag's own entry for why). The\n");
+    printf("                            device will NOT be jailbroken by a run using this\n");
+    printf("                            flag.\n");
     printf("  --stock-securom           DIAGNOSTIC: never attempt to run a pwntool, for a\n");
     printf("                            genuinely un-exploited device still running real,\n");
     printf("                            un-bypassed SecureROM signature enforcement --\n");
@@ -108,11 +115,13 @@ void printCliUsage(const char* argv0) {
     printf("                            serial string (contradicts what this flag is for),\n");
     printf("                            instead of skipping a pwntool. iBSS gets personalized\n");
     printf("                            with a real, ECID-bound SHSH ticket fetched from\n");
-    printf("                            Apple's TSS server before being sent (see\n");
-    printf("                            Personalize.hpp) -- REQUIRES --stock-recovery (refuses\n");
-    printf("                            to start otherwise): that ticket is only ever valid\n");
-    printf("                            for the exact, unmodified stock component, so\n");
-    printf("                            anything blackb0x has patched can never pass.\n");
+    printf("                            Apple's TSS server before being sent, and a combined\n");
+    printf("                            APTicket covering everything after it (see\n");
+    printf("                            Personalize.hpp) -- REQUIRES both --stock-recovery\n");
+    printf("                            and --stock-firmware (refuses to start otherwise):\n");
+    printf("                            those tickets are only ever valid for the exact,\n");
+    printf("                            unmodified stock components, so anything blackb0x\n");
+    printf("                            has patched can never pass.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -467,11 +476,14 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     };
 
     // stockRecovery, not stockFirmware, gates iBSS/iBEC: --stock-firmware
-    // deliberately keeps blackb0x's own patched bootloader and only stocks
-    // the kernel/ramdisk it hands off to (see that flag's own comment in
-    // Cli.hpp) -- --stock-recovery is the complementary test (stock
-    // bootloader, blackb0x's own patched kernel/ramdisk), not something
-    // --stock-firmware also implies.
+    // alone deliberately keeps blackb0x's own patched bootloader and only
+    // stocks the kernel/ramdisk it hands off to (see that flag's own
+    // comment in Cli.hpp). --stock-recovery is the complementary test
+    // (stock bootloader too) -- runCli() requires --stock-firmware
+    // alongside it (a stock bootloader's own real APTicket verification
+    // can never authorize blackb0x's own patched kernel/ramdisk), so in
+    // practice --stock-recovery never appears here without
+    // --stock-firmware also stocking the rest of the suite.
     downloadAndPatch("iBSS", manifest->iBSSPath, [&](const std::string& path) {
         if (stockRecovery) {
             patcher.useStockIBSS(path, stockSecurom);
@@ -711,13 +723,47 @@ int runCli(const CliOptions& options) {
     // unmodified component digest BuildManifest.plist lists, so stitching
     // it into anything blackb0x has patched can never pass a real
     // SecureROM's verification, regardless of how correctly everything
-    // else here behaves. Refuse outright rather than attempting (and
-    // failing) a combination that can never do anything else.
-    if (options.stockSecurom && !options.stockRecovery) {
+    // else here behaves. Same reasoning transitively requires
+    // --stock-firmware too (see that check just below) -- checked
+    // directly here as well, rather than only relying on that second
+    // check to catch it, so this specific combination gets a message
+    // that actually names --stock-securom as the reason. Refuse outright
+    // rather than attempting (and failing) a combination that can never
+    // do anything else.
+    if (options.stockSecurom && !(options.stockRecovery && options.stockFirmware)) {
         fprintf(stderr,
-                "--stock-securom requires --stock-recovery: personalizing anything other than the "
-                "unmodified, stock iBSS (useStockIBSS()'s own output) against a real TSS ticket can never "
-                "pass a genuine SecureROM's signature check. Pass --stock-recovery --stock-securom together.\n");
+                "--stock-securom requires both --stock-recovery and --stock-firmware: personalizing "
+                "anything other than the unmodified, stock iBSS/iBEC/kernel/ramdisk against a real TSS "
+                "ticket can never pass a genuine SecureROM's signature check. Pass --stock-recovery "
+                "--stock-firmware --stock-securom together.\n");
+        return 1;
+    }
+
+    // --stock-recovery's own stock iBEC (useStockIBEC(), never patched --
+    // patch_ticket_check() only ever runs against blackb0x's own patched
+    // iBEC) enforces real APTicket verification on whatever it loads
+    // next, checkm8 or not (see DeviceManager::sendStockRestoreTail()'s
+    // own comment). A real APTicket only ever authorizes the exact,
+    // unmodified component digests BuildManifest.plist lists -- blackb0x's
+    // own patched kernel/ramdisk (patchKernel()/patchRamdisk(), what
+    // --stock-recovery without --stock-firmware would still send) have
+    // different digests by definition, so a stock iBEC can never accept
+    // them regardless of which build gets requested. Refuse outright
+    // rather than attempting (and failing) a combination that can never
+    // do anything else -- this also sidesteps a real, previously-silent
+    // failure mode: --stock-recovery alone still points buildToRequest at
+    // "latest" (needed for the ticket itself), but patchKernel()/
+    // patchRamdisk() have zero support for whatever build that resolves
+    // to (no Blackb0x/ImageKeys/ entry, no baked dist/ ramdisk), so they
+    // fail with no output component set at all, surfacing several layers
+    // away as a generic "Not all required components patched
+    // successfully".
+    if (options.stockRecovery && !options.stockFirmware) {
+        fprintf(stderr,
+                "--stock-recovery requires --stock-firmware: a stock iBEC verifies a real APTicket against "
+                "the exact, unmodified component digests BuildManifest.plist lists, and blackb0x's own "
+                "patched kernel/ramdisk can never match those regardless of which build gets requested. Pass "
+                "--stock-recovery --stock-firmware together.\n");
         return 1;
     }
 
