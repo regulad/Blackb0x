@@ -1111,6 +1111,7 @@ int runCli(const CliOptions& options) {
 
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
+    printf("Targeting %s %s for this run.\n", device.deviceModel.c_str(), buildToRequest.c_str());
     // Both --stock-securerom (real SecureROM, no checkm8) AND --stock-recovery
     // (real, unpatched iBEC via useStockIBEC() -- patch_ticket_check()
     // never runs against it, checkm8 or not) need a build the device's
