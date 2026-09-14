@@ -561,6 +561,7 @@ int patch_kaslr(struct iboot_img *iboot_in)
         printf("%s: Patching KASLR BNE at %p...\n", __FUNCTION__, GET_IBOOT_FILE_OFFSET(iboot_in, bne));
 
         *(uint16_t *)bne = bswap16(0x00bf); //NOP out.
+        return 1;
     }
     else if (os_vers == 7)
     {
@@ -580,6 +581,7 @@ int patch_kaslr(struct iboot_img *iboot_in)
         }
         printf("%s: Patching KASLR BEQ at %p...\n", __FUNCTION__, GET_IBOOT_FILE_OFFSET(iboot_in, beq));
         *(unsigned char *)beq = 0xe0; //Change D0 to E0 resulting in BEQ -> B.
+        return 1;
     }
     else if (os_vers == 8)
     {
@@ -599,6 +601,7 @@ int patch_kaslr(struct iboot_img *iboot_in)
         }
         printf("%s: Patching KASLR BEQ at %p...\n", __FUNCTION__, GET_IBOOT_FILE_OFFSET(iboot_in, beq));
         *(unsigned char *)beq = 0xe0; //Change D0 to E0 resulting in BEQ -> B.
+        return 1;
     }
     else if (os_vers == 9) {
         printf("%s: Entering...\n", __FUNCTION__);
@@ -614,7 +617,18 @@ int patch_kaslr(struct iboot_img *iboot_in)
         *(unsigned char *)it = 0x00; //NOP out (Thanks @JonathanSeals for iOS 9).
         printf("%s: Patching MOV at %p...\n", __FUNCTION__, GET_IBOOT_FILE_OFFSET(iboot_in, it));
         *(uint32_t *)kaslr_search = bswap32(0x002100bf); //Change 4FF00451 to 002100BF resulting in MOV -> MOV NOP;
+        return 1;
     }
+    // Unrecognized os_vers: nothing patched, not success. (Every branch
+    // above that actually applies its patch now has its own explicit
+    // return 1 -- falling off the end of a non-void function without one
+    // is undefined behavior, and this used to do exactly that for every
+    // *successful* patch in every branch, not just this fallthrough case.
+    // Confirmed as a real, architecture-dependent bug, not theoretical:
+    // the garbage return value happened to read back non-zero on x86_64,
+    // masking it there, but 0 on arm64, which made a real macOS run treat
+    // a successfully-applied KASLR patch as a hard failure.)
+    return 0;
 }
 
 int patch_bgcolor(struct iboot_img *iboot_in, const char *bgcolor)
