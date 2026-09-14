@@ -88,6 +88,15 @@ std::string resolvePwnPath() {
     return "blackb0x-pwn";
 }
 
+std::string resolveBakeAllRamdisksPath() {
+    if (const char* override_ = getenv("BLACKB0X_BAKE_ALL_RAMDISKS")) {
+        return std::string(override_);
+    }
+    std::string dir = resolveOwnExecutableDir();
+    if (!dir.empty()) return dir + "/bake-all-ramdisks";
+    return "bake-all-ramdisks";
+}
+
 std::string resolveDebsPath() {
     if (const char* override_ = getenv("BLACKB0X_DEBS_DIR")) {
         return std::string(override_);

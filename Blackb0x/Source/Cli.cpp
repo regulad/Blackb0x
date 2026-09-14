@@ -27,6 +27,7 @@ extern "C" {
 }
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,9 @@ extern "C" {
 #include <set>
 #include <thread>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -396,6 +400,58 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
 // Firmware download + patch
 // ---------------------------------------------------------------------------
 
+// Whether this process could actually run bake-all-ramdisks itself right
+// now, on demand, if it turns out a device needs a dist/ ramdisk that isn't
+// baked (or is stale) yet — used both by runCli()'s upfront dist/
+// emptiness check and by downloadAndPatchComponents() below to decide
+// whether to spawn a background bake at all. On Linux, self-baking loop-
+// mounts a real HFS+ image (BakeRamdisk.cpp), which genuinely needs
+// CAP_SYS_ADMIN — real root, not just a udev-granted device permission the
+// way ordinary DFU/Recovery USB access can be (see runCli()'s own comment
+// on that). On macOS, a parallel work stream is dropping that requirement
+// entirely (native hdiutil, no loop-mount, no root) — self-baking is
+// unconditionally available there once that lands.
+#if defined(__APPLE__)
+static bool canSelfBakeRamdisk() { return true; }
+#else
+static bool canSelfBakeRamdisk() { return geteuid() == 0; }
+#endif
+
+// Non-blocking spawn of `bake-all-ramdisks --device <deviceModel> --build
+// <buildID>` for exactly the one (device, firmware) combination this run
+// needs — returns the child's pid immediately without waiting for it to
+// exit. Unlike DeviceManager.cpp's runLineBufferedSubprocess() (blocking:
+// spawns, streams output, and waits for the child before returning), this
+// needs to let the rest of downloadAndPatchComponents() keep running
+// concurrently with the bake — see that function's own call site for why.
+// The caller waitpid()s the returned pid later, at the actual join point.
+// Returns -1 only if fork() itself failed (reported here); a bad exec
+// (e.g. bake-all-ramdisks not found alongside blackb0x) instead surfaces
+// as an ordinary nonzero exit status once the caller waits on it, same as
+// any other missing-binary failure elsewhere in this codebase.
+static pid_t spawnBakeAllRamdisksBackground(const std::string& deviceModel, const std::string& buildID) {
+    std::string binPath = resolveBakeAllRamdisksPath();
+    std::vector<std::string> argvStrings = {binPath, "--device", deviceModel, "--build", buildID};
+    std::vector<char*> cargv;
+    cargv.reserve(argvStrings.size() + 1);
+    for (auto& a : argvStrings) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "Failed to fork() for a background bake-all-ramdisks run: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        execvp(binPath.c_str(), cargv.data());
+        // Only reached if exec itself failed (binary missing/not
+        // executable) — no fallback, the parent's later waitpid() will see
+        // this as a normal nonzero exit.
+        _exit(127);
+    }
+    return pid;
+}
+
 // ManifestInfo / parseManifest() now live in IPSW.hpp/.cpp — shared with
 // bake-all-ramdisks (BakeAllRamdisks.cpp), which needs the exact same
 // BuildManifest.plist parsing to locate RestoreRamDisk across every known
@@ -449,6 +505,41 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     patcher.loadKeysForDevice(device.deviceModel, manifest->realBuildID);
     patcher.setBuildIdentity(manifest->buildIdentity);
     patcher.setBuildID(manifest->realBuildID);
+
+    // On the real jailbreak path (not onlyBootComponents' tether-boot, and
+    // not stockRamdisk/stockFirmware's diagnostic routes below, which still
+    // need a real download+decrypt of RestoreRamdisk via useStockRamdisk()),
+    // patcher.patchRamdisk() below never actually reads a downloaded
+    // RestoreRamdisk at all -- it only ever looks at
+    // dist/<deviceModel>_<buildID>-Ramdisk.dmg (see its own comment in
+    // Patcher.cpp). Downloading RestoreRamdisk from Apple's servers for
+    // this path has therefore always been wasted work; it's skipped
+    // entirely now (see the RestoreRamdisk dispatch near the end of this
+    // function). Instead, check as early as possible -- right here, before
+    // any of the iBSS/iBEC/KernelCache/DeviceTree/RestoreLogo downloads
+    // below -- whether a fresh bake is actually needed for this exact
+    // (device, firmware) tuple, and if canSelfBakeRamdisk() says it's safe,
+    // kick one off in the background right now. That lets it run
+    // concurrently with this function's own remaining downloads/patches
+    // instead of blocking them -- backgroundBakePid is only waitpid()'d
+    // much later, at the point RestoreRamdisk would previously have been
+    // dispatched, by which point it's had this entire function's remaining
+    // wall-clock time to finish.
+    bool needsRealRamdisk = !onlyBootComponents && !stockRamdisk && !stockFirmware;
+    pid_t backgroundBakePid = -1;
+    if (needsRealRamdisk && ramdiskBakeNeeded(device.deviceModel, manifest->realBuildID, dontCheckFirmwareSums)) {
+        if (canSelfBakeRamdisk()) {
+            printf(
+                "No up-to-date baked ramdisk for %s %s -- building it now in the background while the rest of "
+                "this run continues.\n",
+                device.deviceModel.c_str(), manifest->realBuildID.c_str());
+            fflush(stdout);
+            backgroundBakePid = spawnBakeAllRamdisksBackground(device.deviceModel, manifest->realBuildID);
+        }
+        // Else: not safe to self-bake here (non-root on Linux) -- leave it
+        // to patcher.patchRamdisk()'s own existing dist/-missing hard-exit
+        // later, unchanged. Nothing to spawn.
+    }
 
     std::optional<PatchedComponents> result;
     patcher.onComponentsReady = [&](const PatchedComponents& c) { result = c; };
@@ -557,13 +648,49 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     }
 
     if (!onlyBootComponents) {
-        downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath, [&](const std::string& path) {
-            if (stockRamdisk || stockFirmware) {
-                patcher.useStockRamdisk(path, stockRecovery);
-            } else {
-                patcher.patchRamdisk(path);
+        if (stockRamdisk || stockFirmware) {
+            // Diagnostic routes: useStockRamdisk() genuinely needs the
+            // downloaded file (see its own comment) -- unchanged from
+            // before.
+            downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath,
+                              [&](const std::string& path) { patcher.useStockRamdisk(path, stockRecovery); });
+        } else {
+            // Real jailbreak path: nothing to download here at all (see the
+            // comment above where backgroundBakePid was set, right after
+            // this build's manifest was parsed). Join the background bake
+            // now, if one was started -- this is the actual join point: by
+            // now it's had this whole function's remaining download/patch
+            // pipeline as concurrent wall-clock time to finish, so this
+            // wait is often brief or immediate.
+            if (backgroundBakePid > 0) {
+                printf("Waiting for the background bake-all-ramdisks run (pid %d) to finish...\n",
+                       (int)backgroundBakePid);
+                fflush(stdout);
+                int status = 0;
+                if (waitpid(backgroundBakePid, &status, 0) < 0) {
+                    fprintf(stderr, "Failed to wait for background bake-all-ramdisks (pid %d): %s\n",
+                            (int)backgroundBakePid, strerror(errno));
+                } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    // Not necessarily fatal here -- patcher.patchRamdisk()
+                    // right below does its own authoritative dist/
+                    // existence + staleness check and will produce the
+                    // real error/exit behavior if this genuinely didn't
+                    // produce what's needed. Still worth surfacing loudly
+                    // rather than swallowing, since a silent background
+                    // failure would otherwise be indistinguishable from
+                    // "nothing was needed" until that later check fires.
+                    std::string how = WIFEXITED(status) ? ("exit code " + std::to_string(WEXITSTATUS(status)))
+                                                          : std::string("killed/crashed");
+                    fprintf(stderr,
+                            "Background bake-all-ramdisks did not finish successfully (%s) -- continuing; the "
+                            "next step will fail clearly if it genuinely didn't produce what this run needs.\n",
+                            how.c_str());
+                } else {
+                    printf("Background bake-all-ramdisks finished successfully.\n");
+                }
             }
-        });
+            patcher.patchRamdisk();
+        }
     }
 
     if (!result) {
@@ -821,12 +948,20 @@ int runCli(const CliOptions& options) {
     // own device-open calls are what actually surface a real permission
     // error, with a real errno behind it, if access genuinely isn't there.
 
-    // Nothing this tool can ever do succeeds without at least one baked
-    // ramdisk sitting in dist/ — patchRamdisk() (Patcher.cpp) checks for a
-    // specific device+firmware's own entry once a device is actually
-    // connected, but an entirely empty dist/ means bake-all-ramdisks was
-    // simply never run at all, which is worth failing on immediately
-    // rather than waiting for a device to show up first.
+    // Nothing this tool can ever do succeeds without a baked ramdisk sitting
+    // in dist/ for whichever specific device+firmware turns out to be
+    // needed — patchRamdisk() (Patcher.cpp) checks for that specific entry
+    // once a device is actually connected and its firmware is known. An
+    // entirely empty dist/ here used to always mean bake-all-ramdisks was
+    // simply never run at all, worth failing on immediately rather than
+    // waiting for a device to show up first — but that's no longer strictly
+    // true: if canSelfBakeRamdisk() says this process can bake one itself
+    // (see its own comment), an empty dist/ is recoverable on demand later
+    // (downloadAndPatchComponents() in this file bakes exactly the one
+    // tuple actually needed, once a device is connected and its firmware
+    // resolved), so there's nothing to fail on yet. Only hard-exit here
+    // when self-baking genuinely isn't possible (non-root on Linux) --
+    // failing fast with this same clear message is still correct then.
     {
         bool haveAnyRamdisk = false;
         std::error_code ec;
@@ -840,11 +975,17 @@ int runCli(const CliOptions& options) {
             }
         }
         if (!haveAnyRamdisk) {
-            fprintf(stderr,
-                    "blackb0x: dist/ has no baked ramdisks at all. Run this once (as root) before using\n"
-                    "blackb0x against any device:\n"
-                    "  sudo ./bake-all-ramdisks\n");
-            return 1;
+            if (!canSelfBakeRamdisk()) {
+                fprintf(stderr,
+                        "blackb0x: dist/ has no baked ramdisks at all. Run this once (as root) before using\n"
+                        "blackb0x against any device:\n"
+                        "  sudo ./bake-all-ramdisks\n");
+                return 1;
+            }
+            printf(
+                "dist/ has no baked ramdisks yet -- will bake whatever this run specifically needs on demand "
+                "once a device is connected and its firmware build is known.\n");
+            fflush(stdout);
         }
     }
 
