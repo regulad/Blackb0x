@@ -60,6 +60,7 @@ static const char* mode_to_str(int mode);
 static int send_data(irecv_client_t client, unsigned char* data, size_t size);
 static bool commandExistsOnPath(const char* name);
 static int runGaster(const std::vector<std::string>& args, int timeoutSeconds = 0);
+static int runBlackb0xPwn(const std::vector<std::string>& args, int timeoutSeconds = 0);
 static int boot_client(irecv_client_t client, void* buf, size_t sz);
 static int check_img3_file_format(irecv_client_t client, void* file, size_t sz, void** out, size_t* outsz);
 static int sendiBSS_ATV31(uint64_t ecid, const char* iBSSpath);
@@ -409,35 +410,40 @@ static std::string resolveStdbufBinary() {
 // grace period, diagnoses+reports a D-state explicitly if it's still
 // there, and moves on regardless — leaving the child to be reaped
 // whenever/if the kernel call it's stuck in ever actually returns.
-static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
-    // Prefixed with `stdbuf -oL -eL`: glibc's stdio only line-buffers
-    // stdout/stderr when they're attached to a terminal — attached to a
-    // pipe (exactly what this function does below), it silently switches
-    // to full block buffering instead, and gaster.c never calls
-    // setvbuf()/fflush() itself. Confirmed directly: a short-lived gaster
-    // invocation (no args, prints usage then exits) shows its output fine
-    // either way, since exit() flushes stdio regardless — but a `gaster
-    // pwn` that runs for a long time before ever exiting (exactly the
-    // "stuck" scenario this timeout/D-state handling exists for) would
-    // never flush its "Stage: RESET"/"Stage: SETUP"/etc. progress lines to
-    // the pipe at all, making the live-streaming above silently useless for
-    // the one case it actually matters for. `stdbuf` (GNU coreutils,
-    // LD_PRELOADs a constructor that calls setvbuf() before gaster's own
-    // main() runs) fixes this without needing to fork gaster.c just to add
-    // a setvbuf() call.
-    //
-    // Treated as a hard requirement, not a nice-to-have: an earlier version
-    // of this function fell back to running gaster unbuffered if stdbuf
-    // wasn't found, which silently reintroduces exactly the "blind the
-    // whole time" blind spot documented in docs/HISTORY.md — the one this
-    // whole mechanism exists to fix, and precisely when it would matter
-    // most (a stuck/hanging exploit run). Fail loudly and immediately
-    // instead, before ever forking gaster.
+// Shared by runGaster()/runBlackb0xPwn() below: spawns binaryPath with
+// args, streaming stdout/stderr live via the same stdbuf/timeout/D-state
+// machinery either way. toolName is used only in diagnostic messages.
+//
+// Prefixed with `stdbuf -oL -eL`: glibc's (and Darwin libc's) stdio only
+// line-buffers stdout/stderr when they're attached to a terminal —
+// attached to a pipe (exactly what this function does below), it
+// silently switches to full block buffering instead, and neither
+// gaster.c nor blackb0x-pwn's own main.c/Checkm8Pwn.c ever call
+// setvbuf()/fflush() themselves. Confirmed directly: a short-lived
+// invocation (no args, prints usage then exits) shows its output fine
+// either way, since exit() flushes stdio regardless — but a long-running
+// exploit attempt that never exits until it's done (exactly the "stuck"
+// scenario this timeout/D-state handling exists for) would never flush
+// its progress lines to the pipe at all, making the live-streaming below
+// silently useless for the one case it actually matters for. `stdbuf`
+// (GNU coreutils, LD_PRELOADs a constructor that calls setvbuf() before
+// the child's own main() runs) fixes this without needing to patch
+// either child just to add a setvbuf() call.
+//
+// Treated as a hard requirement, not a nice-to-have: an earlier version
+// of this function fell back to running unbuffered if stdbuf wasn't
+// found, which silently reintroduces exactly the "blind the whole time"
+// blind spot documented in docs/HISTORY.md — the one this whole
+// mechanism exists to fix, and precisely when it would matter most (a
+// stuck/hanging exploit run). Fail loudly and immediately instead,
+// before ever forking the child.
+static int runLineBufferedSubprocess(const std::string& binaryPath, const std::vector<std::string>& args,
+                                      int timeoutSeconds, const char* toolName) {
     std::string stdbufBin = resolveStdbufBinary();
     if (stdbufBin.empty()) {
         fprintf(stderr,
                 "checkm8: `stdbuf` (GNU coreutils) is required but not found on PATH -- "
-                "without it, gaster's exploit progress can't be streamed live, which makes "
+                "without it, %s's exploit progress can't be streamed live, which makes "
                 "a stuck/hanging run indistinguishable from a silently-working one. "
 #if defined(__APPLE__)
                 "Install it with `brew install coreutils` (this program looks for both the "
@@ -445,10 +451,10 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
 #else
                 "Install coreutils and try again.\n"
 #endif
-        );
+                , toolName);
         return -1;
     }
-    std::vector<std::string> argvStrings = { stdbufBin, "-oL", "-eL", resolveGasterPath() };
+    std::vector<std::string> argvStrings = { stdbufBin, "-oL", "-eL", binaryPath };
     argvStrings.insert(argvStrings.end(), args.begin(), args.end());
     std::vector<char*> cargv;
     cargv.reserve(argvStrings.size() + 1);
@@ -532,14 +538,14 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
         if (!reaped) {
             if (isUninterruptible(pid)) {
                 fprintf(stderr,
-                        "checkm8: gaster (pid %d) is stuck in an uninterruptible kernel USB "
+                        "checkm8: %s (pid %d) is stuck in an uninterruptible kernel USB "
                         "wait and can't be killed by software. It will keep running in the "
                         "background until whatever syscall it's blocked in returns on its own "
                         "-- this usually needs the Apple TV physically unplugged from USB to "
                         "clear. Continuing without waiting for it further.\n",
-                        (int)pid);
+                        toolName, (int)pid);
             } else {
-                fprintf(stderr, "checkm8: gaster (pid %d) did not exit after SIGKILL.\n", (int)pid);
+                fprintf(stderr, "checkm8: %s (pid %d) did not exit after SIGKILL.\n", toolName, (int)pid);
             }
         }
     }
@@ -551,6 +557,20 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
     if (timedOut) return -2;
     if (!WIFEXITED(status)) return -1;
     return WEXITSTATUS(status);
+}
+
+static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
+    return runLineBufferedSubprocess(resolveGasterPath(), args, timeoutSeconds, "gaster");
+}
+
+// blackb0x-pwn only exists on Apple platforms (see CMakeLists.txt's
+// if(APPLE) block) -- this function is still compiled everywhere so
+// checkm8Attempt() below doesn't need its own #ifdef, but is only ever
+// actually called when pwnTool == "blackb0x-pwn", which the CLI only ever
+// sets on Apple (Cli.hpp's CliOptions::pwnTool default, --pwntool's
+// argument validation in Cli.cpp).
+static int runBlackb0xPwn(const std::vector<std::string>& args, int timeoutSeconds) {
+    return runLineBufferedSubprocess(resolvePwnPath(), args, timeoutSeconds, "blackb0x-pwn");
 }
 
 // The low-level USB request sequence/payload/timing that used to live
@@ -572,25 +592,25 @@ static int runGaster(const std::vector<std::string>& args, int timeoutSeconds) {
 // status, but that's still worth confirming independently before handing
 // control back to the rest of this project's own boot-chain code
 // (sendiBSS/sendiBEC/etc., all unchanged).
-bool DeviceManager::checkm8Attempt(uint64_t ecid) {
+bool DeviceManager::checkm8Attempt(uint64_t ecid, const std::string& pwnTool) {
     auto status = [this](const char* s) { if (sink_.onStatus) sink_.onStatus(s); };
     auto progress = [this](double p) { if (sink_.onProgress) sink_.onProgress(p); };
 
-    // The device may already be sitting in pwned DFU before gaster is ever
-    // invoked: checkm8()'s own retry loop calling this function again, a
-    // previous CLI run that got killed/crashed after gaster's pwn actually
-    // succeeded but before this function's own post-pwn verification ran,
-    // or gaster itself finishing the pwn in the background after this
-    // project gave up waiting on it (see runGaster()'s timeout/D-state
-    // handling above — this is exactly the scenario that produces:
-    // confirmed live, a `gaster pwn` stuck past its own timeout while the
-    // device had, per this same check, already rebooted into pwned DFU).
-    // Re-running the exploit against an already-pwned device is pointless
-    // at best; check first, quickly (get_tv(), not get_tv_patient() — if
-    // it's not there within get_tv()'s own short default, it's almost
-    // certainly not already pwned and yet-unconnected, not worth 30
-    // seconds of patience just to rule that out), and skip straight to
-    // success if it's already there.
+    // The device may already be sitting in pwned DFU before the exploit
+    // tool is ever invoked: checkm8()'s own retry loop calling this
+    // function again, a previous CLI run that got killed/crashed after the
+    // pwn actually succeeded but before this function's own post-pwn
+    // verification ran, or the tool itself finishing the pwn in the
+    // background after this project gave up waiting on it (see
+    // runLineBufferedSubprocess()'s timeout/D-state handling above — this
+    // is exactly the scenario that produces: confirmed live, a `gaster
+    // pwn` stuck past its own timeout while the device had, per this same
+    // check, already rebooted into pwned DFU). Re-running the exploit
+    // against an already-pwned device is pointless at best; check first,
+    // quickly (get_tv(), not get_tv_patient() — if it's not there within
+    // get_tv()'s own short default, it's almost certainly not already
+    // pwned and yet-unconnected, not worth 30 seconds of patience just to
+    // rule that out), and skip straight to success if it's already there.
     {
         irecv_client_t already = get_tv(ecid);
         if (already) {
@@ -609,14 +629,26 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid) {
     status("Exploiting with checkm8");
     progress(10.0);
 
-    int exitCode = runGaster({"pwn"}, 180);
+    // pwnTool selects which subprocess actually runs the exploit -- see
+    // Cli.hpp's CliOptions::pwnTool and docs/HISTORY.md for why: gaster
+    // does not work on macOS no matter what has been tried; blackb0x-pwn
+    // (this project's own original checkm8, run standalone over
+    // libirecovery's native IOKit backend — see Blackb0x/Source/Pwn/) does.
+    // blackb0x-pwn's own CLI takes an explicit --ecid (gaster's doesn't --
+    // it just waits for any DFU device), so pass it through for precision.
+    int exitCode;
+    if (pwnTool == "blackb0x-pwn") {
+        exitCode = runBlackb0xPwn({"checkm8", "--ecid", std::to_string(ecid)}, 180);
+    } else {
+        exitCode = runGaster({"pwn"}, 180);
+    }
     if (exitCode != 0) {
         if (exitCode == -2) {
-            fprintf(stderr, "checkm8: gaster pwn timed out waiting for the device.\n");
+            fprintf(stderr, "checkm8: %s timed out waiting for the device.\n", pwnTool.c_str());
         } else {
-            fprintf(stderr, "checkm8: gaster pwn failed (exit %d).\n", exitCode);
+            fprintf(stderr, "checkm8: %s failed (exit %d).\n", pwnTool.c_str(), exitCode);
         }
-        runGaster({"reset"}, 15);
+        if (pwnTool != "blackb0x-pwn") runGaster({"reset"}, 15);
         status("Checkm8 unsuccessful");
         progress(100.0);
         return 0;
@@ -626,7 +658,7 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid) {
 
     irecv_client_t client = get_tv_patient(ecid);
     if (!client) {
-        fprintf(stderr, "checkm8: device did not reappear after gaster pwn.\n");
+        fprintf(stderr, "checkm8: device did not reappear after %s.\n", pwnTool.c_str());
         status("Checkm8 unsuccessful");
         progress(100.0);
         return 0;
@@ -635,7 +667,7 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid) {
     const struct irecv_device_info* info = irecv_get_device_info(client);
     if (!info || !strstr(info->serial_string, "PWND:[")) {
         irecv_close(client);
-        fprintf(stderr, "checkm8: device did not report pwned DFU after gaster pwn.\n");
+        fprintf(stderr, "checkm8: device did not report pwned DFU after %s.\n", pwnTool.c_str());
         status("Checkm8 unsuccessful");
         progress(100.0);
         return 0;
@@ -648,18 +680,19 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid) {
     return 1;
 }
 
-// gaster itself already retries internally and unboundedly within a single
-// `gaster pwn` invocation (its RESET -> SETUP -> SPRAY -> PATCH state
-// machine resets and starts over on any stage failure on its own) — this
-// outer retry is now mostly a safety net for the rarer case of a hard
-// failure/timeout out of runGaster() itself (e.g. gaster exiting outright,
-// or this project's own 180s ceiling on top of gaster's patience being
+// gaster/blackb0x-pwn both already retry internally and unboundedly within
+// a single invocation (gaster's own RESET -> SETUP -> SPRAY -> PATCH state
+// machine resets and starts over on any stage failure on its own;
+// blackb0x-pwn's get_tv() is likewise patient) — this outer retry is now
+// mostly a safety net for the rarer case of a hard failure/timeout out of
+// runLineBufferedSubprocess() itself (e.g. the child exiting outright, or
+// this project's own 180s ceiling on top of the child's patience being
 // hit). kMaxAttempts stays finite so the CLI still eventually reports a
 // real, actionable failure rather than retrying forever.
-int DeviceManager::checkm8(uint64_t ecid) {
+int DeviceManager::checkm8(uint64_t ecid, const std::string& pwnTool) {
     constexpr int kMaxAttempts = 3;
     for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
-        if (checkm8Attempt(ecid)) return 1;
+        if (checkm8Attempt(ecid, pwnTool)) return 1;
         if (attempt < kMaxAttempts) {
             if (sink_.onStatus) sink_.onStatus("checkm8 attempt failed, retrying...");
             sleep(1);

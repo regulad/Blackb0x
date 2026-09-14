@@ -39,6 +39,13 @@ std::string resolveImageKeyPath(const std::string& relativePath);
 // tree.
 std::string resolveGasterPath();
 
+// Resolves the path to the `blackb0x-pwn` binary (Apple-only — see
+// CMakeLists.txt's `if(APPLE)` block, and docs/HISTORY.md for why:
+// gaster does not work on macOS, blackb0x-pwn does): $BLACKB0X_PWN if
+// set, otherwise "blackb0x-pwn" alongside blackb0x's own executable, same
+// resolution strategy as resolveGasterPath() above.
+std::string resolvePwnPath();
+
 // Resolves the loose .deb root: $BLACKB0X_DEBS_DIR if set, otherwise
 // "Blackb0x/Debs" relative to the current working directory. bakeRamdisk()'s
 // stageDebcache() (BakeRamdisk.cpp) copies exactly the subset

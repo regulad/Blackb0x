@@ -37,10 +37,10 @@ std::string resolveImageKeyPath(const std::string& relativePath) {
     return "Blackb0x/ImageKeys/" + relativePath;
 }
 
-std::string resolveGasterPath() {
-    if (const char* override_ = getenv("BLACKB0X_GASTER")) {
-        return std::string(override_);
-    }
+// Shared by resolveGasterPath()/resolvePwnPath() below: the directory
+// blackb0x's own executable lives in, or empty if it can't be determined
+// (falls back to a bare binaryName, resolved via PATH at exec time).
+static std::string resolveOwnExecutableDir() {
     char exePath[PATH_MAX];
 #if defined(__APPLE__)
     // No /proc on Darwin; _NSGetExecutablePath() may return a path
@@ -64,10 +64,28 @@ std::string resolveGasterPath() {
         std::string dir(exePath);
         size_t slash = dir.find_last_of('/');
         if (slash != std::string::npos) {
-            return dir.substr(0, slash) + "/gaster";
+            return dir.substr(0, slash);
         }
     }
+    return "";
+}
+
+std::string resolveGasterPath() {
+    if (const char* override_ = getenv("BLACKB0X_GASTER")) {
+        return std::string(override_);
+    }
+    std::string dir = resolveOwnExecutableDir();
+    if (!dir.empty()) return dir + "/gaster";
     return "gaster";
+}
+
+std::string resolvePwnPath() {
+    if (const char* override_ = getenv("BLACKB0X_PWN")) {
+        return std::string(override_);
+    }
+    std::string dir = resolveOwnExecutableDir();
+    if (!dir.empty()) return dir + "/blackb0x-pwn";
+    return "blackb0x-pwn";
 }
 
 std::string resolveDebsPath() {

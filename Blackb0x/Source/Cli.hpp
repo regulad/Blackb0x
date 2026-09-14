@@ -25,6 +25,18 @@ struct CliOptions {
     bool dryRun = false;
     bool noCheckm8 = false;
     bool help = false;
+    // Which tool actually runs the checkm8 exploit -- "gaster" or
+    // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms
+    // (--pwntool, see printCliUsage()/parseCliOptions()): gaster does not
+    // work on macOS no matter what has been tried, blackb0x-pwn does (see
+    // README.md/docs/HISTORY.md), so blackb0x-pwn is the Apple default;
+    // blackb0x-pwn itself is never built at all on Linux, so gaster is the
+    // only option there, unconditionally.
+#if defined(__APPLE__)
+    std::string pwnTool = "blackb0x-pwn";
+#else
+    std::string pwnTool = "gaster";
+#endif
 };
 
 CliOptions parseCliOptions(int argc, char** argv);

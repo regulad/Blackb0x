@@ -55,6 +55,13 @@ void printCliUsage(const char* argv0) {
     printf("                            attempting the exploit. For iterating on the\n");
     printf("                            post-exploit send flow against an already-\n");
     printf("                            pwned device without spawning gaster again.\n");
+#if defined(__APPLE__)
+    printf("  --pwntool <gaster|blackb0x-pwn>\n");
+    printf("                            Which tool runs the checkm8 exploit\n");
+    printf("                            (default: blackb0x-pwn — gaster does not\n");
+    printf("                            work on macOS no matter what has been\n");
+    printf("                            tried; see README.md)\n");
+#endif
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -85,6 +92,19 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.dryRun = true;
         } else if (arg == "--no-checkm8") {
             options.noCheckm8 = true;
+        } else if (arg == "--pwntool") {
+            std::string value = nextArg("--pwntool");
+#if defined(__APPLE__)
+            if (value != "gaster" && value != "blackb0x-pwn") {
+                fprintf(stderr, "--pwntool must be 'gaster' or 'blackb0x-pwn' (got '%s')\n", value.c_str());
+                exit(2);
+            }
+            options.pwnTool = value;
+#else
+            fprintf(stderr,
+                    "--pwntool is only meaningful on macOS (blackb0x-pwn isn't built on this "
+                    "platform, gaster is the only option) -- ignoring.\n");
+#endif
         } else if (arg == "--help" || arg == "-h") {
             options.help = true;
         } else {
@@ -189,7 +209,8 @@ bool waitForDFUMode(DeviceManager& deviceManager, uint64_t ecid, AppleTVDevice& 
 // AppleTV3,2/checkm8 branch below (the one that actually spawns gaster) —
 // SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that never
 // touches gaster at all, so there's nothing for this flag to refuse there.
-bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noCheckm8) {
+bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noCheckm8,
+                   const std::string& pwnTool) {
     if (device.pwnedDFU) return true;
 
     if (device.deviceModel == "AppleTV2,1") {
@@ -218,16 +239,18 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
         if (noCheckm8) {
             fprintf(stderr,
                     "--no-checkm8: device is not already in pwned DFU (no PWND: in its serial string) — "
-                    "refusing to run checkm8/gaster. Pwn it separately first (e.g. `gaster pwn`), or drop "
-                    "--no-checkm8 to let blackb0x do it.\n");
+                    "refusing to run checkm8/%s. Pwn it separately first (e.g. `%s pwn`%s), or drop "
+                    "--no-checkm8 to let blackb0x do it.\n",
+                    pwnTool.c_str(), pwnTool.c_str(),
+                    pwnTool == "blackb0x-pwn" ? " — note blackb0x-pwn's own verb is `checkm8`, not `pwn`" : "");
             return false;
         }
         if (dryRun) {
             printf("(dry run) Would try checkm8\n");
             return true;
         }
-        printf("Trying checkm8...\n");
-        if (deviceManager.checkm8(device.ecid) == 0) {
+        printf("Trying checkm8 (%s)...\n", pwnTool.c_str());
+        if (deviceManager.checkm8(device.ecid, pwnTool) == 0) {
             fprintf(stderr, "Exploit failed.\n");
             return false;
         }
@@ -589,7 +612,7 @@ int runCli(const CliOptions& options) {
         }
     }
 
-    if (!checkExploit(deviceManager, device, options.dryRun, options.noCheckm8)) {
+    if (!checkExploit(deviceManager, device, options.dryRun, options.noCheckm8, options.pwnTool)) {
         return 1;
     }
 
