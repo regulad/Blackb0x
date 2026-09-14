@@ -1354,22 +1354,50 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
 
 // A real run against an AppleTV3,2 once failed mid-Ramdisk-upload with a
 // bulk short-write ("wrote 0 of 32768 bytes") at exactly packet 2049/2204
-// -- byte offset 0x4000000 (64MiB) on the nose, on a 68.9MiB ramdisk. This
-// project used to send a "getenv ramdisk-size" (irecv_getenv(), a full
-// command-then-read-response round trip) before every ramdisk upload to
-// turn that into an upfront diagnostic instead of a cryptic mid-transfer
-// failure -- removed again: real idevicerestore's own equivalent
-// (recovery_send_ramdisk(), recovery.c) only ever fires a bare
-// "getenv ramdisk-delay" via plain irecv_send_command() (no response read
-// at all, just letting the device print it to its own console), never
-// irecv_getenv()'s extra IN control transfer this project's own check
-// relied on -- and that extra read, not anything else in this sequence,
-// is suspected (real hardware, not yet fully isolated) of being what was
-// actually interfering with the restore-tail cycle.
+// -- byte offset 0x4000000 (64MiB) on the nose, on a 68.9MiB ramdisk. Real
+// idevicerestore's own recovery_send_ramdisk() (recovery.c) sends a
+// "getenv ramdisk-size" (irecv_getenv(), a full command-then-read-response
+// round trip, same shape as this) right before uploading the ramdisk
+// component -- this was briefly removed on a mistaken belief that
+// idevicerestore didn't do this at all (it does, in this exact spot),
+// then re-added to match it once that was corrected.
+static void warnIfRamdiskExceedsDeviceLimit(irecv_client_t client, const std::string& path) {
+    if (!client) return;
+
+    std::error_code ec;
+    uint64_t fileSize = std::filesystem::file_size(path, ec);
+    if (ec) return;
+
+    char* value = nullptr;
+    irecv_error_t err = irecv_getenv(client, "ramdisk-size", &value);
+    if (err != IRECV_E_SUCCESS || !value || !value[0]) {
+        free(value);
+        fprintf(stderr, "warnIfRamdiskExceedsDeviceLimit: device did not report a ramdisk-size (or getenv "
+                        "unsupported on this device/firmware) -- skipping the size check\n");
+        return;
+    }
+
+    char* end = nullptr;
+    uint64_t deviceLimit = strtoull(value, &end, 0);
+    bool parsed = end != value && deviceLimit != 0;
+    if (parsed && fileSize > deviceLimit) {
+        fprintf(stderr,
+                "warnIfRamdiskExceedsDeviceLimit: %s is %llu bytes, but the device reports a ramdisk-size "
+                "limit of %llu bytes (%s) -- the upload is very likely to fail partway through once it hits "
+                "that boundary. A smaller baked ramdisk is the real fix.\n",
+                path.c_str(), (unsigned long long)fileSize, (unsigned long long)deviceLimit, value);
+    } else if (!parsed) {
+        fprintf(stderr, "warnIfRamdiskExceedsDeviceLimit: device reported ramdisk-size=\"%s\", not parseable "
+                        "as a number -- skipping the size check\n", value);
+    }
+    free(value);
+}
+
 int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
     // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
     // follows DeviceTree's own NOTIFY_FINISH-triggered reset.
     irecv_client_t client = get_tv_patient(ecid);
+    warnIfRamdiskExceedsDeviceLimit(client, Ramdisk_Path);
     int result = sendFileThenCommand(client, "sendRamdisk", Ramdisk_Path, "ramdisk", false, 0, false,
                                       "getenv ramdisk-delay");
     sleep(2);
@@ -1634,6 +1662,7 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
             irecv_close(client);
             return -1;
         }
+        warnIfRamdiskExceedsDeviceLimit(client, *components.ramdisk);
         if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk",
                                                /*bReq=*/0, "getenv ramdisk-delay")) {
             if (client) irecv_close(client);
