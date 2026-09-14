@@ -1209,6 +1209,241 @@ cp -a /preinstall/var/lib/dpkg/info/. /out/dpkg-state/info/
 rm -rf /preinstall/var/lib/dpkg /preinstall/etc/apt
 )SCRIPT";
 
+#if defined(__APPLE__)
+// macOS has no container runtime at all (confirmed directly — not just
+// podman, no viable alternative either), so the real, containerized dpkg
+// bootstrap the #else branch below runs is off the table here. That real
+// dpkg run only exists to correctly SEQUENCE maintainer-script execution
+// around a genuine dpkg/tar/gzip/sed dependency cycle in this bootstrap-era
+// package set (see kPreinstallInnerScript's own long comment for the full
+// cycle) — force-unpack everything with checking off, then one real forced
+// `--configure -a` pass to push scripts through in dpkg's own correct
+// order. But every package that reaches this function has already been
+// proven, by computePreinstallEligibleFilenames()'s own transitive
+// closure over prebake_package_blacklist.txt, to need no real, stateful
+// maintainer-script execution at all — any postinst/preinst an eligible
+// package DOES happen to carry is either stripped (postinst, before a real
+// --configure would run it) or never reaches dpkg in the first place
+// (preinst, since --unpack never runs here either). With no script ever
+// executed on this path (not "stripped-then-executed", literally never
+// extracted-and-run), the whole reason for real, sequenced dpkg evaporates:
+// "unpack every package" degenerates to "copy every package's real payload
+// files onto disk," an operation with no meaningful ordering constraint
+// left to get wrong — so `stripPostinstPackages`/`stripPreinstFilenames`
+// are accepted for signature parity with the #else branch but genuinely
+// unused here, not an oversight.
+//
+// Mechanism: reuse extractDebAndBuildStanza() (already proven by
+// stageEtasonatv()/stageP0sixspwn() below) per eligible package to pull its
+// real data.tar.* payload out with plain ar/tar and build a dpkg status
+// stanza from its real control file via buildStatusStanzaFromControl();
+// merge the payload into a preinstall root the same way mergeRealFilesystemTree()
+// already merges any other real, ordinary filesystem tree (mirroring
+// exactly what a real `dpkg --unpack` would have left on disk); concatenate
+// every stanza into one status file and hand-write matching per-package
+// dpkg/info/ state. The result lands in the exact same outPreinstallDir/
+// outDpkgStateDir shape the #else branch produces, so mergePreinstalledPackages()
+// (the shared, non-platform-specific caller) needs no changes at all.
+//
+// This intentionally skips the #else branch's `dpkg --audit`/`apt-get
+// check` consistency pass — there is no real dpkg/apt state machine
+// running here to audit in the first place, just files being copied. What
+// substitutes for it: computePreinstallEligibleFilenames()'s own
+// dependency-satisfaction propagation loop (the `while (changed) { ...
+// unsatisfiable ... }` loop in that function) already proved, before this
+// function is ever called, that every package in `eligibleFilenames` has
+// every one of its real Depends:/Pre-Depends: also present in the eligible
+// set — the actual condition a real audit would otherwise be checking for
+// here. This is a real, deliberate, accepted simplification (no full
+// apt-style audit), not an oversight.
+static bool computePreinstalledPackages(const std::set<std::string>& eligibleFilenames,
+                                         const std::set<std::string>& /*stripPostinstPackages*/,
+                                         const std::set<std::string>& /*stripPreinstFilenames*/,
+                                         std::string& outPreinstallDir, std::string& outDpkgStateDir) {
+    std::string preinstallDir = makeTempDir("blackb0x-preinstall-root-");
+    std::string outDir = makeTempDir("blackb0x-preinstall-out-");
+    if (preinstallDir.empty() || outDir.empty()) {
+        fprintf(stderr, "bakeRamdisk: cannot create preinstall temp dirs\n");
+        return false;
+    }
+    std::error_code mkEc;
+    fs::create_directories(fs::path(outDir) / "dpkg-state" / "info", mkEc);
+    outPreinstallDir = preinstallDir;
+    outDpkgStateDir = outDir + "/dpkg-state";
+
+    if (eligibleFilenames.empty()) {
+        fprintf(stderr, "bakeRamdisk: no packages eligible for bake-time preinstall this run\n");
+        return true;
+    }
+
+    // Loose members every .deb's own `ar x` + data.tar/control.tar
+    // extraction (extractDebAndBuildStanza()) leaves sitting in its tempDir
+    // alongside the real payload tree: the .deb's own top-level archive
+    // members (debian-binary, control.tar.*, data.tar.* — never real
+    // device paths), plus every possible flat control-archive member name
+    // per the real Debian binary-package spec. None of these are ever
+    // legitimate top-level payload paths with no directory prefix, so
+    // they're removed before merging — otherwise this hand-rolled unpack
+    // would stage a maintainer script (or the .deb's own archive bytes) as
+    // if it were real content belonging on the device.
+    static const std::vector<std::string> kDebControlArtifactNames = {
+        "control", "preinst", "postinst", "prerm", "postrm",
+        "conffiles", "md5sums", "triggers", "shlibs", "templates", "config",
+    };
+
+    std::string debsRoot = resolveDebsPath();
+    std::string statusOut;
+    for (const auto& filename : eligibleFilenames) {
+        std::string debPath = fs::absolute(debsRoot + "/" + filename).string();
+        // dropRelationshipFields=false: unlike stageManualDpkgInstall()'s
+        // two firmware-version-gated callers, these are ordinary bake-time
+        // preinstalls with nothing to route around — keep Depends:/
+        // Pre-Depends: verbatim so this stanza matches what a real dpkg
+        // --unpack/--configure would actually have produced.
+        ExtractedDeb extracted = extractDebAndBuildStanza(debPath, "blackb0x-preinstall-pkg-",
+                                                            "bake-time preinstall payload for " + filename,
+                                                            /*hold=*/false, /*dropRelationshipFields=*/false);
+        if (!extracted.ok || extracted.stanza.empty()) {
+            fprintf(stderr,
+                    "bakeRamdisk: FATAL: cannot extract eligible package %s for bake-time preinstall (no "
+                    "container fallback available on macOS)\n",
+                    filename.c_str());
+            if (!extracted.tempDir.empty()) {
+                std::error_code rmEc;
+                fs::remove_all(extracted.tempDir, rmEc);
+            }
+            return false;
+        }
+
+        std::string pkgName;
+        {
+            std::istringstream stanzaLines(extracted.stanza);
+            std::string line;
+            while (std::getline(stanzaLines, line)) {
+                if (line.rfind("Package:", 0) != 0) continue;
+                std::string val = line.substr(8);
+                size_t start = val.find_first_not_of(" \t");
+                size_t end = val.find_last_not_of(" \t\r");
+                if (start != std::string::npos) pkgName = val.substr(start, end - start + 1);
+                break;
+            }
+        }
+        if (pkgName.empty()) {
+            fprintf(stderr, "bakeRamdisk: FATAL: %s's stanza has no parseable Package: name\n", filename.c_str());
+            std::error_code rmEc;
+            fs::remove_all(extracted.tempDir, rmEc);
+            return false;
+        }
+
+        for (const auto& name : kDebControlArtifactNames) {
+            std::error_code rmEc;
+            fs::remove(fs::path(extracted.tempDir) / name, rmEc);
+        }
+        {
+            std::error_code dirEc;
+            for (const auto& e : fs::directory_iterator(extracted.tempDir, dirEc)) {
+                std::string fn = e.path().filename().string();
+                if (fn == "debian-binary" || fn.rfind("control.tar", 0) == 0 || fn.rfind("data.tar", 0) == 0) {
+                    std::error_code rmEc2;
+                    fs::remove(e.path(), rmEc2);
+                }
+            }
+        }
+
+        // Real dpkg .list convention: one absolute path per line, every
+        // directory the package owns as well as every file/symlink,
+        // starting with "/." for the root itself. Captured now, before
+        // mergeRealFilesystemTree() below consumes this tempDir.
+        std::vector<std::string> ownedPaths = {"/."};
+        {
+            std::error_code walkEc;
+            for (const auto& e : fs::recursive_directory_iterator(extracted.tempDir, walkEc)) {
+                if (walkEc) break;
+                std::error_code relEc;
+                fs::path rel = fs::relative(e.path(), extracted.tempDir, relEc);
+                if (relEc) continue;
+                ownedPaths.push_back("/" + rel.string());
+            }
+        }
+
+        bool mergeOk = mergeRealFilesystemTree(fs::path(preinstallDir), "", extracted.tempDir);
+        std::error_code rmEc;
+        fs::remove_all(extracted.tempDir, rmEc);
+        if (!mergeOk) {
+            fprintf(stderr, "bakeRamdisk: FATAL: failed to merge %s's payload into the preinstall root\n",
+                    filename.c_str());
+            return false;
+        }
+
+        statusOut += extracted.stanza + "\n";
+
+        // Per-package .list/.md5sums, same convention stageManualDpkgInstall()
+        // already established for the hand-rolled etasonatv/p0sixspwn case:
+        // real (owned-path) .list content, but an intentionally-empty
+        // .md5sums — nothing in this codebase computes real md5 sums, and
+        // (as noted above) nothing here runs `dpkg --audit` to care either
+        // way; see stageManualDpkgInstall()'s own comment for the same
+        // precedent.
+        std::string listPath = outDpkgStateDir + "/info/" + pkgName + ".list";
+        std::string md5Path = outDpkgStateDir + "/info/" + pkgName + ".md5sums";
+        {
+            std::ofstream listFile(listPath, std::ios::trunc);
+            for (const auto& p : ownedPaths) listFile << p << "\n";
+        }
+        { std::ofstream md5File(md5Path, std::ios::trunc); }
+        chmod(listPath.c_str(), 0644);
+        chown(listPath.c_str(), 0, 0);
+        chmod(md5Path.c_str(), 0644);
+        chown(md5Path.c_str(), 0, 0);
+    }
+
+    // The synthetic "firmware" package — the exact same entry
+    // kPreinstallInnerScript's own copy declares in the #else branch (see
+    // its own comment), and the one scripts/build_deb_cache.py /
+    // scripts/build_deb_cache_experimental_no_container.py's own outer apt
+    // resolution already declares too. Genuinely needed here, not just for
+    // symmetry: dropRelationshipFields=false above means every preinstalled
+    // package's real Depends:/Pre-Depends: — including any genuine
+    // `Depends: firmware (>= X)` line (e.g. rtadvd's) — is preserved
+    // verbatim in the status file this produces, so without this entry a
+    // real device's own dpkg/apt would see an unmet dependency the #else
+    // branch never has.
+    statusOut +=
+        "Package: firmware\n"
+        "Status: install ok installed\n"
+        "Priority: required\n"
+        "Section: base\n"
+        "Installed-Size: 0\n"
+        "Maintainer: Blackb0x BakeRamdisk.cpp <noreply@regulad.xyz>\n"
+        "Architecture: iphoneos-arm\n"
+        "Version: 8.4.2\n"
+        "Description: Synthetic package matching scripts/build_deb_cache.py's own\n"
+        " declaration, so this ramdisk's dpkg agrees with the outer apt resolution\n"
+        " that already decided firmware-version-gated Depends: lines here are\n"
+        " satisfied.\n"
+        "\n";
+    {
+        std::string firmwareListPath = outDpkgStateDir + "/info/firmware.list";
+        std::string firmwareMd5Path = outDpkgStateDir + "/info/firmware.md5sums";
+        { std::ofstream f(firmwareListPath, std::ios::trunc); }
+        { std::ofstream f(firmwareMd5Path, std::ios::trunc); }
+        chmod(firmwareListPath.c_str(), 0644);
+        chown(firmwareListPath.c_str(), 0, 0);
+        chmod(firmwareMd5Path.c_str(), 0644);
+        chown(firmwareMd5Path.c_str(), 0, 0);
+    }
+
+    std::string statusPath = outDpkgStateDir + "/status";
+    {
+        std::ofstream statusFile(statusPath, std::ios::trunc);
+        statusFile << statusOut;
+    }
+    chmod(statusPath.c_str(), 0644);
+    chown(statusPath.c_str(), 0, 0);
+
+    return true;
+}
+#else
 // Runs the real dpkg preinstall for `eligibleFilenames` into fresh temp
 // directories and leaves them in place (caller owns cleanup — or, in
 // practice, never cleans them up at all: see computeGlobalDebcacheOnce(),
@@ -1288,6 +1523,7 @@ static bool computePreinstalledPackages(const std::set<std::string>& eligibleFil
     }
     return true;
 }
+#endif
 
 // The fast, per-bake half of the mechanism above: merges an already-
 // computed preinstall payload + dpkg state into `blackb0xRoot`. No
@@ -1359,10 +1595,27 @@ static bool computeGlobalDebcacheOnce(GlobalDebcacheResult& outResult) {
         return false;
     }
     chownToInvokingUserIfSudo(tempDir);
+#if defined(__APPLE__)
+    // No container runtime on macOS (see computePreinstalledPackages()'s
+    // own macOS branch above for the full story) — build_deb_cache.py
+    // itself shells out to real apt-get inside a podman sandbox, so it
+    // can't run here either. scripts/build_deb_cache_experimental_no_container.py
+    // is the portable, no-container stand-in: same --output-dir/picklist.txt/
+    // resolved_packages.txt contract (verified directly against its own
+    // main()), just a plain local transitive-closure walk over Blackb0x/Debs/
+    // instead of a real apt dependency solve — see that script's own module
+    // docstring for its real, accepted gaps versus build_deb_cache.py.
+    bool ok = runAsInvokingUser(
+        {"python3", "scripts/build_deb_cache_experimental_no_container.py", "--output-dir", tempDir});
+    if (!ok) {
+        fprintf(stderr, "bakeRamdisk: scripts/build_deb_cache_experimental_no_container.py failed\n");
+        outResult = cached;
+#else
     bool ok = runAsInvokingUser({"python3", "scripts/build_deb_cache.py", "--output-dir", tempDir});
     if (!ok) {
         fprintf(stderr, "bakeRamdisk: scripts/build_deb_cache.py failed\n");
         outResult = cached;
+#endif
         return false;
     }
     std::ifstream picklist(tempDir + "/picklist.txt");
@@ -1551,15 +1804,23 @@ static bool stageManualDpkgInstall(const fs::path& blackb0xRoot, const std::stri
 // Turns a real .deb's own extracted `control` file into a dpkg status
 // stanza for stageManualDpkgInstall() above: injects `Status: install ok
 // installed` (or, with `hold` set, `Status: hold ok installed`) right after
-// the `Package:` line, and drops Depends:/Conflicts:/Provides: (plus their
-// RFC822 continuation lines — anything starting with a space/tab
-// immediately following a dropped field) per stageManualDpkgInstall()'s own
-// comment on why those three specifically aren't safe to carry over
-// verbatim. Every other real field (Version, Architecture, Maintainer,
-// Section, Description, ...) is copied exactly as the real .deb's own
-// control file has it, so this stanza can't silently drift from whatever
-// .deb is actually sitting in Blackb0x/Debs/ the way a hand-typed literal
-// duplicating those same fields could.
+// the `Package:` line, and — when `dropRelationshipFields` is true (the
+// default) — drops Depends:/Conflicts:/Provides: (plus their RFC822
+// continuation lines — anything starting with a space/tab immediately
+// following a dropped field) per stageManualDpkgInstall()'s own comment on
+// why those three specifically aren't safe to carry over verbatim for its
+// two firmware-version-gated callers. Every other real field (Version,
+// Architecture, Maintainer, Section, Description, ...) is copied exactly as
+// the real .deb's own control file has it, so this stanza can't silently
+// drift from whatever .deb is actually sitting in Blackb0x/Debs/ the way a
+// hand-typed literal duplicating those same fields could.
+//
+// `dropRelationshipFields=false` is for computePreinstalledPackages()'s
+// macOS path (see that function's own comment): those packages are real,
+// ordinary bake-time preinstalls with no firmware-version-gating weirdness
+// to route around, so the faithful thing — matching what a real `dpkg
+// --unpack`/`--configure` would actually have left in status — is to keep
+// their real Depends:/Pre-Depends: verbatim, not strip them.
 //
 // `hold`'s "hold ok installed" is exactly the on-disk effect a real
 // `apt-mark hold`/`dpkg --set-selections` run would produce (only the
@@ -1574,7 +1835,8 @@ static bool stageManualDpkgInstall(const fs::path& blackb0xRoot, const std::stri
 // function's own comment), so letting postinstall.sh's later `apt-get
 // upgrade`/`autoremove` ever silently "fix" this package back to a real
 // resolved install would overwrite it with the wrong one.
-static std::string buildStatusStanzaFromControl(const std::string& controlPath, bool hold = false) {
+static std::string buildStatusStanzaFromControl(const std::string& controlPath, bool hold = false,
+                                                  bool dropRelationshipFields = true) {
     std::ifstream in(controlPath, std::ios::binary);
     if (!in) return std::string();
 
@@ -1592,10 +1854,12 @@ static std::string buildStatusStanzaFromControl(const std::string& controlPath, 
             continue;
         }
         dropping = false;
-        for (const auto& field : kDropFields) {
-            if (line.rfind(field, 0) == 0) {
-                dropping = true;
-                break;
+        if (dropRelationshipFields) {
+            for (const auto& field : kDropFields) {
+                if (line.rfind(field, 0) == 0) {
+                    dropping = true;
+                    break;
+                }
             }
         }
         if (dropping) continue;
@@ -1666,8 +1930,16 @@ struct ExtractedDeb {
 // stageManualDpkgInstall() produces — a special-cased, conditional install
 // for the two packages that are exploit-critical enough to need one, not a
 // hand-rolled reimplementation of dpkg for its own sake.
+//
+// Also reused, on macOS, by computePreinstalledPackages()'s own no-
+// container path (see that function's own comment) — the exact same
+// ar/tar extraction dance generalizes cleanly to every bake-time-eligible
+// package, not just these two hand-picked ones. `dropRelationshipFields`
+// is threaded straight through to buildStatusStanzaFromControl() — see
+// its own comment for why that caller needs it false.
 static ExtractedDeb extractDebAndBuildStanza(const std::string& debPath, const std::string& tempDirPrefix,
-                                              const std::string& labelForLogging, bool hold = false) {
+                                              const std::string& labelForLogging, bool hold = false,
+                                              bool dropRelationshipFields = true) {
     ExtractedDeb result;
     result.tempDir = makeTempDir(tempDirPrefix);
     if (result.tempDir.empty()) return result;
@@ -1703,7 +1975,7 @@ static ExtractedDeb extractDebAndBuildStanza(const std::string& debPath, const s
         fprintf(stderr, "bakeRamdisk: WARNING: failed to extract %s's control.tar.* — dpkg state not staged\n",
                 debPath.c_str());
     } else {
-        result.stanza = buildStatusStanzaFromControl(result.tempDir + "/control", hold);
+        result.stanza = buildStatusStanzaFromControl(result.tempDir + "/control", hold, dropRelationshipFields);
         if (result.stanza.empty()) {
             fprintf(stderr,
                     "bakeRamdisk: WARNING: %s's control.tar.* has no usable control file — dpkg state not staged\n",
