@@ -1091,6 +1091,18 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
     bool isATV31 = strstr(device->product_type, "AppleTV3,1") != nullptr;
     bool isATV32 = strstr(device->product_type, "AppleTV3,2") != nullptr;
 
+    // Unambiguous, always-printed record of which of the two very
+    // differently-shaped upload paths below this run actually took --
+    // there was previously no way to tell from the terminal output alone
+    // whether a --stock-securom run really exercised the standard
+    // irecv_send_file() route or silently fell through to boot_client().
+    fprintf(stderr,
+            "sendiBSS: device reports product_type \"%s\" (isATV31=%d, isATV32=%d), stockRecovery=%d, "
+            "stockSecurom=%d -> using %s route.\n",
+            device->product_type, isATV31, isATV32, stockRecovery, stockSecurom,
+            (isATV31 || isATV32) ? (stockSecurom ? "standard irecv_send_file()" : "checkm8 soft-DFU boot_client()")
+                                  : "AppleTV2,1 irecv_send_file()");
+
     if ((isATV31 || isATV32) && stockSecurom) {
         // --stock-securom: boot_client() below (used by sendiBSS_ATV31()/
         // sendiBSS_ATV32()) is a custom soft-DFU sequence shaped around
