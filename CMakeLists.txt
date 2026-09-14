@@ -1394,55 +1394,53 @@ add_test(NAME RamdiskOverlayTests
 # ---------------------------------------------------------------------------
 # bake-all-ramdisks
 #
-# The one piece of blackb0x that needs CAP_SYS_ADMIN/CAP_CHOWN (loop-
-# mounting a real HFS+ image) — split into its own binary, run as a separate
-# manual step, not invoked by blackb0x itself (see BakeRamdisk.hpp's header
-# comment and Patcher::patchRamdisk()). Batches bakeRamdisk() over every
-# (device, firmware) combination under Blackb0x/ImageKeys/ in one run,
-# writing results to dist/ — so it needs the HFS+/DMG patching stack AND the
-# IPSW download stack (IPSW.cpp/IPSWDownloader.cpp), but none of the
+# The one piece of blackb0x that needs CAP_SYS_ADMIN/CAP_CHOWN on Linux (loop-
+# mounting a real HFS+ image) or root for `hdiutil`/`diskutil` on macOS —
+# split into its own binary, run as a separate manual step, not invoked by
+# blackb0x itself (see BakeRamdisk.hpp's header comment and
+# Patcher::patchRamdisk()). Batches bakeRamdisk() over every (device,
+# firmware) combination under Blackb0x/ImageKeys/ in one run, writing
+# results to dist/ — so it needs the HFS+/DMG patching stack AND the IPSW
+# download stack (IPSW.cpp/IPSWDownloader.cpp), but none of the
 # USB/device-communication libraries the main blackb0x binary needs.
 #
-# Linux-only, deliberately (.claude/TODO.md item 4/4a: "ramdisk baking can
-# stay Linux-only in the interim" while macOS support is brought up for
-# blackb0x/gaster/blackb0x-pwn first — nobody had scoped or started actually
-# porting it yet). Nothing enforced that boundary at the build-system level
-# until now: a real macOS build tried to compile this target anyway (a
-# plain `cmake --build` with no target = build everything) and hit exactly
-# the kind of portability gap 4a's own scoping notes anticipated --
-# third_party/xpwn's vendored hfsplus.h uses the `register` storage-class
-# specifier (removed from the language in C++17; GCC still only warns,
-# Clang on macOS hard-errors) and BakeRamdisk.cpp's own st_atim/st_mtim
-# struct stat fields are Linux/glibc-specific spellings (Darwin's struct
-# stat calls the same fields st_atimespec/st_mtimespec instead). Neither is
-# fixed here — that's the actual 4a porting work, still not started --
-# this just stops bake-all-ramdisks from being part of a macOS build at
-# all, matching the scope decision that was already made, so the rest of
-# a plain `cmake --build` (blackb0x, gaster, blackb0x-pwn) isn't blocked by
-# a target nobody meant to build there yet.
+# Was Linux-only for a while (.claude/TODO.md item 4/4a) because nobody had
+# scoped or started actually porting BakeRamdisk.cpp's HFS+ volume-build
+# sequence to macOS: third_party/xpwn's vendored hfsplus.h uses the
+# `register` storage-class specifier (removed from the language in C++17;
+# GCC still only warns, Clang on macOS hard-errors) and BakeRamdisk.cpp's own
+# st_atim/st_mtim struct stat fields are Linux/glibc-specific spellings
+# (Darwin's struct stat calls the same fields st_atimespec/st_mtimespec
+# instead). Both are now handled directly in BakeRamdisk.cpp (see its own
+# `#if defined(__APPLE__)` branches — an `hdiutil`-based volume build
+# replaces Linux's loop-mount sequence there, and the `register` keyword is
+# bracketed out around the one include that pulls it in), so this target now
+# builds on both platforms. No Apple frameworks are linked pre-emptively
+# here — this target doesn't link deps::wolfssl/deps::irecovery even on
+# Linux, so add whatever a real macOS link actually demands, the same way
+# blackb0x's own `if(APPLE)` framework block below was arrived at from a
+# real link error rather than a guess.
 # ---------------------------------------------------------------------------
 
-if(NOT APPLE)
-    add_executable(bake-all-ramdisks
-        Blackb0x/Source/BakeAllRamdisks.cpp
-        Blackb0x/Source/BakeRamdisk.cpp
-        Blackb0x/Source/IPSW.cpp
-        Blackb0x/Source/IPSWDownloader.cpp
-        Blackb0x/Source/ResourcePath.cpp)
+add_executable(bake-all-ramdisks
+    Blackb0x/Source/BakeAllRamdisks.cpp
+    Blackb0x/Source/BakeRamdisk.cpp
+    Blackb0x/Source/IPSW.cpp
+    Blackb0x/Source/IPSWDownloader.cpp
+    Blackb0x/Source/ResourcePath.cpp)
 
-    target_include_directories(bake-all-ramdisks PRIVATE third_party/xpwn/includes)
+target_include_directories(bake-all-ramdisks PRIVATE third_party/xpwn/includes)
 
-    target_link_libraries(bake-all-ramdisks PRIVATE
-        blackb0x_xpwntool
-        xpwn
-        deps::plist
-        deps::fragmentzip
-        deps::general
-        deps::curl
-        ZLIB::ZLIB)
+target_link_libraries(bake-all-ramdisks PRIVATE
+    blackb0x_xpwntool
+    xpwn
+    deps::plist
+    deps::fragmentzip
+    deps::general
+    deps::curl
+    ZLIB::ZLIB)
 
-    add_dependencies(bake-all-ramdisks
-        libplist_ext libfragmentzip_ext libgeneral_ext
-        wolfssl_ext curl_ext bzip2_ext libpng_ext zlib_ext)
-endif()
+add_dependencies(bake-all-ramdisks
+    libplist_ext libfragmentzip_ext libgeneral_ext
+    wolfssl_ext curl_ext bzip2_ext libpng_ext zlib_ext)
 

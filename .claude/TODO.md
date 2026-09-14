@@ -151,12 +151,12 @@ IOKit paths on macOS instead, where they're the actively-maintained
 reference implementations rather than something inherited secondhand via
 libusb's Darwin backend.
 
-First cut is scoped to the `blackb0x`/`gaster` CLI path only — ramdisk
-baking (`bake-all-ramdisks`, `BakeRamdisk.cpp`) can stay Linux-only in the
-interim (real loop-mounted HFS+, `CAP_SYS_ADMIN`), with a macOS build of
-`blackb0x` consuming `dist/` output baked elsewhere in the meantime. But
-macOS support for the ramdisk baker itself is also wanted eventually, not
-permanently deferred — see its own subsection below.
+First cut was scoped to the `blackb0x`/`gaster` CLI path only — ramdisk
+baking (`bake-all-ramdisks`, `BakeRamdisk.cpp`) stayed Linux-only for a
+while (real loop-mounted HFS+, `CAP_SYS_ADMIN`), with a macOS build of
+`blackb0x` consuming `dist/` output baked elsewhere in the meantime. macOS
+support for the ramdisk baker itself has since landed too — see 4a below,
+now resolved.
 
 Real blockers, in the code today — **all four now addressed** (code
 written and cross-checked to still build clean on Linux; none of it has
@@ -268,54 +268,78 @@ the Linux build-deps list. `Cli.cpp`'s udev/sudo help text and
 `IPSWDownloader.hpp`'s `ipswDataRoot()` XDG-only fallback are both
 cosmetically Linux-flavored but not blockers.
 
-### 4a. macOS support for the ramdisk baker (`bake-all-ramdisks`/`BakeRamdisk.cpp`)
+### 4a. macOS support for the ramdisk baker (`bake-all-ramdisks`/`BakeRamdisk.cpp`) (resolved)
 
-Not started. Unlike the `blackb0x` CLI path above, this one plausibly gets
-*simpler* on macOS rather than harder, since HFS+ and DMG tooling are
-native there instead of a bolted-on Linux kernel driver:
+Ported. As anticipated below, it ended up *simpler* on macOS than Linux's
+loop-mount flow, not harder: `bakeRamdisk()` now has a `#if
+defined(__APPLE__)` branch that mounts the original volume once with
+`hdiutil attach -nobrowse -readonly`, reads its label via `diskutil info
+-plist` (parsed with the already-vendored libplist), copies the content
+out to a plain staging directory, splices in `/sbin/launchd` + `/blackb0x`
+there, and builds the final correctly-sized volume in one step with
+`hdiutil create -srcfolder ... -fs "Case-sensitive HFS+" -format UDRW
+-layout NONE` — one real mount instead of Linux's three, no
+`CAP_SYS_ADMIN`/loop-mount mechanism needed at all. `copyVolumeHeaderMetadata()`
+(pure byte-level work on the raw image) is unchanged and shared by both
+platforms. `MountGuard`'s destructor, `st_atim`/`st_mtim` vs
+`st_atimespec`/`st_mtimespec`, and the vendored `hfsplus.h`'s `register`
+keyword (bracketed with `#define`/`#undef` around the one include that
+pulls it in, not editing the vendored header) are all now handled per the
+same `#if defined(__APPLE__)` convention used elsewhere in this project.
 
-- `BakeRamdisk.cpp`'s whole reason for existing as a privileged,
-  `CAP_SYS_ADMIN`/`CAP_CHOWN`-requiring step is that Linux has no
-  in-process way to grow/write a real HFS+ volume — it has to loop-mount
-  one via the kernel's `hfsplus` driver and shell out to
-  `mkfs.hfsplus`/`fsck.hfsplus` (see `Patcher.hpp`'s and
-  `BakeRamdisk.cpp`'s own long comments on this). macOS has first-party
-  `hdiutil`/`diskutil` for creating, resizing, and attaching HFS+ `.dmg`
-  images, and attaching a user-owned image doesn't require root at all —
-  the whole loop-mount/`CAP_SYS_ADMIN` mechanism this file exists to work
-  around may not be needed on macOS in the first place. Worth designing
-  fresh against `hdiutil attach`/`hdiutil create` rather than porting the
-  Linux mount-based flow as-is.
-- `mount`/`umount`/`blkid` subprocess calls in `BakeRamdisk.cpp` would need
-  a `hdiutil attach -mountpoint ...`/`hdiutil detach` equivalent path.
-- `scripts/build_deb_cache.py`'s `podman` dependency (`BakeRamdisk.cpp`'s
-  `buildPicklist()`) — Podman does run on macOS, but always through a
-  Linux VM (`podman machine`), not natively; needs verifying the picklist
-  resolution flow still works through that indirection, or an alternative.
-- The `$SUDO_USER`/`runuser` re-invocation dance (for podman's rootless
-  storage) is Linux/systemd-flavored and likely doesn't apply to macOS at
-  all if the `hdiutil`-based rewrite above removes the root requirement
-  entirely.
-- Same `xxd`/autotools/toolchain build-time deps as the `blackb0x` side.
+The `podman`+real-`apt-get` dependency (`scripts/build_deb_cache.py`,
+and `BakeRamdisk.cpp`'s own podman-based `computePreinstalledPackages()`
+dpkg run) turned out to have no viable macOS path at all — not even
+through `podman machine`'s Linux VM, since no containerization was
+available in the environment this was ported from, and real Debian
+`apt-get` has no native Apple Silicon path either (`dpkg` alone has a
+MacPorts port, but not `apt-get`; Fink carries the genuine apt/dpkg
+codebase but is unmaintained since Feb 2022 and explicitly unsupported on
+Apple Silicon, fink/fink#232). Resolved with a new, deliberately
+experimental, portable replacement instead of either container path:
+`scripts/build_deb_cache_experimental_no_container.py` (a plain
+transitive-closure dependency-group walk over already-vendored
+`Blackb0x/Debs/`, no version-constraint comparison, no network/root/
+container use at all — see its own module docstring for the documented
+gaps versus `build_deb_cache.py`, and
+`scripts/test_build_deb_cache_experimental_no_container.py` for its 18
+fully-portable tests) plus a portable, no-dpkg preinstall step in
+`BakeRamdisk.cpp` (extracts each bake-time-eligible `.deb`'s `data.tar.*`
+directly and hand-assembles the `dpkg-state/status` stanza, relying on
+`computePreinstallEligibleFilenames()`'s existing guarantee that no
+bake-time-eligible package has a real preinst/postinst to run in the
+first place). `computeGlobalDebcacheOnce()` now picks between the real
+podman-based script and this one via `#if defined(__APPLE__)`; the Linux
+path is untouched. Building the experimental resolver surfaced (and
+fixed, in both the Python script and the identical pre-existing bug in
+`BakeRamdisk.cpp`'s own `readDebControlInfo()`) two real bugs: 14
+vendored `org.tihmstar.*.deb`s store their control member as plain
+`control` rather than the assumed `./control` inside `control.tar.*`,
+and `rtadvd`'s bare `Depends: firmware` needs the same synthetic
+`firmware` package declaration the podman script and
+`kPreinstallInnerScript` already had.
 
-No code started here — this is scoping notes only, to pick up whenever
-this is prioritized.
+`CMakeLists.txt`'s `add_executable(bake-all-ramdisks ...)` block no
+longer wraps in `if(NOT APPLE)` — it builds unconditionally now, with no
+Apple frameworks linked pre-emptively (matching how `blackb0x`'s own
+`if(APPLE)` framework block was arrived at from a real link error, not a
+guess).
 
-**The build system didn't enforce this scope decision until a real macOS
-build proved it needed to.** A plain `cmake --build` (no explicit target =
-build everything) tried to compile `bake-all-ramdisks` on macOS too, and
-failed for real, concrete reasons that confirm porting it is genuinely
-more than a recompile: `third_party/xpwn/includes/hfs/hfsplus.h` (vendored,
-not ours to edit) uses the `register` storage-class specifier, removed
-from the language in C++17 — GCC only warns, Clang (macOS's default) hard-
-errors; and `BakeRamdisk.cpp`'s own `st.st_atim`/`st.st_mtim` (Linux/glibc
-`struct stat` field names) don't exist on Darwin at all (BSD/macOS spells
-the same fields `st_atimespec`/`st_mtimespec`). Neither is fixed — that's
-this section's own still-not-started work — but `CMakeLists.txt` now
-wraps the whole `add_executable(bake-all-ramdisks ...)` block in
-`if(NOT APPLE)` so a plain macOS build of the rest of the project
-(`blackb0x`, `gaster`, `blackb0x-pwn`) isn't blocked by a target nobody
-had actually scoped for that platform yet.
+**Not yet real-hardware/real-macOS verified** — everything above was
+built and tested on Linux only (the experimental resolver's 18 tests
+pass there; both `blackb0x` and `bake-all-ramdisks` build clean with
+every `#if defined(__APPLE__)` branch necessarily uncompiled). Two
+specific spots are flagged in `BakeRamdisk.cpp`'s own comments as
+unverified pending a real Mac: the exact `-fs "Case-sensitive HFS+"`
+argument string for `hdiutil create`, and whether `hdiutil create
+-format UDRW -layout NONE`'s real output is genuinely flat raw bytes or
+carries extra UDIF structure (defensively mitigated by an
+`unwrapUDIFIfPresent()` safety net, itself untested). The actual
+motivating question behind this whole port — whether baking a ramdisk
+natively on the real Mac test machine, rather than copying one over from
+elsewhere, resolves the persistent post-`bootx` boot failure documented
+elsewhere in this file/`docs/HISTORY.md` — is also still open, only
+answerable by running it there.
 
 ### 4b. `blackb0x-pwn`: Blackb0x's own original checkm8/SHAtter, standalone and IOKit-only
 
