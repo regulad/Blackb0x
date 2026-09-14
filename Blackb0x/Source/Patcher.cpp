@@ -108,8 +108,21 @@ bool Patcher::patchiBSS(const std::string& path) {
 
     decrypt(const_cast<char*>(path.c_str()), const_cast<char*>(decPath.c_str()),
             const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE", nullptr);
-    iBootPatcher(const_cast<char*>(decPath.c_str()), const_cast<char*>(patchedPath.c_str()), nullptr,
-                 (char*)"TRUE", (char*)"FALSE", (char*)"FALSE", (char*)"FALSE");
+    int patchResult = iBootPatcher(const_cast<char*>(decPath.c_str()), const_cast<char*>(patchedPath.c_str()),
+                                    nullptr, (char*)"TRUE", (char*)"FALSE", (char*)"FALSE", (char*)"FALSE");
+    if (patchResult != 0) {
+        // iBootPatcher() never writes patchedPath on failure (e.g.
+        // patch_rsa_check() couldn't find its target instruction pattern
+        // in this specific iBSS build) -- same "decrypt() a nonexistent
+        // file" heap corruption patchKernel() was already fixed for (see
+        // its own comment), just never fixed here. Stop here instead of
+        // silently shipping garbage/stale output that would still fail
+        // signature verification once actually sent.
+        fprintf(stderr, "patchiBSS: iBootPatcher() failed for %s\n", path.c_str());
+        std::error_code ec;
+        fs::remove(decPath, ec);
+        return false;
+    }
     decrypt(const_cast<char*>(patchedPath.c_str()), const_cast<char*>(outPath.c_str()),
             const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE",
             const_cast<char*>(path.c_str()));
@@ -198,10 +211,23 @@ bool Patcher::patchiBEC(const std::string& path, const std::string& flags, bool 
                          "cs_enforcement_disable=1";
     char* t = ticket ? (char*)"TRUE" : (char*)"FALSE";
 
-    iBootPatcher(const_cast<char*>(decPath.c_str()), const_cast<char*>(patchedPath.c_str()), args1, (char*)"TRUE",
-                 (char*)"FALSE", t, (char*)"TRUE");
-    iBootPatcher(const_cast<char*>(decPath.c_str()), const_cast<char*>(prebootPath.c_str()), args2, (char*)"TRUE",
-                 (char*)"FALSE", t, (char*)"TRUE");
+    int patchedResult = iBootPatcher(const_cast<char*>(decPath.c_str()), const_cast<char*>(patchedPath.c_str()),
+                                      args1, (char*)"TRUE", (char*)"FALSE", t, (char*)"TRUE");
+    int prebootResult = iBootPatcher(const_cast<char*>(decPath.c_str()), const_cast<char*>(prebootPath.c_str()),
+                                      args2, (char*)"TRUE", (char*)"FALSE", t, (char*)"TRUE");
+    if (patchedResult != 0 || prebootResult != 0) {
+        // Same reasoning as patchiBSS()'s own comment -- iBootPatcher()
+        // never writes its output file on failure (e.g. patch_ticket_check()/
+        // patch_rsa_check() couldn't find their target instruction pattern
+        // in this specific iBEC build), and decrypt()ing a missing/stale
+        // file next would silently ship garbage that still fails
+        // verification once sent, rather than failing cleanly here.
+        fprintf(stderr, "patchiBEC: iBootPatcher() failed for %s (patchedPath=%d, prebootPath=%d)\n", path.c_str(),
+                patchedResult, prebootResult);
+        std::error_code ec;
+        fs::remove(decPath, ec);
+        return false;
+    }
 
     decrypt(const_cast<char*>(patchedPath.c_str()), const_cast<char*>(downgradePath.c_str()),
             const_cast<char*>(k->key.c_str()), const_cast<char*>(k->iv.c_str()), (char*)"FALSE",
