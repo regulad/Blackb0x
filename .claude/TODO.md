@@ -459,3 +459,26 @@ demand, so it can be refreshed as new builds/tuples get added to
 so the exact sourcing logic (ipsw.me primary, `BuildManifest.plist`/AppleDB
 fallback for builds ipsw.me doesn't list) is checked-in and auditable
 rather than only described after the fact.
+
+## 9. Change the saurik repo version when not building against an iOS 8 version
+
+Not started. `Blackb0x/Misc/apt/saurik.list` is a static, checked-in file
+(`deb http://apt.saurik.com/ ios/8.0 main`) staged verbatim onto every
+baked ramdisk regardless of target OS
+(`BakeRamdisk.cpp:stageBlackb0xTree()`'s plain `stageFile(...,
+resolveMiscPath("apt/saurik.list"), ...)` call) — same class of bug as
+item 8's persistence-payload/firmware-deb fix: apt.saurik.com hosts
+separate, version-specific `ios/X.0` dist branches (Cydia's repo has
+historically been split this way per iOS era), and pinning every bake to
+`ios/8.0` is only correct for 8.x-era targets. Once bake-time knows the
+real target version to use (the same "newest known version for this
+device model" value item 8's fix and this session's bug fix already
+thread through for `stageVersionBranch()`/the synthetic `firmware`
+package), `saurik.list` needs to pick its dist path from that same value
+instead of a fixed string — likely templated the same way
+`stagePostinstallScript()` already substitutes `postinstall.sh`'s
+`__BLACKB0X_PACKAGES__` placeholder, rather than a plain static
+`stageFile()` copy. Needs the actual mapping from OS era to saurik's real
+`ios/X.0` dist names confirmed against apt.saurik.com before implementing
+(not all of this project's supported OS eras necessarily have their own
+distinct saurik dist branch — worth checking which do).
