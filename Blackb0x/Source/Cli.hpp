@@ -60,6 +60,19 @@ struct CliOptions {
     // suite end to end (checkm8/pwnTool still runs regardless, unless
     // noPwn above also skips it).
     bool stockFirmware = false;
+    // Like noPwn above (never attempt to run a pwntool), but for the
+    // opposite scenario: a genuinely un-exploited device, still running
+    // real, un-bypassed SecureROM signature enforcement. Errors out if the
+    // device IS already pwned (PWND: in its serial string) instead of
+    // proceeding -- an already-pwned device contradicts what this flag is
+    // for, so silently continuing would give a meaningless result. If the
+    // device is confirmed not pwned, skips the pwntool and proceeds into
+    // the rest of the boot chain regardless, relying entirely on the
+    // device's own real signature verification -- only a meaningful test
+    // combined with stockRecovery/stockFirmware above (blackb0x's own
+    // patched content will just fail that verification immediately
+    // otherwise, telling you nothing new).
+    bool stockSecurom = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or
     // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms

@@ -101,6 +101,15 @@ void printCliUsage(const char* argv0) {
     printf("                            implicated. Combine with --stock-recovery for a\n");
     printf("                            fully-stock suite end to end. The device will\n");
     printf("                            NOT be jailbroken by a run using this flag.\n");
+    printf("  --stock-securom           DIAGNOSTIC: never attempt to run a pwntool, for a\n");
+    printf("                            genuinely un-exploited device still running real,\n");
+    printf("                            un-bypassed SecureROM signature enforcement --\n");
+    printf("                            ERRORS if the device already reports PWND: in its\n");
+    printf("                            serial string (contradicts what this flag is for),\n");
+    printf("                            instead of skipping a pwntool. Only meaningful\n");
+    printf("                            combined with --stock-recovery/--stock-firmware --\n");
+    printf("                            blackb0x's own patched content will just fail real\n");
+    printf("                            signature verification immediately otherwise.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -139,6 +148,8 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.stockRecovery = true;
         } else if (arg == "--stock-firmware") {
             options.stockFirmware = true;
+        } else if (arg == "--stock-securom") {
+            options.stockSecurom = true;
         } else if (arg == "--pwntool") {
             std::string value = nextArg("--pwntool");
 #if defined(__APPLE__)
@@ -172,6 +183,16 @@ CliOptions parseCliOptions(int argc, char** argv) {
     // either -- it controls whether a pwntool runs at all.
     if (options.stockFirmware && options.stockRamdisk) {
         fprintf(stderr, "--stock-ramdisk is redundant with --stock-firmware\n");
+    }
+    // Opposite PWND-state requirements (noPwn hard-fails if NOT already
+    // pwned; stockSecurom hard-fails if it IS) -- not useful together,
+    // and checkExploit() checks stockSecurom first, then noPwn, so
+    // combining them just means noPwn's hard-fail wins once stockSecurom's
+    // own check passes.
+    if (options.noPwn && options.stockSecurom) {
+        fprintf(stderr,
+                "--no-pwn and --stock-securom require opposite device states (already pwned vs. not) -- "
+                "combining them is not useful.\n");
     }
     return options;
 }
@@ -265,14 +286,31 @@ bool waitForDFUMode(DeviceManager& deviceManager, uint64_t ecid, AppleTVDevice& 
 // device-model branching from the original, not simplified. `dryRun` skips
 // the actual SHAtter/checkm8 USB call (the point where this function stops
 // being observation and starts writing exploit payloads into the device),
-// printing what would have run instead. `noPwn` only gates the
-// AppleTV3,2/checkm8 branch below (the one that actually spawns a pwntool)
-// — SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that never
-// touches a pwntool at all, so there's nothing for this flag to refuse
-// there. (Was named noCheckm8/--no-checkm8; renamed once "pwntool" became
-// the general term for gaster/blackb0x-pwn both.)
+// printing what would have run instead. `noPwn`/`stockSecurom` only gate
+// the AppleTV3,2/checkm8 branch below (the one that actually spawns a
+// pwntool) — SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that
+// never touches a pwntool at all, so there's nothing for these flags to
+// refuse there. (`noPwn` was named noCheckm8/--no-checkm8; renamed once
+// "pwntool" became the general term for gaster/blackb0x-pwn both, keeping
+// its original hard-fail-if-not-already-pwned behavior.)
+//
+// stockSecurom is checked before the early pwnedDFU return below, not
+// after: its whole point is a genuinely un-exploited device (real,
+// Apple-signed SecureROM DFU, not checkm8'd) -- if the device is already
+// pwned, that contradicts the test setup this flag exists for, so it
+// needs to error out even though checkExploit() would otherwise treat an
+// already-pwned device as trivially "done" and return success.
 bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noPwn,
-                   const std::string& pwnTool) {
+                   bool stockSecurom, const std::string& pwnTool) {
+    if (stockSecurom && device.pwnedDFU) {
+        fprintf(stderr,
+                "--stock-securom: device is already in pwned DFU (PWND: in its serial string) -- this "
+                "flag requires a genuinely un-exploited device (real SecureROM signature enforcement "
+                "still intact) to be a meaningful test. Re-enter DFU mode on a device that hasn't been "
+                "pwned, or drop --stock-securom.\n");
+        return false;
+    }
+
     if (device.pwnedDFU) return true;
 
     if (device.deviceModel == "AppleTV2,1") {
@@ -299,21 +337,31 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
 
     if (device.deviceModel == "AppleTV3,2") {
         if (noPwn) {
-            // Not a hard failure: proceed straight into the rest of the
-            // boot chain (iBSS/iBEC/etc.) without ever having run a
-            // pwntool at all, even though the device isn't (as far as
-            // blackb0x can tell) already in pwned DFU. Useful when the
-            // device might already accept unsigned code through some path
-            // blackb0x's own pwnedDFU detection doesn't know about, or
-            // just to see how far the rest of the send flow gets on its
-            // own -- if SecureROM's signature check was never actually
-            // bypassed, that will surface naturally as a real failure
-            // further down (e.g. sendiBSS/sendiBEC), not here.
             fprintf(stderr,
-                    "--no-pwn: device is not already in pwned DFU (no PWND: in its serial string) -- "
-                    "skipping %s and proceeding into the rest of the boot chain anyway. If SecureROM's "
-                    "signature check was never actually bypassed, expect a real failure further down "
-                    "(e.g. sending iBSS/iBEC), not here.\n",
+                    "--no-pwn: device is not already in pwned DFU (no PWND: in its serial string) — "
+                    "refusing to run checkm8/%s. Pwn it separately first (e.g. `%s pwn`%s), or drop "
+                    "--no-pwn to let blackb0x do it.\n",
+                    pwnTool.c_str(), pwnTool.c_str(),
+                    pwnTool == "blackb0x-pwn" ? " — note blackb0x-pwn's own verb is `checkm8`, not `pwn`" : "");
+            return false;
+        }
+        if (stockSecurom) {
+            // Already confirmed not pwned (the check at the top of this
+            // function would have errored out otherwise) -- skip the
+            // pwntool entirely and proceed straight into the rest of the
+            // boot chain, relying on the device's own real, un-bypassed
+            // SecureROM signature verification the whole way. Only
+            // meaningful combined with --stock-recovery/--stock-firmware
+            // (sending blackb0x's own patched content to a genuinely
+            // un-exploited device will just fail signature verification
+            // immediately, telling you nothing new) -- this flag itself
+            // doesn't force that, so it's on the caller to combine them.
+            fprintf(stderr,
+                    "--stock-securom: device confirmed not already pwned -- skipping %s entirely and "
+                    "proceeding into the rest of the boot chain, relying on the device's own real "
+                    "SecureROM signature verification. Only meaningful combined with --stock-recovery/"
+                    "--stock-firmware -- blackb0x's own patched content will just fail signature "
+                    "verification immediately otherwise.\n",
                     pwnTool.c_str());
             return true;
         }
@@ -719,7 +767,8 @@ int runCli(const CliOptions& options) {
         }
     }
 
-    if (!checkExploit(deviceManager, device, options.dryRun, options.noPwn, options.pwnTool)) {
+    if (!checkExploit(deviceManager, device, options.dryRun, options.noPwn, options.stockSecurom,
+                       options.pwnTool)) {
         return 1;
     }
 
