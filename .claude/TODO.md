@@ -482,3 +482,30 @@ instead of a fixed string — likely templated the same way
 `ios/X.0` dist names confirmed against apt.saurik.com before implementing
 (not all of this project's supported OS eras necessarily have their own
 distinct saurik dist branch — worth checking which do).
+
+## 10. Additional ramdisk size shedding to get under the 64MiB watermark
+
+Not started. `BakeRamdisk.cpp`'s `kMaxRamdiskSize` (64MiB) is a real,
+hardware-confirmed tripwire — its own comment cites a real USB bulk
+short-write at exactly byte offset 0x4000000 (64MiB) on a 68.9MiB ramdisk,
+and `DeviceManager.cpp`'s `warnIfRamdiskExceedsDeviceLimit()` queries a
+given device/firmware's own real `ramdisk-size` getenv value right before
+upload as the authoritative per-device check. Exceeding `kMaxRamdiskSize`
+today only warns (`outSizeWarning`/`bake-all-ramdisks`' own "OK (with size
+warning...)" summary line) rather than failing the bake, since some
+devices/firmwares may tolerate more or less — but a bake that's already
+over 64MiB has no margin left at all for whichever device's real limit
+turns out to be at or below that. `kNeverStageDebs` (`shouldSkipStagingDeb()`,
+`BakeRamdisk.cpp` ~line 798) already excludes the largest known offenders
+by real, checked size (org.xbmc.kodi-atv2 ~40MB, odcctools ~7.7MB,
+gettext ~3.2MB, curl ~0.7MB, com.nito.nitotv ~1.65MB) via a real
+dependency-closure audit proving each is safe to drop. Worth a fresh pass
+once item 6's full bake sweep exists to measure real per-tuple final
+sizes across every known `(device, buildID)` combination (not just
+whichever were spot-baked so far) and identify which tuples are actually
+closest to or over the watermark, then repeat the same audit technique
+(`ar`/`tar` control-file inspection + transitive-closure computation
+against `postinstall.sh`'s real bootstrap set) to find further packages
+safe to exclude or move to network-only (staged in `apt-lists/` but not
+`private/var/cache/apt/archives/`, same mechanism `kNeverStageDebs`
+already uses) for whichever tuples need it.
