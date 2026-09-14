@@ -1274,8 +1274,20 @@ int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
 // `client` (success or failure), leaving connection lifecycle entirely
 // to the caller. Every other caller here leaves this at its default
 // (false, unchanged behavior).
+// commandBreq: the USB control transfer's own bRequest field for the
+// follow-up command -- irecv_send_command()'s default (still what every
+// OTHER command here uses: "ticket"/"setpicture"/"bgcolor"/"ramdisk"/
+// "devicetree"/"firmware") is bRequest=0, but real idevicerestore
+// (recovery.c) sends its two actual boot-triggering commands ("go" for
+// iBEC, "bootx" for the kernelcache) with bRequest=1 specifically via
+// irecv_send_command_breq() -- confirmed against a real AppleTV3,2: a
+// plain bRequest=0 "bootx" gets acknowledged over USB same as any other
+// command, but the device never actually executes the boot, instead
+// resetting back to iBoot's own command prompt ("Boot Failure Count"
+// climbing on every attempt). sendKernelCache()/sendStockRestoreTail()
+// below both pass 1 for their own "bootx" call for exactly this reason.
 static int sendFileThenCommand(irecv_client_t client, const char* what, const std::string& path,
-                                const char* command, bool keepOpen = false) {
+                                const char* command, bool keepOpen = false, uint8_t commandBreq = 0) {
     if (!client) {
         fprintf(stderr, "%s: device did not reconnect for %s\n", what, path.c_str());
         return -1;
@@ -1286,7 +1298,7 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
         if (!keepOpen) irecv_close(client);
         return -1;
     }
-    err = irecv_send_command(client, command);
+    err = irecv_send_command_breq(client, command, commandBreq);
     if (err != IRECV_E_SUCCESS) {
         fprintf(stderr, "%s: failed to send '%s' command: %s\n", what, command, irecv_strerror(err));
         if (!keepOpen) irecv_close(client);
@@ -1494,7 +1506,9 @@ int DeviceManager::sendKernelCache(const std::string& KernelCache_Path, uint64_t
     // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
     // follows Ramdisk's own NOTIFY_FINISH-triggered reset.
     irecv_client_t client = get_tv_patient(ecid);
-    int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx");
+    // bReq=1: see sendFileThenCommand()'s own comment -- "bootx" is one of
+    // idevicerestore's two bRequest=1 boot-triggering commands.
+    int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx", false, 1);
     if (result == 0 && !checkDeviceLeftRecoveryModeAfterBoot(ecid)) {
         result = -1;
     }
@@ -1518,6 +1532,33 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
         fprintf(stderr, "sendStockRestoreTail: device did not reconnect\n");
         return -1;
     }
+
+    // Real idevicerestore (recovery.c) never trusts one connection across
+    // this whole ticket->RestoreLogo->Ramdisk->DeviceTree->KernelCache
+    // sequence the way this function does -- every one of its own send
+    // steps defensively checks "if (client->recovery == NULL)" and
+    // reopens before sending. Confirmed on real hardware: RestoreLogo (the
+    // very first file send after a successful ApTicket+'ticket' exchange,
+    // on a real non-checkm8 SecureROM run) failed outright with "Unable
+    // to upload data to device" -- most consistent with this reused
+    // handle having gone stale in between, not a wrong protocol/API (the
+    // underlying irecv_send_buffer()/irecv_send_file() calls are
+    // identical to idevicerestore's own). There's no cheap no-op
+    // liveness ping in this USB protocol to check proactively, so instead
+    // retry once against a freshly-reopened connection specifically when
+    // a step's own send fails -- exactly the failure shape a stale handle
+    // produces -- rather than giving up on the very first attempt.
+    auto sendFileThenCommandWithReconnect = [&](const char* what, const std::string& path, const char* command,
+                                                 uint8_t bReq = 0) -> bool {
+        if (sendFileThenCommand(client, what, path, command, true, bReq) == 0) return true;
+        fprintf(stderr, "%s: retrying once against a freshly-reopened connection...\n", what);
+        client = get_tv_patient(ecid);
+        if (!client) {
+            fprintf(stderr, "%s: device did not reconnect for the retry\n", what);
+            return false;
+        }
+        return sendFileThenCommand(client, what, path, command, true, bReq) == 0;
+    };
 
     const struct irecv_device_info* info = irecv_get_device_info(client);
     auto ticket = fetchAPTicket(components.buildIdentity, ecid, info->ap_nonce, info->ap_nonce_size, deviceModel,
@@ -1545,9 +1586,9 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
 
     if (!onlyBootComponents) {
         if (components.restoreLogo) {
-            if (sendFileThenCommand(client, "sendStockRestoreTail(RestoreLogo)", *components.restoreLogo,
-                                     "setpicture 4", true) != 0) {
-                irecv_close(client);
+            if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(RestoreLogo)", *components.restoreLogo,
+                                                   "setpicture 4")) {
+                if (client) irecv_close(client);
                 return -1;
             }
             err = irecv_send_command(client, "bgcolor 0 0 0");
@@ -1560,8 +1601,8 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
         }
 
         for (const auto& [name, path] : components.loadedByIBoot) {
-            if (sendFileThenCommand(client, name.c_str(), path, "firmware", true) != 0) {
-                irecv_close(client);
+            if (!sendFileThenCommandWithReconnect(name.c_str(), path, "firmware")) {
+                if (client) irecv_close(client);
                 return -1;
             }
         }
@@ -1572,9 +1613,8 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
             return -1;
         }
         warnIfRamdiskExceedsDeviceLimit(client, *components.ramdisk);
-        if (sendFileThenCommand(client, "sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk", true) !=
-            0) {
-            irecv_close(client);
+        if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk")) {
+            if (client) irecv_close(client);
             return -1;
         }
 
@@ -1583,9 +1623,9 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
             irecv_close(client);
             return -1;
         }
-        if (sendFileThenCommand(client, "sendStockRestoreTail(DeviceTree)", *components.deviceTree, "devicetree",
-                                 true) != 0) {
-            irecv_close(client);
+        if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(DeviceTree)", *components.deviceTree,
+                                               "devicetree")) {
+            if (client) irecv_close(client);
             return -1;
         }
     }
@@ -1595,8 +1635,31 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
         irecv_close(client);
         return -1;
     }
-    if (sendFileThenCommand(client, "sendStockRestoreTail(KernelCache)", *components.kernel, "bootx", true) != 0) {
+    // Real idevicerestore (recovery_send_kernelcache(), recovery.c) always
+    // sends `setenv boot-args rd=md0 nand-enable-reformat=1 -progress`
+    // before triggering the boot -- without rd=md0 specifically, the
+    // kernel has no instruction to root off the ramdisk it was just sent,
+    // and panics/resets back to iBoot's own command prompt instead of
+    // booting. blackb0x's own patched iBEC route doesn't need this
+    // separately (patchiBEC()/Patcher.cpp already compiles an equivalent
+    // rd=md0 boot-args string directly into the patched iBEC itself), but
+    // useStockIBEC()'s genuinely-unpatched stock iBEC has no such
+    // compiled-in args and was never being told this at all. Order
+    // relative to the kernelcache file transfer itself doesn't matter --
+    // only that it happens before 'bootx' -- so it's sent first here for
+    // simplicity.
+    err = irecv_send_command(client, "setenv boot-args rd=md0 nand-enable-reformat=1 -progress");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendStockRestoreTail: failed to send 'setenv boot-args' command: %s\n",
+                irecv_strerror(err));
         irecv_close(client);
+        return -1;
+    }
+    // bReq=1: see sendFileThenCommand()'s own comment -- "bootx" is one of
+    // idevicerestore's two bRequest=1 boot-triggering commands.
+    if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(KernelCache)", *components.kernel, "bootx",
+                                           /*bReq=*/1)) {
+        if (client) irecv_close(client);
         return -1;
     }
 
