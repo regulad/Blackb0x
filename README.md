@@ -12,11 +12,29 @@ Devices supported:
 - Apple TV 2,1 (A1378) (tvOS 7.1.2 tethered, tvOS 6.1.4 untethered)
 
 **Tested hardware:** this portable port — **blackb0x--** — has only ever been
-verified against a real AppleTV3,2 running tvOS 7.9, on Linux. Every other
-device/firmware combination listed above is implemented from protocol
-analysis and disassembly, not confirmed on real hardware; macOS support is
-newer still and hasn't been built or run on real macOS hardware at all yet
-(see `.claude/TODO.md` item 4).
+verified against a real AppleTV3,2 running tvOS 7.9. Every other device/
+firmware combination listed above is implemented from protocol analysis and
+disassembly, not confirmed on real hardware. Platform status, from real
+hardware testing:
+
+- **macOS + `blackb0x-pwn`: known-good.** `blackb0x-pwn` (see "checkm8 on
+  macOS" below) has been run successfully against real AppleTV3,2 hardware.
+- **macOS + gaster: does not work, no matter what has been tried.** Not "flaky" —
+  genuinely non-functional on every macOS attempt so far. Use `--pwntool
+  blackb0x-pwn` (the default on macOS) instead; see below.
+- **Linux: should work per the code/design, but has not worked reliably on
+  any Linux machine tested.** Confirmed on two different real PCs — one
+  Intel 11th-gen, one AMD Zen 2 — both showing the same class of
+  non-deterministic USB behavior during the checkm8/DFU exploit sequence
+  (see `docs/HISTORY.md`'s "Reopening macOS support" entry for the
+  specific symptoms this was chased through). This may be a property of
+  Linux's USB stack/timing on the specific controllers tested rather than
+  something fixable in this project's own code — not resolved as of this
+  writing.
+- **Apple Silicon tip:** a plain (non-Thunderbolt) USB hub between the Mac
+  and the Apple TV, rather than a direct connection, has been reported to
+  make `blackb0x-pwn` reliable — worth trying first if a direct connection
+  is flaky.
 
 IMPORTANT: make sure your device is connected to the internet for the first boot. Do
 not turn it off during first boot until Kodi appears.
@@ -24,8 +42,8 @@ not turn it off during first boot until Kodi appears.
 ## Build
 
 ```sh
-git clone --recurse-submodules https://github.com/NSSpiral/Blackb0x.git
-cd Blackb0x
+git clone --recurse-submodules https://github.com/regulad/Blackb0x--.git
+cd Blackb0x--
 cmake -S . -B build
 cmake --build build -j$(nproc)
 ```
@@ -77,6 +95,30 @@ fresh clone + build, not just assumed):
   gets flushed live through `stdbuf`; without it, a stuck/hanging exploit run would
   be silently indistinguishable from a working one, which is worse than just
   refusing to start.
+
+### checkm8 on macOS: use `--pwntool blackb0x-pwn`
+
+`blackb0x` normally runs the checkm8 exploit by shelling out to the vendored
+`gaster` tool. **On macOS, gaster does not work — not intermittently, not
+"needs a workaround," genuinely non-functional no matter what has been
+tried.** `blackb0x` therefore builds a second executable on macOS,
+`blackb0x-pwn` (see `Blackb0x/Source/Pwn/`), that runs this project's own
+original checkm8/SHAtter exploit directly over libirecovery's native IOKit
+backend instead — no gaster, no libusb. **This is the default on macOS**
+(`--pwntool` defaults to `blackb0x-pwn` there; pass `--pwntool gaster` to
+force the old, broken path anyway, e.g. for debugging gaster itself).
+`blackb0x-pwn` is **known-good**: confirmed working against real AppleTV3,2
+hardware. It can also be run standalone (`blackb0x-pwn checkm8` /
+`blackb0x-pwn shatter`, both accepting `--ecid`) independent of `blackb0x`
+entirely.
+
+**Apple Silicon tip:** if `blackb0x-pwn` is unreliable over a direct
+USB-C connection, try a plain (non-Thunderbolt) USB hub between the Mac and
+the Apple TV instead — this has been reported to make it reliable.
+
+`--pwntool` (and `blackb0x-pwn` itself) only exist on macOS; on Linux,
+gaster is the only option, unconditionally, and passing `--pwntool` prints
+a warning and is otherwise ignored.
 
 ### One-time system setup: blacklist `apple_mfi_fastcharge`
 
@@ -213,6 +255,9 @@ See [`AGENTS.md`](AGENTS.md) for repo conventions, and
 [`docs/HISTORY.md`](docs/HISTORY.md) for the full port/debugging history.
 
 ## Credits
+**[NSSpiral](https://github.com/NSSpiral/Blackb0x)**
+* Original Blackb0x — the macOS Cocoa/Objective-C app this project is a portable CLI port of
+
 **nyan_satan**
 * libbootkit (iBSS loader for AppleTV3,2)
 

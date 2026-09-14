@@ -214,22 +214,48 @@ this session):
   in `blackb0x` still goes through; whether an IOKit-native path is
   available/needed there too is unexplored.
 
-Needs real macOS hardware to verify, not just code review — nothing below
-has changed, still all open:
+**Real macOS hardware results are in, and they change the picture:**
 
+- **gaster does not work on macOS, full stop.** Confirmed by real testing
+  against AppleTV3,2 hardware: not intermittent, not something a workaround
+  fixed — every attempt with gaster on macOS has failed. The IOKit-vs-
+  libusb switch above (and everything else tried) did not change this.
+  Given this, gaster is **not** the answer to "does the checkm8 chain work
+  on macOS" — 4b's `blackb0x-pwn` is.
+- **`blackb0x-pwn` (4b below) is known-good on macOS**, confirmed against
+  real AppleTV3,2 hardware — this is now blackb0x's actual, working macOS
+  checkm8 path, wired up as the default via `--pwntool` (`Cli.hpp`'s
+  `CliOptions::pwnTool`, `DeviceManager::checkm8Attempt()`): `gaster` stays
+  the unconditional-only option on Linux, `blackb0x-pwn` is the macOS
+  default (override with `--pwntool gaster` to force the known-broken path
+  anyway, e.g. to keep debugging gaster itself).
+- **Apple Silicon tip, from real testing:** a plain (non-Thunderbolt) USB
+  hub between the Mac and the Apple TV, instead of a direct connection, has
+  made `blackb0x-pwn` reliable. Worth trying first if a direct connection
+  is flaky — not yet understood why this matters, just observed.
+- **Linux, meanwhile, does not work reliably either** — confirmed on two
+  different real PCs (Intel 11th-gen, AMD Zen 2), both showing
+  non-deterministic USB behavior during the exploit sequence. This
+  reopening was originally prompted by exactly that Linux flakiness (see
+  this section's own opening paragraph); switching development focus to
+  macOS did produce a working tool, but on a *different* implementation
+  (blackb0x-pwn, not gaster) than the one this reopening started out
+  trying to fix on Linux, and Linux's own root cause is still unresolved.
+  Whether that's fixable in this project's own code, or a property of the
+  specific USB controllers/host stacks tested, is still open.
+- Whether the `--no-preflight` usbmuxd workaround this repo needs on Linux
+  is even relevant against macOS's built-in `usbmuxd` (probably not, since
+  it's Apple's own reference daemon) — a docs question, not code. Still
+  open, unrelated to the above.
 - Whether libusb's Darwin backend can claim a checkm8/DFU-mode Apple TV
   without the system's own `usbmuxd`/`MobileDevice` stack interfering, for
   the libirecovery-mediated parts of the chain (`DeviceManager.cpp`'s
   `sendiBSS`/`sendiBEC`/etc., `irecovery` itself) that still go through
-  libusb on every platform, gaster's own IOKit switch above notwithstanding.
-- Whether the `--no-preflight` usbmuxd workaround this repo needs on Linux
-  is even relevant against macOS's built-in `usbmuxd` (probably not, since
-  it's Apple's own reference daemon) — a docs question, not code.
-- End-to-end: whether building the CLI chain against gaster's native IOKit
-  path on real macOS hardware actually sidesteps the Linux-side DFU-state
-  races this reopening was prompted by, or whether that turns out to be a
-  property of the exploited device's own state machine rather than the
-  host's USB stack. Only a real Mac + real AppleTV3,2 run can answer this.
+  libusb on every platform even with `--pwntool blackb0x-pwn` (only
+  checkm8 itself moved to blackb0x-pwn's IOKit-native libirecovery build —
+  see 4b). Given `blackb0x-pwn checkm8` is confirmed working, whatever
+  happens next (`sendiBSS`/`sendiBEC`/etc.) is presumably also fine in
+  practice — but not independently confirmed bullet-by-bullet.
 
 Low-risk, expected to already work: `libusb_ext`'s `--disable-udev` is a
 no-op on Darwin (that configure branch is Linux-only, backend is
@@ -291,19 +317,47 @@ to run on macOS": `third_party/libirecovery` has its own genuine upstream
 `--with-iokit` native Darwin backend (confirmed by reading
 `configure.ac`/`libirecovery.c` directly, not assumed) as an alternative
 to libusb. `blackb0x-pwn` gets its own separate libirecovery build
-(`libirecovery_iokit_ext`, own install prefix, out-of-source so it can't
-collide with the shared in-source `libirecovery_ext`) with `--with-iokit`
-passed explicitly, so its configure step fails loudly if IOKit isn't
-available rather than silently falling back to libusb. Confirmed: no
-`deps::usb` anywhere in this target's link line at all.
+(`libirecovery_iokit_ext`, own install prefix, built from a private
+`git ls-files`-copied source tree — see that `ExternalProject_Add`'s own
+comment in `CMakeLists.txt` for why a copy, not the shared checkout, is
+required) with `--with-iokit` passed explicitly, so its configure step
+fails loudly if IOKit isn't available rather than silently falling back to
+libusb. Confirmed: no `deps::usb` anywhere in this target's link line at
+all.
 
-Verified so far: the exploit-body C file (`Checkm8Pwn.c`) is genuinely
-backend-agnostic (only calls through libirecovery's public `irecv_*` API,
-never touches IOKit/CoreFoundation directly) — confirmed directly by
-compiling and linking it *on Linux* against the existing libusb-backed
-libirecovery headers/library with `-Wall -Wextra` (zero warnings) and
-inspecting its undefined symbols (only `irecv_*` + libc, nothing
-IOKit-shaped). That's real signal the C is correct, but it is **not** a
-substitute for actually building/running on macOS, which hasn't happened
-yet — the CMake plumbing (the new out-of-source `libirecovery_iokit_ext`
-ExternalProject in particular) is entirely unverified on a real host.
+**Status: known-good, confirmed on real macOS + real AppleTV3,2
+hardware.** `blackb0x-pwn checkm8` runs and succeeds; `blackb0x` itself now
+defaults to it via `--pwntool` (see item 4's own update above) rather than
+gaster, which is confirmed *not* to work on macOS at all. Also confirmed
+working with the exact same real-hardware caveat item 4 records: a plain
+(non-Thunderbolt) USB hub between an Apple Silicon Mac and the Apple TV,
+rather than a direct connection, made it reliable.
+
+Before real-hardware confirmation, the only verification available was
+compiling and linking `Checkm8Pwn.c` *on Linux* against the existing
+libusb-backed libirecovery headers/library (`-Wall -Wextra` clean,
+undefined symbols only `irecv_*` + libc) to confirm it's genuinely
+backend-agnostic C — real signal, but not a substitute for the real run
+that's now happened.
+
+## 5. Pre-patch firmware components ahead of time, instead of after device enumeration
+
+Not started. Today's flow (`Cli.cpp`, ported from `MainView.m`'s
+`jailbreakClick`/`checkExploit`/`downloadComponentsForBuildID`/
+`componentsReady` chain) only starts downloading and patching iBSS/iBEC/
+ramdisk/kernelcache/devicetree for the target firmware *after* a device is
+already connected, identified, and the exploit (`checkm8`/`SHAtter`) has
+already run — i.e. network I/O and CPU-bound patching both happen inside
+the same window the device is expected to already be sitting in pwned DFU
+waiting for the next component. Since the target device model/firmware is
+knowable ahead of time in the common case (a specific device the user is
+about to plug in, or — for `bake-all-ramdisks`-style bulk runs — every
+firmware this project already knows about), there's no hard reason this
+has to be done live: downloading and patching components for the
+identified/likely firmware set could happen speculatively before (or
+concurrently with) device enumeration/the exploit itself, so that by the
+time the device is actually pwned and ready, sending components is just a
+local file copy with no network/patch latency in between. Worth
+scoping against real hardware timing data (is the current live-patch
+window actually a problem in practice, or just a theoretical one) before
+committing to the added complexity of a speculative/AOT patch cache.

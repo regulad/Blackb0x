@@ -2355,3 +2355,52 @@ prefixed name — as a fallback when plain `stdbuf` isn't on `PATH`) were the
 other three blockers already named in `.claude/TODO.md` item 4; all three
 are mechanical platform bridging with no design decision of their own
 worth recording here beyond what that TODO entry already says.
+
+## Real-hardware results: gaster doesn't work on macOS at all, blackb0x-pwn does, Linux is unreliable on every machine tested
+
+Everything in the two entries above (the gaster IOKit branch selection, the
+`libirecovery_iokit_ext` build, `blackb0x-pwn`) was built and reasoned
+about without a real Mac available — genuinely unverified, by this
+project's own repeated admission in both entries. Real hardware testing has
+since settled several of those open questions, and the answers reorganize
+this project's actual platform recommendation:
+
+- **gaster does not work on macOS, full stop — not something the IOKit
+  branch selection fixed, not something anything else tried fixed either.**
+  Every real attempt to run gaster's own `pwn` step on macOS against a real
+  AppleTV3,2 has failed. This is a real, repeated result, not a single bad
+  run — treat "gaster on macOS" as a known-broken path going forward, not
+  an open question.
+- **`blackb0x-pwn` — this project's own original checkm8, built standalone
+  against libirecovery's native IOKit backend (see the entry above) — does
+  work**, confirmed against real AppleTV3,2 hardware. Since this is the
+  opposite of gaster's result on the exact same platform and exact same
+  device, `blackb0x.cpp`'s own checkm8 dispatch (`DeviceManager.cpp`'s
+  `checkm8Attempt()`) now takes a `pwnTool` parameter ("gaster" or
+  "blackb0x-pwn") threaded from a new `--pwntool` CLI flag
+  (`Cli.hpp`/`Cli.cpp`) — Apple-only (it's rejected-with-a-warning, not
+  accepted, on Linux, where `blackb0x-pwn` isn't even built), defaulting to
+  `blackb0x-pwn` there specifically because that's the one that's actually
+  been confirmed to work. `--pwntool gaster` is still available on macOS
+  for anyone who wants to keep debugging gaster itself.
+- **A real, reproducible Apple Silicon quirk**: a direct USB-C connection
+  from an Apple Silicon Mac to the Apple TV was unreliable for
+  `blackb0x-pwn`; putting a plain (non-Thunderbolt) USB hub in between made
+  it reliable. Not understood *why* — recorded as a practical tip
+  (README.md, `.claude/TODO.md`), not a fixed root cause.
+- **Linux, meanwhile, remains unreliable — on every real machine tried.**
+  This whole "reopen macOS support" effort (see the two entries above) was
+  originally prompted by exactly this: real-hardware DFU-state races and
+  non-deterministic USB behavior chased at length earlier in this file
+  (`boot_client()`'s reset-timing saga, the `apple_mfi_fastcharge`
+  conflict, etc.), still present on a *second*, independently-confirmed
+  machine beyond whatever was used for that earlier chase — one real Intel
+  11th-gen PC and one real AMD Zen 2 PC have now both shown the same class
+  of problem. That rules out "just one bad host controller" as the
+  explanation; whether it's fixable in this project's own code at all, or
+  an inherent property of Linux's USB stack under this kind of
+  timing-sensitive exploit traffic, is still genuinely open. Practical
+  upshot: macOS + `blackb0x-pwn` is, as of this writing, the only
+  confirmed-reliable way to actually run this tool's checkm8 step, despite
+  Linux being the platform this project was originally, and still is,
+  primarily developed on.
