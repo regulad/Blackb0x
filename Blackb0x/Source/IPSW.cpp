@@ -191,6 +191,43 @@ std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool 
     if (!onlyBootComponents) info.restoreRamdiskPath = componentPath("RestoreRamDisk");
     info.restoreLogoPath = componentPath("RestoreLogo");
 
+    // Matches idevicerestore's own recovery_send_loaded_by_iboot(): walk
+    // every entry in the manifest (not just the fixed set above) and
+    // collect whichever ones are flagged Info.IsLoadedByiBoot (and not
+    // Info.IsLoadedByiBootStage1) -- see ManifestInfo::loadedByIBootComponents'
+    // own comment for why this stays generic.
+    {
+        plist_dict_iter iter = nullptr;
+        plist_dict_new_iter(manifest, &iter);
+        while (iter) {
+            char* key = nullptr;
+            plist_t node = nullptr;
+            plist_dict_next_item(manifest, iter, &key, &node);
+            if (!key) break;
+
+            plist_t info_ = node ? plist_dict_get_item(node, "Info") : nullptr;
+            if (info_) {
+                plist_t loadedNode = plist_dict_get_item(info_, "IsLoadedByiBoot");
+                plist_t stage1Node = plist_dict_get_item(info_, "IsLoadedByiBootStage1");
+                uint8_t loaded = 0, stage1 = 0;
+                if (loadedNode && plist_get_node_type(loadedNode) == PLIST_BOOLEAN) {
+                    plist_get_bool_val(loadedNode, &loaded);
+                }
+                if (stage1Node && plist_get_node_type(stage1Node) == PLIST_BOOLEAN) {
+                    plist_get_bool_val(stage1Node, &stage1);
+                }
+                if (loaded && !stage1) {
+                    std::string path = plistDictString(info_, "Path");
+                    if (!path.empty()) {
+                        info.loadedByIBootComponents.emplace_back(key, path);
+                    }
+                }
+            }
+            free(key);
+        }
+        free(iter);
+    }
+
     // plist_copy(): `identity` is a subtree of `root`, freed below --
     // detach an independent copy so it outlives this function.
     info.buildIdentity = std::shared_ptr<void>(plist_copy(identity), plist_free);

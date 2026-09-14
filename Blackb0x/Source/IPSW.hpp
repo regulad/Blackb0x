@@ -16,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 // A firmware component's decryption [iv, key] pair, as stored in
 // Blackb0x/ImageKeys/<device>/<device>_<buildID>.keys.
@@ -43,6 +44,17 @@ struct ManifestInfo {
     // APTicket is on file; blackb0x's own patched-bootloader flow never
     // needed it because it was never ticket-gated in the first place.
     std::string restoreLogoPath;
+    // Every OTHER manifest component (name -> Path) whose own
+    // Info.IsLoadedByiBoot is true and Info.IsLoadedByiBootStage1 isn't
+    // -- matches idevicerestore's own recovery_send_loaded_by_iboot(),
+    // which iterates the whole manifest generically rather than a fixed
+    // list, since which components (if any) carry this flag varies by
+    // device/build. Empty for builds where nothing does (confirmed via a
+    // real AppleTV3,2 manifest that this is currently the common case for
+    // this project's own target hardware) -- kept generic anyway rather
+    // than hardcoded to "always empty here", since a different build or
+    // device this project targets later could genuinely have entries.
+    std::vector<std::pair<std::string, std::string>> loadedByIBootComponents;
 
     // The matching BuildIdentity dict (a plist_t, type-erased as
     // shared_ptr<void> with plist_free as its deleter so this header

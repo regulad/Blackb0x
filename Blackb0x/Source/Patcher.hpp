@@ -48,6 +48,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "IPSW.hpp"
 
@@ -61,6 +63,10 @@ struct PatchedComponents {
     // See setRestoreLogoPath()'s own comment -- unset whenever this
     // build's manifest doesn't list a RestoreLogo component at all.
     std::optional<std::string> restoreLogo;
+    // See addLoadedByIBootComponent()'s own comment -- name -> local
+    // downloaded path, one entry per IPSW.hpp's own
+    // ManifestInfo::loadedByIBootComponents (usually empty).
+    std::vector<std::pair<std::string, std::string>> loadedByIBoot;
 
     // --stock-securom (Cli.hpp's CliOptions): the matching BuildManifest.plist
     // identity (IPSW.hpp's ManifestInfo::buildIdentity, passed through
@@ -186,6 +192,15 @@ public:
     // downloadAndPatchComponents() in Cli.cpp) -- not every build's
     // manifest lists a RestoreLogo component at all.
     void setRestoreLogoPath(const std::string& path);
+
+    // Like setRestoreLogoPath() above -- sent unmodified, no decrypt/
+    // patch step. Called once per entry in IPSW.hpp's own
+    // ManifestInfo::loadedByIBootComponents (see that field's own
+    // comment) -- name must match the manifest's own component key
+    // exactly, since DeviceManager::sendFirmwareComponent() sends it
+    // alongside the "firmware" command the same way real idevicerestore
+    // does, and nothing here validates it further.
+    void addLoadedByIBootComponent(const std::string& name, const std::string& path);
 
     // See PatchedComponents::buildIdentity's own comment.
     void setBuildIdentity(std::shared_ptr<void> identity) { outputs_.buildIdentity = std::move(identity); }

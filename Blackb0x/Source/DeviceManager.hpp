@@ -156,6 +156,14 @@ public:
     // after sendAPTicket(), before sendRamdisk(), same ordering reasoning
     // as sendAPTicket()'s own comment.
     int sendRestoreLogo(const std::string& path, uint64_t ecid);
+    // One call per entry in Patcher.hpp's PatchedComponents::loadedByIBoot
+    // (almost always empty -- see IPSW.hpp's own
+    // ManifestInfo::loadedByIBootComponents comment). Sends the file, then
+    // the "firmware" command, matching idevicerestore's own
+    // recovery_send_loaded_by_iboot()/recovery_send_component_and_command().
+    // Must run alongside sendRestoreLogo() above -- after sendAPTicket(),
+    // before sendRamdisk().
+    int sendFirmwareComponent(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
     int sendDeviceTree(const std::string& path, uint64_t ecid);

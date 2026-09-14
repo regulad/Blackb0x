@@ -516,6 +516,11 @@ void Patcher::setRestoreLogoPath(const std::string& path) {
     checkPatching();
 }
 
+void Patcher::addLoadedByIBootComponent(const std::string& name, const std::string& path) {
+    outputs_.loadedByIBoot.emplace_back(name, path);
+    checkPatching();
+}
+
 void Patcher::checkPatching() {
     if (!outputs_.iBSS) return;
 

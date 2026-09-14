@@ -1319,6 +1319,14 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
     return 0;
 }
 
+int DeviceManager::sendFirmwareComponent(const std::string& path, uint64_t ecid) {
+    // get_tv_patient(): same reasoning as sendiBEC() above.
+    irecv_client_t client = get_tv_patient(ecid);
+    int result = sendFileThenCommand(client, "sendFirmwareComponent", path, "firmware");
+    sleep(2);
+    return result;
+}
+
 // A real run against an AppleTV3,2 failed mid-Ramdisk-upload with a bulk
 // short-write ("wrote 0 of 32768 bytes") at exactly packet 2049/2204 -- byte
 // offset 0x4000000 (64MiB) on the nose, on a 68.9MiB ramdisk. Too round a

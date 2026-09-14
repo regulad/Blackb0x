@@ -512,6 +512,15 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     downloadAndPatch("RestoreLogo", manifest->restoreLogoPath,
                       [&](const std::string& path) { patcher.setRestoreLogoPath(path); });
 
+    // Almost always empty (see ManifestInfo::loadedByIBootComponents' own
+    // comment) -- one downloadAndPatch() call per manifest entry flagged
+    // Info.IsLoadedByiBoot, matching idevicerestore's own generic
+    // iteration instead of a fixed component list.
+    for (const auto& [name, remotePath] : manifest->loadedByIBootComponents) {
+        downloadAndPatch(name.c_str(), remotePath,
+                          [&](const std::string& path) { patcher.addLoadedByIBootComponent(name, path); });
+    }
+
     if (!onlyBootComponents) {
         downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath, [&](const std::string& path) {
             if (stockRamdisk || stockFirmware) {
@@ -640,6 +649,21 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
             printf("%s\n", (i == 0) ? "Sent" : "Error");
             if (i != 0) {
                 fprintf(stderr, "Failed to send RestoreLogo. Re-enter DFU mode and try again.\n");
+                return false;
+            }
+        }
+
+        // Almost always empty (see ManifestInfo::loadedByIBootComponents'
+        // own comment) -- matches idevicerestore's own
+        // recovery_send_loaded_by_iboot(), called right after AppleLogo,
+        // before Ramdisk.
+        for (const auto& [name, path] : components.loadedByIBoot) {
+            printf("Sending %s -> ", name.c_str());
+            fflush(stdout);
+            i = deviceManager.sendFirmwareComponent(path, device.ecid);
+            printf("%s\n", (i == 0) ? "Sent" : "Error");
+            if (i != 0) {
+                fprintf(stderr, "Failed to send %s. Re-enter DFU mode and try again.\n", name.c_str());
                 return false;
             }
         }
