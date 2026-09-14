@@ -450,6 +450,13 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
         return false;
     }
     printf("Sent\n");
+    // iBSS running successfully means the device is about to reboot and
+    // re-enumerate in Recovery mode -- sendiBEC() below (get_tv_patient())
+    // blocks retrying for up to ~30s waiting for exactly that, with no
+    // status of its own in between. Without this, that whole window reads
+    // as silently stuck rather than an expected, normal wait.
+    printf("Waiting for device to come back up in Recovery mode...\n");
+    fflush(stdout);
 
     if (tetherBoot) {
         printf("Sending iBEC (downgrade) -> ");
