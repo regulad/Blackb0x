@@ -544,11 +544,13 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
 
     printf("Sending iBSS -> ");
     fflush(stdout);
-    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery || stockSecurom) != 0) {
+    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurom) != 0) {
         printf("Error\n");
         fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
-                stockSecurom ? " (this failure is predictable, since you are trying to send the pwned "
-                               "recovery with an intact securom)"
+                stockSecurom ? " (this failure is still plausible even via the standard DFU route: "
+                               "useStockIBSS() sends a decrypted, unsigned iBSS, and a genuinely un-pwned "
+                               "SecureROM verifies signatures against the original encrypted image, not this "
+                               "one)"
                              : "");
         return false;
     }

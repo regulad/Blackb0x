@@ -1079,7 +1079,7 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid) {
 // sendComponentsToDevice(), which already knows exactly when each one
 // starts and what its result was) — these stay quiet on success and only
 // report genuine, otherwise-unexplained failures.
-int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool allowUnpwned) {
+int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool stockRecovery, bool stockSecurom) {
     irecv_client_t client = get_tv(ecid);
     if (!client) {
         return -1;
@@ -1088,12 +1088,33 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool all
     irecv_device_t device = nullptr;
     irecv_devices_get_device_by_client(client, &device);
 
-    if (strstr(device->product_type, "AppleTV3,1")) {
+    bool isATV31 = strstr(device->product_type, "AppleTV3,1") != nullptr;
+    bool isATV32 = strstr(device->product_type, "AppleTV3,2") != nullptr;
+
+    if ((isATV31 || isATV32) && stockSecurom) {
+        // --stock-securom: boot_client() below (used by sendiBSS_ATV31()/
+        // sendiBSS_ATV32()) is a custom soft-DFU sequence shaped around
+        // checkm8's own post-exploit memory-corruption state, not the real
+        // USB DFU class protocol SecureROM itself implements -- it has no
+        // reason to work against a device that was never exploited,
+        // independent of whether the iBSS content is valid. Use the same
+        // standard irecv_send_file() route every other component (iBEC,
+        // ramdisk, kernelcache) already uses instead, so this is at least
+        // a real attempt at real DFU-protocol delivery rather than one
+        // that fails at the USB state-machine level regardless of content.
+        irecv_error_t err = irecv_send_file(client, iBSSpath.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+        irecv_close(client);
+        return (err == IRECV_E_SUCCESS) ? 0 : -1;
+    }
+
+    bool allowUnpwned = stockRecovery || stockSecurom;
+
+    if (isATV31) {
         irecv_close(client);
         return sendiBSS_ATV31(ecid, iBSSpath.c_str(), allowUnpwned);
     }
 
-    if (strstr(device->product_type, "AppleTV3,2")) {
+    if (isATV32) {
         irecv_close(client);
         return sendiBSS_ATV32(ecid, iBSSpath.c_str(), allowUnpwned);
     }

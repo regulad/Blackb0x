@@ -102,16 +102,25 @@ public:
     irecv_client_t get_tv(uint64_t ecid);
 
     // --- iRecovery upload helpers ---
-    // allowUnpwned: skip the hard "PWND:[" serial-string check that would
-    // otherwise refuse to even attempt the AppleTV3,1/3,2 soft-DFU iBSS
-    // upload (see boot_client() in DeviceManager.cpp) -- set for
-    // --stock-recovery/--stock-securom (Cli.hpp's CliOptions), which
-    // deliberately want to try this against a device that either hasn't
-    // been pwned by this run's own checkm8 call, or was never meant to be
-    // (--stock-securom). Does not change anything else about the upload --
-    // a genuinely un-pwned device's real SecureROM is still free to reject
-    // it on its own terms.
-    int sendiBSS(const std::string& path, uint64_t ecid, bool allowUnpwned = false);
+    // stockRecovery/stockSecurom: mirror Cli.hpp's CliOptions of the same
+    // name.
+    //   - stockRecovery alone: device was genuinely pwned by this run's own
+    //     checkm8 call, just skip the hard "PWND:[" serial-string check
+    //     that boot_client() (DeviceManager.cpp) would otherwise still
+    //     enforce -- has no practical effect here since a real checkm8 run
+    //     already leaves that string in place, kept for symmetry/defense in
+    //     depth.
+    //   - stockSecurom: the device was never pwned at all, and for
+    //     AppleTV3,1/3,2 the usual boot_client() soft-DFU path is skipped
+    //     entirely in favor of the standard irecv_send_file() DFU-class
+    //     protocol -- boot_client()'s raw control-transfer sequence is
+    //     shaped around checkm8's own post-exploit memory-corruption state,
+    //     not the real DFU protocol, so it has no reason to work against a
+    //     device whose SecureROM was never exploited (see boot_client()'s
+    //     own comment). The standard route is at least a real attempt,
+    //     even though a genuinely un-pwned SecureROM is still free to
+    //     reject the content on signature-verification grounds.
+    int sendiBSS(const std::string& path, uint64_t ecid, bool stockRecovery = false, bool stockSecurom = false);
     int sendiBEC(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
