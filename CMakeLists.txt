@@ -315,6 +315,29 @@ foreach(_d ${_xpwn_subdirs})
             # this dependency. Applying it to every executable in xpwn's
             # subdirectories, needed or not, is simpler and harmless.
             add_dependencies(${_t} bzip2_ext libpng_ext)
+            if(APPLE)
+                # Same real macOS link failure blackb0x's own
+                # target_link_libraries(blackb0x ...) block was fixed for
+                # (see that comment for the full explanation): every one of
+                # these executables also links ${CRYPTO_LIBRARIES} (=
+                # libwolfssl.a, via the OPENSSL_LIBRARIES/CRYPTO_LIBRARIES
+                # cache-variable redirect near the top of this file), and
+                # once ANY symbol from wolfSSL's internal.o/ssl.o gets
+                # pulled in, the whole object file comes with it --
+                # including DoAppleNativeCertValidation/LoadSystemCaCertsMac,
+                # which need CoreFoundation/Security regardless of whether
+                # this specific tool ever calls into them. Confirmed for
+                # real against dmg-bin specifically; applying to every
+                # executable here rather than enumerating exactly which
+                # ones hit it, same reasoning as the bzip2_ext/libpng_ext
+                # dependency two lines up — none of these tools are
+                # actually used by blackb0x/bake-all-ramdisks at runtime
+                # (only the `xpwn` library and blackb0x_xpwntool are), so
+                # there's no harm in over-applying this.
+                target_link_libraries(${_t} PRIVATE
+                    "-framework CoreFoundation"
+                    "-framework Security")
+            endif()
         endif()
     endforeach()
 endforeach()
@@ -950,7 +973,15 @@ target_include_directories(xpwn BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
 # wolfSSL's shim went unnoticed) — confirmed as a real, not hypothetical,
 # bug on a real macOS build, which has no such fallback header anywhere on
 # its default include path and failed outright.
-foreach(t dmg-bin ipsw xpwntool imagetool dripwn blackb0x_xpwntool)
+# dmg-bin doesn't exist as a target on Apple at all (third_party/xpwn's own
+# dmg/CMakeLists.txt skips it there — it duplicates macOS's native
+# `hdiutil`, see that file's own comment) — omit it from this list there,
+# referencing a nonexistent target name is a hard CMake error.
+set(_wolfssl_include_targets ipsw xpwntool imagetool dripwn blackb0x_xpwntool)
+if(NOT APPLE)
+    list(APPEND _wolfssl_include_targets dmg-bin)
+endif()
+foreach(t ${_wolfssl_include_targets})
     target_include_directories(${t} PRIVATE ${DEPS_INCLUDE})
     target_include_directories(${t} BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
     target_compile_options(${t} PRIVATE -include ${DEPS_INCLUDE}/wolfssl/options.h)
