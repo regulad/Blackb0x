@@ -2435,3 +2435,69 @@ for anything observed with USB attached). Two practical consequences:
   "Boot Failure Count" increment (the device booted and ran fine unplugged
   in between blackb0x attempts, ruling out failing NAND as the cause of
   that failure).
+
+## Unresolved: the stock (`--stock-recovery`/`--stock-securerom`) restore-tail path has never been gotten to boot successfully
+
+Extensive real-hardware iteration against a real AppleTV3,2 (12H606, and
+briefly 12H1006/"latest") has not produced a single successful boot via
+`sendStockRestoreTail()`, on either sub-path:
+
+- **`--stock-recovery` without `--stock-securerom`** (checkm8 + a genuinely
+  stock, unpatched iBEC): every attempt reaches `bootx`, gets it
+  acknowledged over USB, and then the device resets back to iBoot's own
+  command prompt (`Boot Failure Count` incrementing on a real, freshly
+  power-cycled device — confirmed NOT a stuck/stale counter, and
+  confirmed NOT a NAND-health issue, since the same device boots and runs
+  tvOS completely normally once unplugged — see the entry above).
+- **`--stock-firmware --stock-recovery --stock-securerom`** (real
+  SecureROM, no checkm8 at all): has not yet even reliably reached
+  `bootx` — every real run so far died earlier, at RestoreLogo/Ramdisk,
+  with `irecv_send_file()` failing outright ("Unable to upload data to
+  device") on the reused post-ticket connection, despite a real ApTicket
+  round-trip with Apple succeeding immediately before it.
+
+Real idevicerestore's actual `recovery.c`/`dfu.c` source (fetched fresh
+from GitHub, not assumed/half-remembered) was read start to finish and
+compared line-by-line against this project's own `sendStockRestoreTail()`/
+`sendKernelCache()`/`sendiBEC()`/`sendRamdisk()` for this exact device
+class (build_major=12>8, non-image4, non-macos_variant, non-custom).
+Every concrete, confirmable discrepancy found this way was fixed:
+`bootx`/`go` need `bRequest=1` not the default 0 (`irecv_send_command_breq()`);
+a missing zero-length DFU_DNLOAD-class control transfer
+(`0x21`/`1`/zero-length) right after the kernelcache upload, before
+boot-args/`bootx`; a missing `setenv boot-args rd=md0 ...` for the stock
+(uncompiled-in-args) iBEC path specifically; a missing
+`irecv_usb_set_configuration(client, 1)` after the post-iBSS reconnect;
+a missing `setenv auto-boot false`/`saveenv` before RestoreLogo; a
+missing `getenv ramdisk-delay`; and a reused, potentially-stale USB
+connection across the whole ticket→RestoreLogo→Ramdisk→DeviceTree→
+KernelCache sequence (now retried once against a fresh reconnect per
+step). None of it — individually or all together — has resolved the
+underlying failure on real hardware as of this writing.
+
+**Conclusion, stated plainly rather than left implicit**: something is
+still genuinely different between this project's implementation and real
+idevicerestore's for this exact restore-tail sequence, and it has evaded
+detection through a real, full source-level comparison. This is not from
+lack of trying — it's an honest, currently-unsolved gap. Worth
+considering for whoever picks this up next:
+
+- The comparison so far has been idevicerestore's `recovery.c`/`dfu.c`
+  read directly and matched function-by-function; it has NOT included a
+  live, side-by-side USB packet capture (e.g. `usbmon`/Wireshark) of a
+  real idevicerestore run against comparable old hardware, which would
+  catch anything at the wire level that reading source can't (timing,
+  transfer chunking, an endpoint/interface selection difference, a
+  standard (non-DFU-class) USB control request neither of us has been
+  looking for).
+- Worth an explicit caveat: the stock diagnostic route specifically
+  (`--stock-recovery`/`--stock-securerom`) never touches `BakeRamdisk.cpp`
+  at all — it sends Apple's own downloaded `RestoreRamDisk` untouched (or
+  decrypt()-only), never the `dist/`-baked one. So a ramdisk-baker bug
+  can't be the direct cause of the stock-path failures documented above.
+  It remains a live suspect for the *separate*, ultimate goal (a real
+  jailbroken boot via the patched `dist/*.dmg` ramdisk), since
+  `bake-all-ramdisks` is Linux-only today and has never actually been run
+  on the macOS host all of this real-hardware testing has been done from
+  — see item 4a in `.claude/TODO.md`, "macOS support for the ramdisk
+  baker", the next thing being investigated.
