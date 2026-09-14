@@ -916,8 +916,24 @@ extern "C" void blackb0x_irecv_device_event_cb(const irecv_device_event_t* event
         const char* modeStr = mode_to_str(mode);
         const char* productType = device ? device->product_type : "";
 
-        int pwnedDFU = 0;
         const char* serial = event->device_info->serial_string;
+
+        // irecv_get_mode()'s PID read is unreliable at exactly this
+        // DFU<->Recovery transition (see serialStringIndicatesRealDFU()'s
+        // own comment for the documented upstream reports and a real
+        // capture pair) -- this is the device-classification point
+        // waitForDFUMode()/checkm8Attempt() (Cli.cpp) actually gate on, so
+        // a misreported "DFU" here means checkm8 gets attempted against a
+        // device that's still genuinely in Recovery mode underneath (no
+        // "SRTG:[iBoot-...]" in its serial string at all). Correct it back
+        // to "Recovery" before it ever reaches icon->mode below, the same
+        // way the later stockSecurom send-file branch already trusts the
+        // serial string over this same PID read.
+        if (modeStr && strcmp(modeStr, "DFU") == 0 && !serialStringIndicatesRealDFU(serial)) {
+            modeStr = "Recovery";
+        }
+
+        int pwnedDFU = 0;
         if (serial && strstr(serial, "SHAtter")) pwnedDFU = 1;
         if (serial && strstr(serial, "checkm8")) pwnedDFU = 2;
 
