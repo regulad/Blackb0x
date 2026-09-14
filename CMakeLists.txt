@@ -1060,28 +1060,39 @@ if(APPLE)
     # "includes non-existent path" check on every clean configure.
     file(MAKE_DIRECTORY ${DEPS_IOKIT_INCLUDE})
 
-    # BUILD_IN_SOURCE 0 (the default -- omitted, unlike every libusb-backed
-    # ExternalProject_Add above): libirecovery_ext already builds in-source
-    # directly inside third_party/libirecovery, so a second in-source build
-    # here with different configure flags would overwrite its Makefile/
-    # config.status/object files out from under it. NOCONFIGURE=1
-    # ./autogen.sh (first COMMAND) only bootstraps the shared, generic
-    # `configure` script (aclocal/autoheader/automake/autoconf -- see
-    # autogen.sh's own NOCONFIGURE check) without running ./configure
-    # in-source; the real, differently-flagged ./configure call (second
-    # COMMAND) then runs out-of-source, from this step's own separate
-    # <BINARY_DIR>, exactly like every other out-of-source autotools
-    # ExternalProject_Add would. DEPENDS libirecovery_ext purely to
-    # serialize the two targets' autogen.sh runs against the same source
-    # directory -- both are idempotent and would otherwise be a real race
-    # under parallel `make -j`.
+    # A first attempt tried to reuse third_party/libirecovery's own
+    # checkout directly, out-of-source (VPATH), to avoid colliding with
+    # libirecovery_ext's in-source build there -- autoconf's generated
+    # `configure` refuses that outright ("source directory already
+    # configured; run 'make clean' first") the moment it notices the
+    # source directory itself already has build artifacts in it from
+    # libirecovery_ext's own in-source run, regardless of DEPENDS
+    # ordering. Autotools genuinely does not support in-source and
+    # out-of-source builds against the same source tree at once.
+    #
+    # Fixed by giving this target its own private, pristine copy of the
+    # source instead: `git ls-files -z | tar ...` copies exactly the
+    # tracked files AT THEIR CURRENT WORKING-TREE CONTENT (not just
+    # HEAD -- deliberately, since third_party/libirecovery can carry a
+    # real uncommitted local fix at any given time, per this project's own
+    # "fork it, don't leave an uncommitted patch" convention being
+    # aspirational rather than always-instantaneously-true; confirmed
+    # directly that a real uncommitted edit to src/libirecovery.c survives
+    # this copy), while implicitly excluding every untracked/gitignored
+    # generated file (configure, Makefile, config.status, .libs/, *.lo/
+    # *.o, autom4te.cache/) that caused the VPATH conflict above in the
+    # first place -- a completely independent, ordinary in-source
+    # ./autogen.sh build against that private copy has nothing left to
+    # collide with libirecovery_ext over.
+    set(LIBIRECOVERY_IOKIT_SRC ${CMAKE_BINARY_DIR}/libirecovery-iokit-src)
     ExternalProject_Add(libirecovery_iokit_ext
-        DEPENDS         libirecovery_ext libplist_ext libimobiledevice_glue_ext
-        SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libirecovery
-        CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env NOCONFIGURE=1
-                            ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR}/third_party/libirecovery ./autogen.sh
-                  COMMAND ${AUTOTOOLS_ENV_WITH_MODERN} ${CMAKE_SOURCE_DIR}/third_party/libirecovery/configure
-                            --prefix=${DEPS_IOKIT_PREFIX}
+        DEPENDS         libplist_ext libimobiledevice_glue_ext
+        SOURCE_DIR      ${LIBIRECOVERY_IOKIT_SRC}
+        DOWNLOAD_COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIBIRECOVERY_IOKIT_SRC}
+                  COMMAND ${CMAKE_COMMAND} -E make_directory ${LIBIRECOVERY_IOKIT_SRC}
+                  COMMAND sh -c "cd '${CMAKE_SOURCE_DIR}/third_party/libirecovery' && git ls-files -z | tar -cf - --null -T - | tar -xf - -C '${LIBIRECOVERY_IOKIT_SRC}'"
+        BUILD_IN_SOURCE 1
+        CONFIGURE_COMMAND ${AUTOTOOLS_ENV_WITH_MODERN} ./autogen.sh --prefix=${DEPS_IOKIT_PREFIX}
                             --enable-static --disable-shared --with-iokit
         BUILD_COMMAND   ${AUTOTOOLS_ENV_WITH_MODERN} make -j
         INSTALL_COMMAND make install
