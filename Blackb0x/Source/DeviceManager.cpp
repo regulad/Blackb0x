@@ -1272,9 +1272,26 @@ static void checkDeviceLeftRecoveryModeAfterBoot(uint64_t ecid) {
                     i * 5);
             return;
         }
+        // Raw numeric mode, not just mode_to_str()'s collapsed "Recovery"
+        // string -- IRECV_K_RECOVERY_MODE_1..4 (0x1280-0x1283) are four
+        // genuinely different USB PIDs that mode_to_str() folds into one
+        // label. Whether this device's kernel-booted-and-running-the-
+        // ramdisk's-own-restore-protocol state uses a *different* one of
+        // these four than iBoot's own pre-kernel-boot recovery console
+        // does isn't confirmed anywhere in this codebase -- logging the
+        // raw value on every poll at least surfaces if/when it changes,
+        // which plain reachability alone can't. Serial string logged too:
+        // if anything about the device's self-reported identity changes
+        // once the ramdisk's kernel is actually running versus iBoot
+        // itself, this is the other place that would show up.
+        int mode = 0;
+        irecv_get_mode(check, &mode);
+        const struct irecv_device_info* info = irecv_get_device_info(check);
+        fprintf(stderr,
+                "sendKernelCache: still responding in Recovery mode after %ds (this can be entirely "
+                "normal -- see above). Raw mode: 0x%04x. Serial string: %s\n",
+                i * 5, mode, (info && info->serial_string) ? info->serial_string : "(none)");
         irecv_close(check);
-        fprintf(stderr, "sendKernelCache: still responding in Recovery mode after %ds (this can be "
-                        "entirely normal -- see above).\n", i * 5);
     }
     fprintf(stderr,
             "sendKernelCache: still responding in Recovery mode 60s after 'bootx'. Past this point it's "
