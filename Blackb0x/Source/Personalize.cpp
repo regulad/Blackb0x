@@ -63,7 +63,16 @@ plist_t requestTSS(std::shared_ptr<void> buildIdentity, uint64_t ecid, const uns
         }
     }
 
-    tss_set_debug_level(1);
+    // Level 1 only unlocks tss.c's own error()-level messages
+    // ("ERROR: Unable to find X node", etc.) -- its actual request/
+    // response plist dumps (debug_plist(), the only way to see exactly
+    // which manifest components got included and what a real TSS
+    // response actually contains) are gated on level >= 2 specifically
+    // (confirmed directly against libtatsu's own tss.c: both debug() and
+    // debug_plist() check `debug_level < 2`). Real hardware runs of the
+    // combined-ApTicket flow have hit a wall that's impossible to
+    // diagnose further without seeing the actual wire content.
+    tss_set_debug_level(2);
 
     plist_t parameters = plist_new_dict();
     plist_dict_set_item(parameters, "ApECID", plist_new_uint(ecid));
