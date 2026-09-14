@@ -22,7 +22,7 @@
  */
 //
 // Copied from libimobiledevice/idevicerestore @ src/img3.c (current HEAD
-// as of 2026-09) -- --stock-securom's one missing piece: stitching a
+// as of 2026-09) -- --stock-securerom's one missing piece: stitching a
 // TSS-response SHSH/ECID/CERT blob into an already-downloaded, still-
 // encrypted img3 file's own tags, the same way a genuine (non-exploited)
 // idevicerestore DFU restore personalizes each component before sending

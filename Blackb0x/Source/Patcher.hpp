@@ -68,11 +68,11 @@ struct PatchedComponents {
     // ManifestInfo::loadedByIBootComponents (usually empty).
     std::vector<std::pair<std::string, std::string>> loadedByIBoot;
 
-    // --stock-securom (Cli.hpp's CliOptions): the matching BuildManifest.plist
+    // --stock-securerom (Cli.hpp's CliOptions): the matching BuildManifest.plist
     // identity (IPSW.hpp's ManifestInfo::buildIdentity, passed through
     // unchanged) -- sendComponentsToDevice()/DeviceManager::sendiBSS() need
     // this to personalize iBSS with a real TSS-issued SHSH ticket. Unset
-    // (nullptr) whenever stockSecurom isn't in play.
+    // (nullptr) whenever stockSecurerom isn't in play.
     std::shared_ptr<void> buildIdentity;
     // IPSW.hpp's ManifestInfo::realBuildID, passed through unchanged --
     // personalizeIMG3Component() (Personalize.cpp) needs this alongside
@@ -133,24 +133,24 @@ public:
     // patches; if it fails the same way, the failure is elsewhere
     // (kernelcache/ramdisk patches, devicetree, or the boot trigger
     // itself).
-    // stockSecurom (--stock-securom, Cli.hpp's CliOptions): decrypt()ing
+    // stockSecurerom (--stock-securerom, Cli.hpp's CliOptions): decrypt()ing
     // still produces a bare, decrypted, unwrapped binary (the img3
     // container gets stripped) -- fine for the checkm8-shaped soft-DFU
     // upload path (boot_client() in DeviceManager.cpp), which sends raw
     // post-verification bytes since checkm8 skips SecureROM's check
-    // entirely. But sendiBSS()'s --stock-securom route sends this to a
+    // entirely. But sendiBSS()'s --stock-securerom route sends this to a
     // device whose SecureROM was never exploited via the *standard* DFU
     // protocol, which hands the received bytes to SecureROM's own image
     // loader -- that loader expects (and cryptographically verifies) a
     // real img3 container, computed over the ORIGINAL encrypted bytes as
     // signed by Apple. A decrypted/unwrapped binary fails that check
-    // immediately regardless of its content. So when stockSecurom is set,
+    // immediately regardless of its content. So when stockSecurerom is set,
     // skip decrypt() entirely and point straight at the original
     // downloaded file, untouched -- still encrypted, still img3-wrapped,
     // exactly as Apple shipped and signed it.
-    bool useStockIBSS(const std::string& path, bool stockSecurom = false);
+    bool useStockIBSS(const std::string& path, bool stockSecurerom = false);
     // Unlike useStockIBSS() above, this one's correctness doesn't depend
-    // on stockSecurom at all: iBEC is only ever sent once some iBSS is
+    // on stockSecurerom at all: iBEC is only ever sent once some iBSS is
     // already running, and useStockIBEC() is only ever called when
     // useStockIBSS() was too (both gated on stockRecovery in Cli.cpp) --
     // meaning that running iBSS is always useStockIBSS()'s own unpatched
@@ -159,7 +159,7 @@ public:
     // iBootPatcher()), so it will verify iBEC's img3 signature over the
     // original encrypted bytes exactly like a real SecureROM does for
     // iBSS -- decrypting iBEC first invalidates that signature
-    // unconditionally, not just under --stock-securom. Always sends the
+    // unconditionally, not just under --stock-securerom. Always sends the
     // original downloaded file untouched.
     bool useStockIBEC(const std::string& path);
 

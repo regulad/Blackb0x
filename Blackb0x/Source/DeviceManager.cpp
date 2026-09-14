@@ -927,7 +927,7 @@ extern "C" void blackb0x_irecv_device_event_cb(const irecv_device_event_t* event
         // device that's still genuinely in Recovery mode underneath (no
         // "SRTG:[iBoot-...]" in its serial string at all). Correct it back
         // to "Recovery" before it ever reaches icon->mode below, the same
-        // way the later stockSecurom send-file branch already trusts the
+        // way the later stockSecurerom send-file branch already trusts the
         // serial string over this same PID read.
         if (modeStr && strcmp(modeStr, "DFU") == 0 && !serialStringIndicatesRealDFU(serial)) {
             modeStr = "Recovery";
@@ -997,7 +997,7 @@ static const char* mode_to_str(int mode) {
 // mode underneath, serial string included) and idevicerestore's own
 // source carrying a literal "TODO: verify if it actually goes from
 // 0x1222 -> 0x1227" comment on this exact transition. Confirmed directly
-// on real hardware here too: --stock-securom's iBSS send silently took
+// on real hardware here too: --stock-securerom's iBSS send silently took
 // the wrong wire protocol (irecv_send_buffer()'s DFU-vs-Recovery branch
 // is chosen by the SAME misdetected client->mode) because of this.
 //
@@ -1123,7 +1123,7 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid) {
 // sendComponentsToDevice(), which already knows exactly when each one
 // starts and what its result was) — these stay quiet on success and only
 // report genuine, otherwise-unexplained failures.
-int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool stockRecovery, bool stockSecurom,
+int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool stockRecovery, bool stockSecurerom,
                              std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
                              const std::string& buildID) {
     irecv_client_t client = get_tv(ecid);
@@ -1140,17 +1140,17 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
     // Unambiguous, always-printed record of which of the two very
     // differently-shaped upload paths below this run actually took --
     // there was previously no way to tell from the terminal output alone
-    // whether a --stock-securom run really exercised the standard
+    // whether a --stock-securerom run really exercised the standard
     // irecv_send_file() route or silently fell through to boot_client().
     fprintf(stderr,
             "sendiBSS: device reports product_type \"%s\" (isATV31=%d, isATV32=%d), stockRecovery=%d, "
-            "stockSecurom=%d -> using %s route.\n",
-            device->product_type, isATV31, isATV32, stockRecovery, stockSecurom,
-            (isATV31 || isATV32) ? (stockSecurom ? "standard irecv_send_file()" : "checkm8 soft-DFU boot_client()")
+            "stockSecurerom=%d -> using %s route.\n",
+            device->product_type, isATV31, isATV32, stockRecovery, stockSecurerom,
+            (isATV31 || isATV32) ? (stockSecurerom ? "standard irecv_send_file()" : "checkm8 soft-DFU boot_client()")
                                   : "AppleTV2,1 irecv_send_file()");
 
-    if ((isATV31 || isATV32) && stockSecurom) {
-        // --stock-securom: boot_client() below (used by sendiBSS_ATV31()/
+    if ((isATV31 || isATV32) && stockSecurerom) {
+        // --stock-securerom: boot_client() below (used by sendiBSS_ATV31()/
         // sendiBSS_ATV32()) is a custom soft-DFU sequence shaped around
         // checkm8's own post-exploit memory-corruption state, not the real
         // USB DFU class protocol SecureROM itself implements -- it has no
@@ -1209,7 +1209,7 @@ int DeviceManager::sendiBSS(const std::string& iBSSpath, uint64_t ecid, bool sto
         return (err == IRECV_E_SUCCESS) ? 0 : -1;
     }
 
-    bool allowUnpwned = stockRecovery || stockSecurom;
+    bool allowUnpwned = stockRecovery || stockSecurerom;
 
     if (isATV31) {
         irecv_close(client);
@@ -1704,18 +1704,18 @@ static int boot_client(irecv_client_t client, void* buf, size_t sz, bool allowUn
             fprintf(stderr, "Device is not in pwned DFU mode.\n");
             return -1;
         }
-        // --stock-recovery/--stock-securom (Cli.hpp's CliOptions): the
+        // --stock-recovery/--stock-securerom (Cli.hpp's CliOptions): the
         // caller deliberately wants this attempted against a device
         // without a "PWND:[" serial string. The soft-DFU sequence below is
         // built entirely around checkm8's own memory-corruption state
         // accepting a raw, unsigned payload over USB -- a genuinely
         // un-pwned device's real, intact SecureROM has no reason to honor
         // any of it, so this is expected to go on to fail below rather
-        // than being a new bug (see the --stock-securom-specific note on
+        // than being a new bug (see the --stock-securerom-specific note on
         // that failure in Cli.cpp's sendComponentsToDevice()).
         fprintf(stderr,
                 "Device does not report pwned DFU mode (no PWND:[ in its serial string) -- continuing anyway "
-                "since --stock-recovery/--stock-securom was passed.\n");
+                "since --stock-recovery/--stock-securerom was passed.\n");
     }
 
     void* ibss;

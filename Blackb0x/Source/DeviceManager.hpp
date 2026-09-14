@@ -108,7 +108,7 @@ public:
     irecv_client_t get_tv(uint64_t ecid);
 
     // --- iRecovery upload helpers ---
-    // stockRecovery/stockSecurom: mirror Cli.hpp's CliOptions of the same
+    // stockRecovery/stockSecurerom: mirror Cli.hpp's CliOptions of the same
     // name.
     //   - stockRecovery alone: device was genuinely pwned by this run's own
     //     checkm8 call, just skip the hard "PWND:[" serial-string check
@@ -116,7 +116,7 @@ public:
     //     enforce -- has no practical effect here since a real checkm8 run
     //     already leaves that string in place, kept for symmetry/defense in
     //     depth.
-    //   - stockSecurom: the device was never pwned at all, and for
+    //   - stockSecurerom: the device was never pwned at all, and for
     //     AppleTV3,1/3,2 the usual boot_client() soft-DFU path is skipped
     //     entirely in favor of the standard irecv_send_file() DFU-class
     //     protocol -- boot_client()'s raw control-transfer sequence is
@@ -132,8 +132,8 @@ public:
     //     ManifestInfo::buildIdentity) that personalization needs;
     //     deviceModel/buildID (IPSW.hpp's ManifestInfo::realBuildID) let
     //     it check signedBuildsForDevice() before ever sending a real TSS
-    //     request. All four ignored unless stockSecurom is set.
-    int sendiBSS(const std::string& path, uint64_t ecid, bool stockRecovery = false, bool stockSecurom = false,
+    //     request. All four ignored unless stockSecurerom is set.
+    int sendiBSS(const std::string& path, uint64_t ecid, bool stockRecovery = false, bool stockSecurerom = false,
                  std::shared_ptr<void> buildIdentity = nullptr, const std::string& deviceModel = "",
                  const std::string& buildID = "");
     int sendiBEC(const std::string& path, uint64_t ecid);
@@ -142,7 +142,7 @@ public:
     int sendDeviceTree(const std::string& path, uint64_t ecid);
 
     // stockRecovery only (see sendComponentsToDevice()'s own comment for
-    // why that's the gate, not stockSecurom): whether useStockIBEC()'s
+    // why that's the gate, not stockSecurerom): whether useStockIBEC()'s
     // genuinely-unpatched iBEC is what's running, not whether checkm8 ran
     // to get there -- patch_ticket_check() (patchiBEC(), applied by
     // default) is what makes a ticket unnecessary, and it only ever runs

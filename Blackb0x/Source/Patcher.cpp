@@ -151,15 +151,15 @@ bool Patcher::patchiBSS(const std::string& path) {
 // patchiBSS()'s two *patched* outputs to keep) entirely -- there's only
 // ever one output here, the plain decrypted file, since nothing about it
 // differs by device model when unpatched.
-bool Patcher::useStockIBSS(const std::string& path, bool stockSecurom) {
-    if (stockSecurom) {
+bool Patcher::useStockIBSS(const std::string& path, bool stockSecurerom) {
+    if (stockSecurerom) {
         // See this method's own comment in Patcher.hpp -- a genuinely
         // un-pwned device's SecureROM verifies the img3 signature over the
         // original encrypted bytes; decrypt()ing first (even without any
         // patch applied) would invalidate that signature before it's ever
         // checked.
         fprintf(stderr,
-                "--stock-securom: sending the original downloaded iBSS untouched (still encrypted, still "
+                "--stock-securerom: sending the original downloaded iBSS untouched (still encrypted, still "
                 "img3-wrapped) -- decrypting it first would invalidate Apple's own signature before a real "
                 "SecureROM ever gets to check it.\n");
         outputs_.iBSS = path;
@@ -169,7 +169,7 @@ bool Patcher::useStockIBSS(const std::string& path, bool stockSecurom) {
 
     const FirmwareKeyPair* k = keyFor("iBSS");
     if (!k) {
-        // --stock-recovery without --stock-securom deliberately isn't
+        // --stock-recovery without --stock-securerom deliberately isn't
         // refused outright for this (see Cli.hpp's own comment on
         // stockRecovery) -- loadKeysForDevice() already resolved "latest"
         // to buildID_ and genuinely tried Blackb0x/ImageKeys/<device>_
@@ -274,7 +274,7 @@ bool Patcher::useStockIBEC(const std::string& path) {
     // intact and verifies iBEC's img3 signature over the original
     // encrypted bytes, same as a real SecureROM does for iBSS.
     // Decrypting first invalidates that signature before it's ever
-    // checked, regardless of --stock-securom.
+    // checked, regardless of --stock-securerom.
     fprintf(stderr,
             "--stock-recovery: sending the original downloaded iBEC untouched (still encrypted, still "
             "img3-wrapped) -- the stock iBSS that's now running still verifies its signature.\n");
@@ -484,10 +484,10 @@ bool Patcher::patchRamdisk(const std::string& path) {
 // restore would send the device.
 // Called for either --stock-ramdisk or --stock-firmware (see Cli.cpp's
 // downloadAndPatchComponents()) -- the stockRecovery branch below is only
-// ever actually reachable in practice alongside --stock-securom (runCli()
+// ever actually reachable in practice alongside --stock-securerom (runCli()
 // requires --stock-firmware for --stock-recovery, and the only reason to
 // combine those two without also testing against a real, un-pwned
-// SecureROM is rare/contrived), so that message names --stock-securom
+// SecureROM is rare/contrived), so that message names --stock-securerom
 // specifically rather than a generic internal function name a user has
 // no way to connect back to anything they typed. The other (non-
 // stockRecovery) branch is reachable via --stock-ramdisk or
@@ -499,7 +499,7 @@ bool Patcher::useStockRamdisk(const std::string& path, bool stockRecovery) {
         // the only iBEC stockRecovery ever produces) still verifies the
         // ramdisk's img3 signature over the original encrypted bytes.
         fprintf(stderr,
-                "--stock-securom: sending the original downloaded RestoreRamdisk untouched (still encrypted, "
+                "--stock-securerom: sending the original downloaded RestoreRamdisk untouched (still encrypted, "
                 "still img3-wrapped) -- the stock iBEC that's now running still verifies its signature.\n");
         outputs_.ramdisk = path;
         checkPatching();

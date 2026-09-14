@@ -59,7 +59,7 @@ struct ManifestInfo {
     // The matching BuildIdentity dict (a plist_t, type-erased as
     // shared_ptr<void> with plist_free as its deleter so this header
     // doesn't need <plist/plist.h> itself) -- only Personalize.cpp reads
-    // this, for --stock-securom's TSS personalization
+    // this, for --stock-securerom's TSS personalization
     // (tss_parameters_add_from_manifest() needs the raw identity dict,
     // not just the handful of fields already pulled out above).
     std::shared_ptr<void> buildIdentity;

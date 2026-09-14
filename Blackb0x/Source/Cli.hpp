@@ -57,9 +57,9 @@ struct CliOptions {
     // this project's own fixed jailbreak-target build -- see runCli()'s
     // buildToRequest comment.
     //
-    // Deliberately NOT required to also carry stockSecurom: useStockIBSS()
+    // Deliberately NOT required to also carry stockSecurerom: useStockIBSS()
     // still needs a real local .keys entry to decrypt the stock iBSS for
-    // checkm8's boot_client() path when stockSecurom isn't set, and
+    // checkm8's boot_client() path when stockSecurerom isn't set, and
     // blackb0x only ever ships one for kJailbreakTargetBuild, essentially
     // never whatever "latest" resolves to -- but that's a per-build data
     // gap, not an incoherent combination, and it's a legitimate
@@ -100,7 +100,7 @@ struct CliOptions {
     // valid for the exact, unmodified stock components BuildManifest.plist
     // lists, so anything blackb0x has patched can never pass a real
     // SecureROM/iBEC's check regardless.
-    bool stockSecurom = false;
+    bool stockSecurerom = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or
     // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms

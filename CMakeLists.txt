@@ -143,7 +143,7 @@ target_include_directories(blackb0x_xpwntool PUBLIC Blackb0x/Libraries)
 # idevicerestore's own img3.c/img3.h (src/img3.c, src/img3.h at
 # libimobiledevice/idevicerestore's current HEAD), copied in nearly
 # unchanged (see the file's own header comment for the diff) — the one
-# piece --stock-securom's personalization needs that libtatsu itself
+# piece --stock-securerom's personalization needs that libtatsu itself
 # doesn't provide: stitching a TSS-response SHSH/ECID/CERT blob into an
 # existing img3 file's own tags (img3_stitch_component()). Kept as its
 # own small static library rather than folded into blackb0x's own
@@ -780,7 +780,7 @@ ExternalProject_Add(libirecovery_ext
 )
 
 # libtatsu: libimobiledevice's own TSS (Apple signing server) request/
-# response client -- used by --stock-securom (DeviceManager.cpp's
+# response client -- used by --stock-securerom (DeviceManager.cpp's
 # sendiBSS()) to personalize a stock iBSS/iBEC with a real, ECID-bound
 # SHSH ticket before sending it, the same way idevicerestore does for a
 # genuine (non-exploited) DFU restore. Its own configure.ac

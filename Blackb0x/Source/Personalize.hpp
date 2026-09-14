@@ -2,13 +2,13 @@
 //  Personalize.hpp
 //  Blackb0x
 //
-//  --stock-securom (Cli.hpp's CliOptions): a genuinely un-pwned device's
+//  --stock-securerom (Cli.hpp's CliOptions): a genuinely un-pwned device's
 //  real SecureROM/iBoot don't just check "is this Apple's signature" --
 //  they require a live, ECID-personalized SHSH ticket, the same one a
 //  real (non-exploited) idevicerestore DFU restore fetches from Apple's
 //  TSS server before sending iBSS. checkm8/boot_client() never needed
 //  this because the exploit patches SecureROM's own signature check out
-//  of memory; --stock-securom deliberately skips the exploit, so this
+//  of memory; --stock-securerom deliberately skips the exploit, so this
 //  requirement is back in full force. Implemented via libtatsu (the same
 //  TSS client library idevicerestore itself now uses, vendored as
 //  third_party/libtatsu) for the request/response, plus
@@ -33,7 +33,7 @@
 // per-component blob by).
 // rawImg3Path: the original, untouched, still-encrypted file exactly as
 // downloaded from Apple (useStockIBSS()/useStockIBEC()'s own output when
-// stockSecurom is set -- see Patcher.cpp) -- NOT a decrypted one; the
+// stockSecurerom is set -- see Patcher.cpp) -- NOT a decrypted one; the
 // signature this stitches in is computed over these exact bytes.
 // buildIdentity: IPSW.hpp's ManifestInfo::buildIdentity (the matching
 // BuildIdentity plist_t, type-erased the same way).

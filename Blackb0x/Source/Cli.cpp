@@ -108,7 +108,7 @@ void printCliUsage(const char* argv0) {
     printf("                            end (see that flag's own entry for why). The\n");
     printf("                            device will NOT be jailbroken by a run using this\n");
     printf("                            flag.\n");
-    printf("  --stock-securom           DIAGNOSTIC: never attempt to run a pwntool, for a\n");
+    printf("  --stock-securerom           DIAGNOSTIC: never attempt to run a pwntool, for a\n");
     printf("                            genuinely un-exploited device still running real,\n");
     printf("                            un-bypassed SecureROM signature enforcement --\n");
     printf("                            ERRORS if the device already reports PWND: in its\n");
@@ -160,8 +160,8 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.stockRecovery = true;
         } else if (arg == "--stock-firmware") {
             options.stockFirmware = true;
-        } else if (arg == "--stock-securom") {
-            options.stockSecurom = true;
+        } else if (arg == "--stock-securerom") {
+            options.stockSecurerom = true;
         } else if (arg == "--pwntool") {
             std::string value = nextArg("--pwntool");
 #if defined(__APPLE__)
@@ -197,13 +197,13 @@ CliOptions parseCliOptions(int argc, char** argv) {
         fprintf(stderr, "--stock-ramdisk is redundant with --stock-firmware\n");
     }
     // Opposite PWND-state requirements (noPwn hard-fails if NOT already
-    // pwned; stockSecurom hard-fails if it IS) -- not useful together,
-    // and checkExploit() checks stockSecurom first, then noPwn, so
-    // combining them just means noPwn's hard-fail wins once stockSecurom's
+    // pwned; stockSecurerom hard-fails if it IS) -- not useful together,
+    // and checkExploit() checks stockSecurerom first, then noPwn, so
+    // combining them just means noPwn's hard-fail wins once stockSecurerom's
     // own check passes.
-    if (options.noPwn && options.stockSecurom) {
+    if (options.noPwn && options.stockSecurerom) {
         fprintf(stderr,
-                "--no-pwn and --stock-securom require opposite device states (already pwned vs. not) -- "
+                "--no-pwn and --stock-securerom require opposite device states (already pwned vs. not) -- "
                 "combining them is not useful.\n");
     }
     return options;
@@ -298,7 +298,7 @@ bool waitForDFUMode(DeviceManager& deviceManager, uint64_t ecid, AppleTVDevice& 
 // device-model branching from the original, not simplified. `dryRun` skips
 // the actual SHAtter/checkm8 USB call (the point where this function stops
 // being observation and starts writing exploit payloads into the device),
-// printing what would have run instead. `noPwn`/`stockSecurom` only gate
+// printing what would have run instead. `noPwn`/`stockSecurerom` only gate
 // the AppleTV3,2/checkm8 branch below (the one that actually spawns a
 // pwntool) — SHAtter (AppleTV2,1) is a separate, hand-rolled exploit that
 // never touches a pwntool at all, so there's nothing for these flags to
@@ -306,20 +306,20 @@ bool waitForDFUMode(DeviceManager& deviceManager, uint64_t ecid, AppleTVDevice& 
 // "pwntool" became the general term for gaster/blackb0x-pwn both, keeping
 // its original hard-fail-if-not-already-pwned behavior.)
 //
-// stockSecurom is checked before the early pwnedDFU return below, not
+// stockSecurerom is checked before the early pwnedDFU return below, not
 // after: its whole point is a genuinely un-exploited device (real,
 // Apple-signed SecureROM DFU, not checkm8'd) -- if the device is already
 // pwned, that contradicts the test setup this flag exists for, so it
 // needs to error out even though checkExploit() would otherwise treat an
 // already-pwned device as trivially "done" and return success.
 bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, bool dryRun, bool noPwn,
-                   bool stockSecurom, const std::string& pwnTool) {
-    if (stockSecurom && device.pwnedDFU) {
+                   bool stockSecurerom, const std::string& pwnTool) {
+    if (stockSecurerom && device.pwnedDFU) {
         fprintf(stderr,
-                "--stock-securom: device is already in pwned DFU (PWND: in its serial string) -- this "
+                "--stock-securerom: device is already in pwned DFU (PWND: in its serial string) -- this "
                 "flag requires a genuinely un-exploited device (real SecureROM signature enforcement "
                 "still intact) to be a meaningful test. Re-enter DFU mode on a device that hasn't been "
-                "pwned, or drop --stock-securom.\n");
+                "pwned, or drop --stock-securerom.\n");
         return false;
     }
 
@@ -357,7 +357,7 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
                     pwnTool == "blackb0x-pwn" ? " — note blackb0x-pwn's own verb is `checkm8`, not `pwn`" : "");
             return false;
         }
-        if (stockSecurom) {
+        if (stockSecurerom) {
             // Already confirmed not pwned (the check at the top of this
             // function would have errored out otherwise) -- skip the
             // pwntool entirely and proceed straight into the rest of the
@@ -365,11 +365,11 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
             // SecureROM signature verification (backed by a real,
             // TSS-issued personalization ticket -- see
             // Personalize.hpp/sendiBSS()'s own comments) the whole way.
-            // runCli() already hard-refuses --stock-securom without
+            // runCli() already hard-refuses --stock-securerom without
             // --stock-recovery before this ever runs, so there's nothing
             // left to caveat here.
             fprintf(stderr,
-                    "--stock-securom: device confirmed not already pwned -- skipping %s entirely and "
+                    "--stock-securerom: device confirmed not already pwned -- skipping %s entirely and "
                     "proceeding into the rest of the boot chain, relying on the device's own real "
                     "SecureROM signature verification.\n",
                     pwnTool.c_str());
@@ -411,7 +411,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
                                                               bool onlyBootComponents,
                                                               bool dontCheckFirmwareSums, bool stockRamdisk,
                                                               bool stockRecovery, bool stockFirmware,
-                                                              bool stockSecurom) {
+                                                              bool stockSecurerom) {
     patcher.onlyBootComponents = onlyBootComponents;
     patcher.dontCheckFirmwareSums = dontCheckFirmwareSums;
 
@@ -504,7 +504,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     // --stock-firmware also stocking the rest of the suite.
     downloadAndPatch("iBSS", manifest->iBSSPath, [&](const std::string& path) {
         if (stockRecovery) {
-            patcher.useStockIBSS(path, stockSecurom);
+            patcher.useStockIBSS(path, stockSecurerom);
         } else {
             patcher.patchiBSS(path);
         }
@@ -595,7 +595,7 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
 // — verbatim from the original's `self.selected_device.jailbroken == 1`
 // branch.
 bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device, const PatchedComponents& components,
-                             bool tetherBoot, bool dryRun, bool stockRecovery, bool stockSecurom) {
+                             bool tetherBoot, bool dryRun, bool stockRecovery, bool stockSecurerom) {
     if (dryRun) {
         printf("(dry run) Would send:\n");
         printf("  iBSS%s\n", components.iBSS ? "" : " (missing, would fail here)");
@@ -614,11 +614,11 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
 
     printf("Sending iBSS -> ");
     fflush(stdout);
-    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurom,
+    if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurerom,
                                 components.buildIdentity, device.deviceModel, components.buildID) != 0) {
         printf("Error\n");
         fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
-                stockSecurom ? " (--stock-securom personalizes the image with a real TSS-issued SHSH ticket "
+                stockSecurerom ? " (--stock-securerom personalizes the image with a real TSS-issued SHSH ticket "
                                "before sending it via the standard DFU route -- if this still fails, it's a "
                                "real signal about the image/device/firmware match itself, not an artifact of "
                                "this tool's own delivery mechanism)"
@@ -634,12 +634,12 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
     printf("Waiting for device to come back up in Recovery mode...\n");
     fflush(stdout);
 
-    // Gated on stockRecovery, NOT stockSecurom: this is about whether
+    // Gated on stockRecovery, NOT stockSecurerom: this is about whether
     // useStockIBEC()'s genuinely-unpatched iBEC is what's running, not
     // whether checkm8 ran to get there. patch_ticket_check() (patchiBEC(),
     // applied by default) is what makes a ticket unnecessary, and it only
     // ever runs against blackb0x's own patched iBEC -- stockRecovery's
-    // stock iBEC has no such patch applied regardless of stockSecurom, so
+    // stock iBEC has no such patch applied regardless of stockSecurerom, so
     // it enforces real ticket verification on whatever it loads next
     // (DeviceTree/Ramdisk/KernelCache) either way.
     //
@@ -754,7 +754,7 @@ int runCli(const CliOptions& options) {
         return 0;
     }
 
-    // --stock-securom without --stock-recovery would send blackb0x's own
+    // --stock-securerom without --stock-recovery would send blackb0x's own
     // PATCHED iBSS through personalizeIMG3Component() (Personalize.cpp) --
     // the TSS ticket that fetches is only ever valid for the exact,
     // unmodified component digest BuildManifest.plist lists, so stitching
@@ -764,15 +764,15 @@ int runCli(const CliOptions& options) {
     // --stock-firmware too (see that check just below) -- checked
     // directly here as well, rather than only relying on that second
     // check to catch it, so this specific combination gets a message
-    // that actually names --stock-securom as the reason. Refuse outright
+    // that actually names --stock-securerom as the reason. Refuse outright
     // rather than attempting (and failing) a combination that can never
     // do anything else.
-    if (options.stockSecurom && !(options.stockRecovery && options.stockFirmware)) {
+    if (options.stockSecurerom && !(options.stockRecovery && options.stockFirmware)) {
         fprintf(stderr,
-                "--stock-securom requires both --stock-recovery and --stock-firmware: personalizing "
+                "--stock-securerom requires both --stock-recovery and --stock-firmware: personalizing "
                 "anything other than the unmodified, stock iBSS/iBEC/kernel/ramdisk against a real TSS "
                 "ticket can never pass a genuine SecureROM's signature check. Pass --stock-recovery "
-                "--stock-firmware --stock-securom together.\n");
+                "--stock-firmware --stock-securerom together.\n");
         return 1;
     }
 
@@ -943,7 +943,7 @@ int runCli(const CliOptions& options) {
         }
     }
 
-    if (!checkExploit(deviceManager, device, options.dryRun, options.noPwn, options.stockSecurom,
+    if (!checkExploit(deviceManager, device, options.dryRun, options.noPwn, options.stockSecurerom,
                        options.pwnTool)) {
         return 1;
     }
@@ -969,7 +969,7 @@ int runCli(const CliOptions& options) {
 
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
-    // Both --stock-securom (real SecureROM, no checkm8) AND --stock-recovery
+    // Both --stock-securerom (real SecureROM, no checkm8) AND --stock-recovery
     // (real, unpatched iBEC via useStockIBEC() -- patch_ticket_check()
     // never runs against it, checkm8 or not) need a build the device's
     // real signature/ticket verification will actually accept -- either
@@ -985,12 +985,12 @@ int runCli(const CliOptions& options) {
     // so just ask for it directly instead of guessing/enumerating
     // signedBuildsForDevice()'s own (unordered, not "give me the newest")
     // result set.
-    if (options.stockSecurom || options.stockRecovery) buildToRequest = "latest";
+    if (options.stockSecurerom || options.stockRecovery) buildToRequest = "latest";
 
     auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
                                                    options.dontCheckFirmwareSums, options.stockRamdisk,
                                                    options.stockRecovery, options.stockFirmware,
-                                                   options.stockSecurom);
+                                                   options.stockSecurerom);
     if (!components) {
         // Not "...to patch..." -- on any --stock-* route nothing here
         // actually patches anything (useStockIBSS()/useStockIBEC()/etc.
@@ -1003,7 +1003,7 @@ int runCli(const CliOptions& options) {
     }
 
     if (!sendComponentsToDevice(deviceManager, device, *components, tetherBoot, options.dryRun,
-                                 options.stockRecovery, options.stockSecurom)) {
+                                 options.stockRecovery, options.stockSecurerom)) {
         return 1;
     }
 
