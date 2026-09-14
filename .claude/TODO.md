@@ -514,3 +514,24 @@ find further, currently-unexamined candidates safe to exclude or move to
 network-only (staged in `apt-lists/` but not
 `private/var/cache/apt/archives/`, same mechanism `kNeverStageDebs`
 already uses).
+
+A separate, currently-unexplored avenue: `computePreinstallEligibleFilenames()`
+(`BakeRamdisk.cpp` ~line 1099) decides what gets unpacked and marked
+installed at BAKE time (i.e. its real file content lands in the baked
+ramdisk image) purely on "not in `prebake_package_blacklist.txt`,
+transitively" — not on whether it's actually needed before
+`postinstall.sh` can run. `postinstall.sh`'s own real bootstrap closure is
+already known and much smaller (the same ~20 packages item 10's existing
+audit above already enumerated — bash, dpkg, coreutils(-bin), apt7(-lib),
+and what THEY pull in). Any currently-prebaked package outside that
+closure only needs to be prebaked if nothing else about it requires it at
+first boot; once confirmed unneeded by anything that runs before/during
+`postinstall.sh`'s own bootstrap, it could instead be left as a plain
+cached `.deb` (`private/var/cache/apt/archives/`) + `apt-lists/` entry —
+still available for `postinstall.sh`'s own live `apt-get install` to pull
+in on-device (network already required there regardless), just not
+unpacked and consuming ramdisk space at bake time. Needs the same kind of
+real, per-package assertion the existing `kNeverStageDebs` audit already
+used (not guessed) before moving anything: confirm nothing in the
+bootstrap closure itself, and nothing that runs before `postinstall.sh`
+gets a working apt, actually `Depends:`/`Pre-Depends:` on it.
