@@ -209,6 +209,30 @@ int runSHAtter(uint64_t ecid) {
         return 0;
     }
 
+    // Idempotent: a device already showing "SHAtter" in its serial string
+    // (the original device_event()'s own marker for an already-exploited
+    // device -- see this file's own header comment) isn't in the clean
+    // SecureROM DFU state the sequence below assumes. Re-running a
+    // buffer-overflow exploit against a device already running injected
+    // payload code is at best pointless, at worst liable to corrupt that
+    // state -- check first and short-circuit, same as runCheckm8() below.
+    {
+        const struct irecv_device_info* info = irecv_get_device_info(client);
+        int alreadyPwned = info && strstr(info->serial_string, "SHAtter") != NULL;
+        irecv_close(client);
+        if (alreadyPwned) {
+            puts("Device already SHAtter'd");
+            puts("SHAtter successful");
+            return 1;
+        }
+    }
+
+    client = get_tv(ecid);
+    if (!client) {
+        fprintf(stderr, "SHAtter: device disappeared after idempotency check.\n");
+        return 0;
+    }
+
     puts("Preparing buffer overflow");
 
     char data_one[0x40];
@@ -270,6 +294,32 @@ int runCheckm8(uint64_t ecid) {
     irecv_client_t client = get_tv(ecid);
     if (!client) {
         fprintf(stderr, "checkm8: no DFU-mode device found.\n");
+        return 0;
+    }
+
+    // Idempotent: a device already reporting "PWND:[" (same marker
+    // checkm8()'s own end-of-exploit verification below checks, and the
+    // same one DeviceManager.cpp's checkm8Attempt() already short-circuits
+    // on) isn't in the clean SecureROM DFU state the exploit sequence
+    // assumes -- e.g. a previous run already succeeded, or succeeded but
+    // was killed before reporting it. Re-running this exploit against an
+    // already-pwned device is at best pointless, at worst liable to
+    // corrupt that state; check first rather than let a stale PWND:[ from
+    // *before* this run make an unrelated failure look like success.
+    {
+        const struct irecv_device_info* info = irecv_get_device_info(client);
+        int alreadyPwned = info && strstr(info->serial_string, "PWND:[") != NULL;
+        irecv_close(client);
+        if (alreadyPwned) {
+            puts("Device already in pwned DFU");
+            puts("Checkm8 successful");
+            return 1;
+        }
+    }
+
+    client = get_tv(ecid);
+    if (!client) {
+        fprintf(stderr, "checkm8: device disappeared after idempotency check.\n");
         return 0;
     }
 
