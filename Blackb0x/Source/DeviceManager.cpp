@@ -1249,6 +1249,36 @@ int DeviceManager::sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdenti
     return 0;
 }
 
+int DeviceManager::sendRestoreLogo(const std::string& path, uint64_t ecid) {
+    irecv_client_t client = get_tv_patient(ecid);
+    if (!client) {
+        fprintf(stderr, "sendRestoreLogo: device did not reconnect for %s\n", path.c_str());
+        return -1;
+    }
+    irecv_error_t err = irecv_send_file(client, path.c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendRestoreLogo: failed to send %s: %s\n", path.c_str(), irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    err = irecv_send_command(client, "setpicture 4");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendRestoreLogo: failed to send 'setpicture 4' command: %s\n", irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    err = irecv_send_command(client, "bgcolor 0 0 0");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendRestoreLogo: failed to send 'bgcolor 0 0 0' command: %s\n", irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+    fprintf(stderr, "sendRestoreLogo: sent %s and device acknowledged setpicture/bgcolor.\n", path.c_str());
+    irecv_close(client);
+    sleep(2);
+    return 0;
+}
+
 // Shared by sendRamdisk()/sendKernelCache()/sendDeviceTree() below: send a
 // file, then a follow-up command that tells the device what to do with it
 // (e.g. "ramdisk", "bootx", "devicetree"). Sending the command after a

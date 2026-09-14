@@ -58,6 +58,9 @@ struct PatchedComponents {
     std::optional<std::string> kernel;
     std::optional<std::string> ramdisk;
     std::optional<std::string> deviceTree;
+    // See setRestoreLogoPath()'s own comment -- unset whenever this
+    // build's manifest doesn't list a RestoreLogo component at all.
+    std::optional<std::string> restoreLogo;
 
     // --stock-securom (Cli.hpp's CliOptions): the matching BuildManifest.plist
     // identity (IPSW.hpp's ManifestInfo::buildIdentity, passed through
@@ -175,6 +178,14 @@ public:
     bool useStockKernel(const std::string& path, bool stockRecovery = false);
 
     void setDeviceTreePath(const std::string& path);
+
+    // Like setDeviceTreePath() above -- sent unmodified, no decrypt/patch
+    // step, since it's just an image displayed during Recovery-mode
+    // restore, not something iBoot-patchable. Only ever called when
+    // IPSW.hpp's ManifestInfo::restoreLogoPath is non-empty (see
+    // downloadAndPatchComponents() in Cli.cpp) -- not every build's
+    // manifest lists a RestoreLogo component at all.
+    void setRestoreLogoPath(const std::string& path);
 
     // See PatchedComponents::buildIdentity's own comment.
     void setBuildIdentity(std::shared_ptr<void> identity) { outputs_.buildIdentity = std::move(identity); }

@@ -189,6 +189,7 @@ std::optional<ManifestInfo> parseManifest(const std::string& manifestPath, bool 
     info.kernelCachePath = componentPath("KernelCache");
     info.deviceTreePath = componentPath("DeviceTree");
     if (!onlyBootComponents) info.restoreRamdiskPath = componentPath("RestoreRamDisk");
+    info.restoreLogoPath = componentPath("RestoreLogo");
 
     // plist_copy(): `identity` is a subtree of `root`, freed below --
     // detach an independent copy so it outlives this function.

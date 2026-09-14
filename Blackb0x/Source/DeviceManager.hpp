@@ -148,6 +148,14 @@ public:
     // mode, before anything else).
     int sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
                       const std::string& buildID);
+    // Only called when Patcher.hpp's PatchedComponents::restoreLogo is
+    // set (this build's manifest actually lists a RestoreLogo component
+    // -- see ManifestInfo::restoreLogoPath's own comment). Sends the
+    // file, then "setpicture 4"/"bgcolor 0 0 0" (matching idevicerestore's
+    // recovery.c's recovery_send_applelogo() exactly) -- must run right
+    // after sendAPTicket(), before sendRamdisk(), same ordering reasoning
+    // as sendAPTicket()'s own comment.
+    int sendRestoreLogo(const std::string& path, uint64_t ecid);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
     int sendDeviceTree(const std::string& path, uint64_t ecid);

@@ -505,6 +505,13 @@ std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, co
     downloadAndPatch("DeviceTree", manifest->deviceTreePath,
                       [&](const std::string& path) { patcher.setDeviceTreePath(path); });
 
+    // Only present in some builds' manifests at all (see
+    // ManifestInfo::restoreLogoPath's own comment) -- downloadAndPatch()
+    // already skips the callback entirely when the path is empty, so
+    // this is a no-op wherever it's absent.
+    downloadAndPatch("RestoreLogo", manifest->restoreLogoPath,
+                      [&](const std::string& path) { patcher.setRestoreLogoPath(path); });
+
     if (!onlyBootComponents) {
         downloadAndPatch("RestoreRamdisk", manifest->restoreRamdiskPath, [&](const std::string& path) {
             if (stockRamdisk || stockFirmware) {
@@ -538,8 +545,9 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
             printf("  iBEC (downgrade)%s\n", components.iBECDowngrade ? "" : " (missing)");
         } else {
             printf("  iBEC (boot)%s\n", components.iBECBoot ? "" : " (missing)");
-            printf("  DeviceTree%s\n", components.deviceTree ? "" : " (missing)");
+            if (components.restoreLogo) printf("  RestoreLogo\n");
             printf("  Ramdisk%s\n", components.ramdisk ? "" : " (missing)");
+            printf("  DeviceTree%s\n", components.deviceTree ? "" : " (missing)");
         }
         printf("  KernelCache%s\n", components.kernel ? "" : " (missing, would fail here)");
         printf("(dry run) Would then wait for the Apple TV to %s\n", tetherBoot ? "boot" : "reboot");
@@ -620,21 +628,47 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
         }
         if (!sendTicketIfNeeded()) return false;
 
-        printf("Sending DeviceTree -> ");
-        fflush(stdout);
-        i = components.deviceTree ? deviceManager.sendDeviceTree(*components.deviceTree, device.ecid) : -1;
-        printf("%s\n", (i == 0) ? "Sent" : "Error");
-        if (i != 0) {
-            fprintf(stderr, "Failed to send DeviceTree. Re-enter DFU mode and try again.\n");
-            return false;
+        // Only present in some builds' manifests -- components.restoreLogo
+        // is unset wherever downloadAndPatchComponents() found nothing to
+        // download (see ManifestInfo::restoreLogoPath's own comment).
+        // Matches idevicerestore's own recovery_send_applelogo(), called
+        // right after the ticket, before Ramdisk.
+        if (components.restoreLogo) {
+            printf("Sending RestoreLogo -> ");
+            fflush(stdout);
+            i = deviceManager.sendRestoreLogo(*components.restoreLogo, device.ecid);
+            printf("%s\n", (i == 0) ? "Sent" : "Error");
+            if (i != 0) {
+                fprintf(stderr, "Failed to send RestoreLogo. Re-enter DFU mode and try again.\n");
+                return false;
+            }
         }
 
+        // Ramdisk before DeviceTree -- matches idevicerestore's own real
+        // ordering (recovery.c's recovery_enter_restore(): ticket ->
+        // AppleLogo -> components loaded by iBoot -> Ramdisk ->
+        // DeviceTree -> (SEP) -> KernelCache), which this had backwards.
+        // A real run showed DeviceTree specifically rejected with a
+        // generic USB upload failure immediately after a successfully-
+        // acknowledged APTicket send -- consistent with a stock iBEC
+        // expecting Ramdisk first and refusing anything sent out of that
+        // order, not a timing issue (a settle delay on the ticket send
+        // didn't change the outcome).
         printf("Sending Ramdisk -> ");
         fflush(stdout);
         i = components.ramdisk ? deviceManager.sendRamdisk(*components.ramdisk, device.ecid) : -1;
         printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
             fprintf(stderr, "Failed to send Ramdisk. Re-enter DFU mode and try again.\n");
+            return false;
+        }
+
+        printf("Sending DeviceTree -> ");
+        fflush(stdout);
+        i = components.deviceTree ? deviceManager.sendDeviceTree(*components.deviceTree, device.ecid) : -1;
+        printf("%s\n", (i == 0) ? "Sent" : "Error");
+        if (i != 0) {
+            fprintf(stderr, "Failed to send DeviceTree. Re-enter DFU mode and try again.\n");
             return false;
         }
 

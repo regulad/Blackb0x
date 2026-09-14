@@ -35,6 +35,14 @@ struct ManifestInfo {
     std::string kernelCachePath;
     std::string deviceTreePath;
     std::string restoreRamdiskPath;  // empty if onlyBootComponents
+    // Empty if this build's manifest doesn't list one (matches
+    // idevicerestore's own recovery_send_applelogo(), which checks
+    // build_identity_has_component() first and simply skips the whole
+    // step if absent) -- --stock-securom needs this sent (via
+    // DeviceManager::sendRestoreLogo()) before Ramdisk once a real
+    // APTicket is on file; blackb0x's own patched-bootloader flow never
+    // needed it because it was never ticket-gated in the first place.
+    std::string restoreLogoPath;
 
     // The matching BuildIdentity dict (a plist_t, type-erased as
     // shared_ptr<void> with plist_free as its deleter so this header
