@@ -715,11 +715,32 @@ ExternalProject_Add(libirecovery_ext
     INSTALL_COMMAND make install
 )
 
+# CFLAGS/CXXFLAGS=-DCUSTOM_LOGGING: libgeneral's own include/libgeneral/
+# macros.h unconditionally #defines bare, unscoped function-like macros
+# named log/info/warning/error (its own printf-wrapper logging helpers)
+# unless CUSTOM_LOGGING is already defined -- confirmed as a real macOS
+# build failure: exception.cpp's own #include chain pulls in libc++'s
+# <cmath>/<functional> before/during macros.h's expansion on Xcode's SDK,
+# and the `log` macro (no real definition, just a printf) clobbers every
+# subsequent declaration of the real log()/std::log() math function in
+# those headers, breaking their own parse ("error: expected unqualified-id"
+# on `extern double log(double);` and libc++'s templated log() overloads).
+# CUSTOM_LOGGING is libgeneral's own documented escape hatch for exactly
+# this (see macros.h's `#ifndef CUSTOM_LOGGING` guard) -- confirmed safe to
+# just omit these macros outright rather than defining real replacements:
+# libgeneral's own single source file (libgeneral/exception.cpp) never
+# calls log()/info()/warning()/error() as macros internally. This clash is
+# real on Linux too in principle (glibc's <math.h> also declares a real
+# log()), it just happens not to be hit there because nothing in this
+# translation unit's actual Linux include order re-declares log() after
+# the macro takes effect the way libc++'s heavier template-based <cmath>
+# does.
 ExternalProject_Add(libgeneral_ext
     SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libgeneral
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ${AUTOTOOLS_ENV} ./autogen.sh --prefix=${DEPS_PREFIX}
                         --enable-static --disable-shared
+                        CFLAGS=-DCUSTOM_LOGGING CXXFLAGS=-DCUSTOM_LOGGING
     BUILD_COMMAND   ${AUTOTOOLS_ENV} make -j
     INSTALL_COMMAND make install
 )
@@ -731,6 +752,11 @@ ExternalProject_Add(libgeneral_ext
 # location — pass CPPFLAGS/LDFLAGS explicitly instead. Its vendored autogen.sh
 # also fails to bootstrap libtool on a modern toolchain (same "ltmain.sh not
 # found" issue as libimobiledevice above) — use autoreconf -fi instead.
+# CFLAGS=-DCUSTOM_LOGGING: libfragmentzip.c also #includes
+# <libgeneral/macros.h> directly -- same real macOS build failure and same
+# fix as libgeneral_ext's own CFLAGS/CXXFLAGS above; see that target's
+# comment for the full explanation. Confirmed safe the same way: no
+# log()/info()/warning()/error() macro calls anywhere in this file either.
 ExternalProject_Add(libfragmentzip_ext
     DEPENDS         libgeneral_ext curl_ext libzip_ext wolfssl_ext
     SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libfragmentzip
@@ -739,6 +765,7 @@ ExternalProject_Add(libfragmentzip_ext
               COMMAND ${AUTOTOOLS_ENV} ./configure --prefix=${DEPS_PREFIX}
                         --enable-static --disable-shared
                         CPPFLAGS=-I${DEPS_INCLUDE} LDFLAGS=-L${DEPS_LIB}
+                        CFLAGS=-DCUSTOM_LOGGING
     BUILD_COMMAND   ${AUTOTOOLS_ENV} make -j
     INSTALL_COMMAND make install
 )
