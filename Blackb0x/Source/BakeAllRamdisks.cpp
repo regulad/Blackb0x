@@ -213,6 +213,13 @@ int main(int argc, char** argv) {
     size_t warned = 0;
     size_t skippedDownload = 0;
 
+    // Memoized per device MODEL (not per (device, buildID) tuple) — a full
+    // sweep bakes dozens of buildIDs for the same handful of device
+    // models, and newestVersionForDevice() is a live ipsw.me network call
+    // with no caching of its own. Without this, every tuple for the same
+    // model would re-fetch and get the identical answer.
+    std::map<std::string, std::string> newestVersionCache;
+
     for (size_t i = 0; i < targets.size(); i++) {
         const std::string& device = targets[i].first;
         const std::string& buildID = targets[i].second;
@@ -293,29 +300,48 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // manifest->productVersion is the real, authoritative ProductVersion
-        // for this exact (device, buildID) tuple straight out of the
-        // BuildManifest.plist just downloaded/parsed above — bakeRamdisk()
-        // threads it all the way down to the synthetic "firmware" dpkg
-        // stanza scripts/build_deb_cache.py's sandbox and BakeRamdisk.cpp's
-        // own bake-time preinstall declare (see those files' own comments),
-        // so packages gated on `Depends: firmware (>= X)` resolve correctly
-        // against whichever real firmware is actually being baked. In
-        // practice this should always be populated (a genuinely downloaded,
-        // real manifest), but handle it defensively: warn and fall back to
-        // the newest version ipsw.me currently lists for this device model
-        // rather than silently baking a blank/wrong firmware declaration.
-        std::string productVersion = manifest->productVersion;
+        // What bakeRamdisk() threads down to the synthetic "firmware" dpkg
+        // stanza (scripts/build_deb_cache.py's sandbox and
+        // BakeRamdisk.cpp's own bake-time preinstall declare it — see
+        // those files' own comments) AND to stageVersionBranch()'s choice
+        // of persistence/untether payload must be the real target DEVICE's
+        // likely OS version, NOT manifest->productVersion (this specific
+        // (device, buildID) tuple's own ramdisk vehicle version). Those are
+        // two different things: kJailbreakTargetBuild (Cli.cpp) pins one
+        // fixed, old ramdisk vehicle build used for every real jailbreak
+        // run regardless of device model or what OS the actual device is
+        // running — e.g. baking AppleTV3,2's "10B329a" tuple has a real
+        // ProductVersion around 6.x, but a real AppleTV3,2 being jailbroken
+        // today is almost certainly running something much newer (most
+        // real devices auto-update to the latest available). Persistence
+        // payloads and firmware-gated Depends: lines need to match what's
+        // actually installed on the device's own NAND, which this baked
+        // ramdisk never touches or reflects — so assume the newest known
+        // OS for this device MODEL (real per-device precision isn't
+        // available at bake time; tether-boot is the one path that already
+        // knows a specific real device's exact version, and doesn't use
+        // this baked persistence content at all — see Cli.cpp's tetherBoot
+        // handling). manifest->productVersion (this tuple's own version) is
+        // only the last-resort fallback now, if even the newest-known-
+        // version lookup fails.
+        std::string productVersion;
+        auto cacheIt = newestVersionCache.find(device);
+        if (cacheIt != newestVersionCache.end()) {
+            productVersion = cacheIt->second;
+        } else {
+            productVersion = newestVersionForDevice(device);
+            newestVersionCache[device] = productVersion;
+        }
         if (productVersion.empty()) {
             fprintf(stderr,
-                    "bake-all-ramdisks: %s: BuildManifest.plist had no ProductVersion; falling back to "
-                    "ipsw.me's newest known version for %s\n",
+                    "bake-all-ramdisks: %s: ipsw.me lookup for %s's newest known version failed; falling back "
+                    "to this tuple's own BuildManifest.plist ProductVersion (less accurate — reflects the "
+                    "ramdisk vehicle's version, not the likely target device's)\n",
                     label.c_str(), device.c_str());
-            productVersion = newestVersionForDevice(device);
+            productVersion = manifest->productVersion;
             if (productVersion.empty()) {
-                fprintf(stderr,
-                        "bake-all-ramdisks: %s: ipsw.me fallback also failed to yield a version for %s\n",
-                        label.c_str(), device.c_str());
+                fprintf(stderr, "bake-all-ramdisks: %s: BuildManifest.plist fallback also had no ProductVersion\n",
+                        label.c_str());
             }
         }
 

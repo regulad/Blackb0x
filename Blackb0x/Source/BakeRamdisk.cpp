@@ -1674,12 +1674,21 @@ static bool computePreinstalledPackages(const std::set<std::string>& eligibleFil
         // substitution rather than treating it as an f-string-style
         // template (see this constant's own comment) — matches
         // scripts/build_deb_cache.py's identical INNER_SCRIPT.replace()
-        // technique for the same placeholder.
+        // technique for the same placeholder. Replace EVERY occurrence, not
+        // just the first: the constant's own explanatory comment right
+        // above the real "Version:" line also mentions the placeholder by
+        // name (to explain what it is), so a find()-once/replace-once pass
+        // hit that comment instead of the real line, leaving the literal
+        // token in the dpkg status stanza and making dpkg reject it
+        // ("version number does not start with digit") — confirmed on a
+        // real run, not hypothetical. Python's str.replace() already
+        // replaces every occurrence by default, so build_deb_cache.py's
+        // own identical substitution never had this bug.
         std::string innerScript = kPreinstallInnerScript;
         const std::string placeholder = "__FIRMWARE_VERSION__";
-        size_t placeholderPos = innerScript.find(placeholder);
-        if (placeholderPos != std::string::npos) {
-            innerScript.replace(placeholderPos, placeholder.size(), firmwareVersion);
+        for (size_t pos = innerScript.find(placeholder); pos != std::string::npos;
+             pos = innerScript.find(placeholder, pos + firmwareVersion.size())) {
+            innerScript.replace(pos, placeholder.size(), firmwareVersion);
         }
         std::ofstream f(workDir + "/inner.sh");
         f << innerScript;
