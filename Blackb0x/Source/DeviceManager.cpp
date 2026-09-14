@@ -1286,8 +1286,20 @@ int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
 // resetting back to iBoot's own command prompt ("Boot Failure Count"
 // climbing on every attempt). sendKernelCache()/sendStockRestoreTail()
 // below both pass 1 for their own "bootx" call for exactly this reason.
+// dnloadFinish: real idevicerestore's own recovery_send_kernelcache()
+// (recovery.c) sends a zero-length, DFU-class control transfer
+// (bmRequestType 0x21, bRequest 1 -- literal DFU_DNLOAD, the same
+// "that upload is finished, do something with it" signal boot_client()'s
+// own checkm8 soft-DFU code elsewhere in this file already relies on)
+// right after the kernelcache file upload, before its own boot-args/
+// bootx commands -- completely missing here before this fix, on top of
+// the bReq=1 bootx fix above. Confirmed on real hardware: bReq=1 alone
+// (without this) still left the device resetting back to iBoot's own
+// prompt every time. sendKernelCache() below passes true for exactly
+// this reason; every other caller leaves this at its default (false).
 static int sendFileThenCommand(irecv_client_t client, const char* what, const std::string& path,
-                                const char* command, bool keepOpen = false, uint8_t commandBreq = 0) {
+                                const char* command, bool keepOpen = false, uint8_t commandBreq = 0,
+                                bool dnloadFinish = false) {
     if (!client) {
         fprintf(stderr, "%s: device did not reconnect for %s\n", what, path.c_str());
         return -1;
@@ -1297,6 +1309,9 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
         fprintf(stderr, "%s: failed to send %s: %s\n", what, path.c_str(), irecv_strerror(err));
         if (!keepOpen) irecv_close(client);
         return -1;
+    }
+    if (dnloadFinish) {
+        irecv_usb_control_transfer(client, 0x21, 1, 0, 0, nullptr, 0, 5000);
     }
     err = irecv_send_command_breq(client, command, commandBreq);
     if (err != IRECV_E_SUCCESS) {
@@ -1508,7 +1523,7 @@ int DeviceManager::sendKernelCache(const std::string& KernelCache_Path, uint64_t
     irecv_client_t client = get_tv_patient(ecid);
     // bReq=1: see sendFileThenCommand()'s own comment -- "bootx" is one of
     // idevicerestore's two bRequest=1 boot-triggering commands.
-    int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx", false, 1);
+    int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx", false, 1, true);
     if (result == 0 && !checkDeviceLeftRecoveryModeAfterBoot(ecid)) {
         result = -1;
     }
@@ -1635,19 +1650,52 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
         irecv_close(client);
         return -1;
     }
-    // Real idevicerestore (recovery_send_kernelcache(), recovery.c) always
-    // sends `setenv boot-args rd=md0 nand-enable-reformat=1 -progress`
-    // before triggering the boot -- without rd=md0 specifically, the
-    // kernel has no instruction to root off the ramdisk it was just sent,
-    // and panics/resets back to iBoot's own command prompt instead of
-    // booting. blackb0x's own patched iBEC route doesn't need this
-    // separately (patchiBEC()/Patcher.cpp already compiles an equivalent
-    // rd=md0 boot-args string directly into the patched iBEC itself), but
-    // useStockIBEC()'s genuinely-unpatched stock iBEC has no such
-    // compiled-in args and was never being told this at all. Order
-    // relative to the kernelcache file transfer itself doesn't matter --
-    // only that it happens before 'bootx' -- so it's sent first here for
-    // simplicity.
+    // Real idevicerestore's own recovery_send_kernelcache() (recovery.c)
+    // does four things in this exact order, not just a file+command send
+    // -- doesn't fit sendFileThenCommandWithReconnect()'s own shape, so
+    // this step is inlined manually instead:
+    //  1. upload the kernelcache file itself.
+    //  2. a zero-length DFU_DNLOAD-class control transfer (bmRequestType
+    //     0x21, bRequest 1) -- the same "that upload is finished, do
+    //     something with it" signal boot_client()'s own checkm8 soft-DFU
+    //     code elsewhere in this file already relies on. Confirmed on
+    //     real hardware: sending 'bootx' with bRequest=1 alone (without
+    //     this) still wasn't enough -- the device kept resetting back to
+    //     iBoot's own command prompt every time ("Boot Failure Count"
+    //     still climbing) until this was added too.
+    //  3. `setenv boot-args rd=md0 nand-enable-reformat=1 -progress` --
+    //     blackb0x's own patched iBEC route doesn't need this separately
+    //     (patchiBEC()/Patcher.cpp already compiles an equivalent rd=md0
+    //     string directly into the patched iBEC itself), but
+    //     useStockIBEC()'s genuinely-unpatched stock iBEC has no such
+    //     compiled-in args and was never being told this at all.
+    //  4. `bootx` via bRequest=1 -- see sendFileThenCommand()'s own
+    //     comment on why.
+    {
+        irecv_error_t fileErr =
+            irecv_send_file(client, components.kernel->c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+        if (fileErr != IRECV_E_SUCCESS) {
+            fprintf(stderr, "sendStockRestoreTail(KernelCache): failed to send %s: %s\n",
+                    components.kernel->c_str(), irecv_strerror(fileErr));
+            fprintf(stderr,
+                    "sendStockRestoreTail(KernelCache): retrying once against a freshly-reopened connection...\n");
+            client = get_tv_patient(ecid);
+            if (!client) {
+                fprintf(stderr, "sendStockRestoreTail(KernelCache): device did not reconnect for the retry\n");
+                return -1;
+            }
+            fileErr = irecv_send_file(client, components.kernel->c_str(), IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
+            if (fileErr != IRECV_E_SUCCESS) {
+                fprintf(stderr, "sendStockRestoreTail(KernelCache): failed to send %s: %s\n",
+                        components.kernel->c_str(), irecv_strerror(fileErr));
+                irecv_close(client);
+                return -1;
+            }
+        }
+    }
+
+    irecv_usb_control_transfer(client, 0x21, 1, 0, 0, nullptr, 0, 5000);
+
     err = irecv_send_command(client, "setenv boot-args rd=md0 nand-enable-reformat=1 -progress");
     if (err != IRECV_E_SUCCESS) {
         fprintf(stderr, "sendStockRestoreTail: failed to send 'setenv boot-args' command: %s\n",
@@ -1655,13 +1703,14 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
         irecv_close(client);
         return -1;
     }
-    // bReq=1: see sendFileThenCommand()'s own comment -- "bootx" is one of
-    // idevicerestore's two bRequest=1 boot-triggering commands.
-    if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(KernelCache)", *components.kernel, "bootx",
-                                           /*bReq=*/1)) {
-        if (client) irecv_close(client);
+    err = irecv_send_command_breq(client, "bootx", 1);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendStockRestoreTail: failed to send 'bootx' command: %s\n", irecv_strerror(err));
+        irecv_close(client);
         return -1;
     }
+    fprintf(stderr, "sendStockRestoreTail(KernelCache): sent %s and device acknowledged 'bootx'.\n",
+            components.kernel->c_str());
 
     irecv_close(client);
     sleep(2);
