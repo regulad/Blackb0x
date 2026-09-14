@@ -401,3 +401,38 @@ local file copy with no network/patch latency in between. Worth
 scoping against real hardware timing data (is the current live-patch
 window actually a problem in practice, or just a theoretical one) before
 committing to the added complexity of a speculative/AOT patch cache.
+
+## 6. Test building all possible ramdisk configurations
+
+Not started. `bake-all-ramdisks` now builds on both Linux and macOS (see
+item 4a above), but only ever a handful of individual `(device, buildID)`
+tuples have actually been baked and checked in either environment this
+session — never a full run across every one of the 95 known tuples under
+`Blackb0x/ImageKeys/` (`AppleTV2,1`/`AppleTV3,1`/`AppleTV3,2` combined).
+Worth a real `--signed-only`-less full run on each platform (every known
+build, not just currently-signed ones) to catch tuple-specific breakage
+the handful of spot-checked builds wouldn't — e.g. the AppleTV2,1 4.x
+legacy-recreation case `bakeRamdisk()` currently refuses outright (see its
+own early bail-out), older firmware branches' different persistence
+payloads (`stageVersionBranch()`), or firmware-version-gated `Depends:`
+resolution now that the synthetic `firmware` package is pinned to each
+tuple's real version instead of a single hardcoded constant (see item 4a's
+own history) — a bad pin for one specific version could silently break
+just that tuple's dependency resolution without showing up anywhere else.
+
+## 7. CI/CD system for prebuilt, patched firmware suite
+
+Not started. Every patched component this project produces (`dist/*.dmg`
+ramdisks, and whatever else `Patcher`'s patch* functions touch) is built
+locally, on-demand, by whoever happens to be running `blackb0x`/
+`bake-all-ramdisks` at the time — there's no automated build producing and
+publishing a versioned, prebuilt set of patched firmware components
+anyone could just download instead of baking their own. Worth scoping
+once item 6 above has actually exercised every known configuration
+end-to-end: what a CI pipeline would build (presumably the same full
+`bake-all-ramdisks` sweep), where prebuilt output would be published, how
+staleness/re-bakes get triggered when this project's own patches change
+without the underlying Apple firmware changing, and whether publishing
+prebuilt jailbreak components anywhere public raises different
+considerations than this project's current "you build it yourself"
+posture.
