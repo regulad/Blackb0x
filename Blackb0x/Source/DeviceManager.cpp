@@ -1149,6 +1149,17 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
         irecv_close(client);
         return -1;
     }
+    // Previously silent on success -- this step's own USB-level outcome
+    // (file transferred, command acknowledged) is worth logging
+    // unconditionally, not just its failures, since it's the only
+    // ground-truth this project has for "did the device actually do what
+    // we asked" without a serial console. Notably: this only confirms the
+    // COMMAND was accepted over USB, not that whatever the device does in
+    // response to it (mounting a ramdisk, booting a kernel, etc.) actually
+    // succeeds -- sendKernelCache() below adds an explicit post-'bootx'
+    // check for exactly that gap, since USB-level success and an actual
+    // successful boot are two different, genuinely distinguishable things.
+    fprintf(stderr, "%s: sent %s and device acknowledged the '%s' command.\n", what, path.c_str(), command);
     irecv_close(client);
     return 0;
 }
@@ -1210,11 +1221,55 @@ int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
     return result;
 }
 
+// 'bootx' is the actual boot trigger for the whole chain (ramdisk/
+// devicetree's own commands just stage data for the kernel to use once it
+// boots) -- but sendFileThenCommand()'s own success only means the USB
+// control transfer that DELIVERS 'bootx' was acknowledged, not that the
+// device went on to actually boot the kernel it names. Those are
+// genuinely different outcomes this project has no serial console to
+// distinguish directly, but one real signal IS available over USB: a
+// device that actually left Recovery mode to continue booting stops
+// answering as a Recovery-mode irecv client at all, while one that's
+// stuck (kernel panic, failed ramdisk mount, bad boot-args/KASLR patch,
+// etc.) keeps answering right where it was. Polls for a few seconds after
+// 'bootx' is acknowledged and reports which of those two it actually
+// observed -- real, previously entirely missing status for exactly the
+// question "did issuing bootx actually work."
+static void checkDeviceLeftRecoveryModeAfterBoot(uint64_t ecid) {
+    fprintf(stderr, "sendKernelCache: 'bootx' acknowledged -- checking whether the device actually "
+                    "leaves Recovery mode...\n");
+    for (int i = 1; i <= 5; i++) {
+        sleep(1);
+        irecv_client_t check = get_tv(ecid);
+        if (!check) {
+            fprintf(stderr,
+                    "sendKernelCache: device is no longer responding in Recovery mode (checked after "
+                    "%ds) -- it left that state after 'bootx'. This means the boot process actually "
+                    "started; it does NOT by itself confirm the boot finished successfully (a kernel "
+                    "panic partway through, or a failure inside the ramdisk's own entrypoint, can still "
+                    "happen after this point with nothing further visible over USB -- watch the device's "
+                    "own screen).\n",
+                    i);
+            return;
+        }
+        irecv_close(check);
+        fprintf(stderr, "sendKernelCache: device still responding in Recovery mode after %ds...\n", i);
+    }
+    fprintf(stderr,
+            "sendKernelCache: device is STILL responding in Recovery mode 5s after 'bootx' was "
+            "acknowledged -- the command was accepted over USB, but the device does not appear to have "
+            "actually continued booting the uploaded kernelcache/ramdisk/devicetree. This points at the "
+            "boot itself failing (kernel panic, a bad KASLR/boot-args patch for this firmware, or the "
+            "kernel being unable to mount the ramdisk) rather than a USB/command-delivery problem, which "
+            "already succeeded.\n");
+}
+
 int DeviceManager::sendKernelCache(const std::string& KernelCache_Path, uint64_t ecid) {
     // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
     // follows Ramdisk's own NOTIFY_FINISH-triggered reset.
     irecv_client_t client = get_tv_patient(ecid);
     int result = sendFileThenCommand(client, "sendKernelCache", KernelCache_Path, "bootx");
+    if (result == 0) checkDeviceLeftRecoveryModeAfterBoot(ecid);
     sleep(2);
     return result;
 }
