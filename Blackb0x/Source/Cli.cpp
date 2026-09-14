@@ -62,6 +62,14 @@ void printCliUsage(const char* argv0) {
     printf("                            work on macOS no matter what has been\n");
     printf("                            tried; see README.md)\n");
 #endif
+    printf("  --dont-check-firmware-sums\n");
+    printf("                            Skip patchRamdisk()'s check that the baked\n");
+    printf("                            dist/ ramdisk still matches ramdisk/'s current\n");
+    printf("                            content (its .sum sidecar) — uses it as-is\n");
+    printf("                            even if stale. For iterating without\n");
+    printf("                            re-running bake-all-ramdisks every time; NOT\n");
+    printf("                            the default, since it can silently ship a\n");
+    printf("                            stale ramdisk.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
     printf("blackb0x needs root by default: talking to a DFU/Recovery-mode device needs\n");
@@ -92,6 +100,8 @@ CliOptions parseCliOptions(int argc, char** argv) {
             options.dryRun = true;
         } else if (arg == "--no-checkm8") {
             options.noCheckm8 = true;
+        } else if (arg == "--dont-check-firmware-sums") {
+            options.dontCheckFirmwareSums = true;
         } else if (arg == "--pwntool") {
             std::string value = nextArg("--pwntool");
 #if defined(__APPLE__)
@@ -278,8 +288,10 @@ bool checkExploit(DeviceManager& deviceManager, const AppleTVDevice& device, boo
 // the same patch* calls as a side effect of assignment).
 std::optional<PatchedComponents> downloadAndPatchComponents(Patcher& patcher, const AppleTVDevice& device,
                                                               const std::string& buildToRequest,
-                                                              bool onlyBootComponents) {
+                                                              bool onlyBootComponents,
+                                                              bool dontCheckFirmwareSums) {
     patcher.onlyBootComponents = onlyBootComponents;
+    patcher.dontCheckFirmwareSums = dontCheckFirmwareSums;
 
     printf("Downloading firmware for %s %s...\n", device.deviceModel.c_str(), buildToRequest.c_str());
     IpswFetch fetcher;
@@ -619,7 +631,8 @@ int runCli(const CliOptions& options) {
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
 
-    auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot);
+    auto components =
+        downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot, options.dontCheckFirmwareSums);
     if (!components) {
         fprintf(stderr, "Failed to download/patch firmware components.\n");
         return 1;

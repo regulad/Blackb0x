@@ -76,6 +76,15 @@ public:
 
     bool onlyBootComponents = false;
 
+    // --dont-check-firmware-sums (Cli.hpp's CliOptions): skip
+    // patchRamdisk()'s own .sum sidecar staleness check (see that
+    // function's comment) and use dist/<device>_<buildID>-Ramdisk.dmg as-
+    // is even if it doesn't match ramdisk/'s current content. For
+    // iterating without re-running bake-all-ramdisks every time — not a
+    // default, since it reintroduces exactly the "silently ship a stale
+    // ramdisk" failure mode the check exists to catch.
+    bool dontCheckFirmwareSums = false;
+
     // Called once every component checkPatching() requires is available
     // (replaces MainView's componentsReady:). Fired synchronously from
     // whichever patch*() call completes the last required component.

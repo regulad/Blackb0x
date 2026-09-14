@@ -24,6 +24,7 @@ struct CliOptions {
     bool tetherBoot = false;
     bool dryRun = false;
     bool noCheckm8 = false;
+    bool dontCheckFirmwareSums = false;
     bool help = false;
     // Which tool actually runs the checkm8 exploit -- "gaster" or
     // "blackb0x-pwn". Only ever meaningfully choosable on Apple platforms

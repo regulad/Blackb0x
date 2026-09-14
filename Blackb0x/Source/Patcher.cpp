@@ -303,19 +303,28 @@ bool Patcher::patchRamdisk(const std::string& path) {
     // Refuse a stale artifact rather than silently uploading old content:
     // if ramdisk/ has been edited since this was baked, its .sum sidecar
     // (written by bake-all-ramdisks) won't match the overlay's current
-    // hash.
-    std::string storedHash;
-    {
-        std::ifstream sumIn(sumFileFor(patchedDMG));
-        if (sumIn) std::getline(sumIn, storedHash);
-    }
-    if (storedHash != ramdiskOverlayContentHash()) {
+    // hash. --dont-check-firmware-sums bypasses this entirely (see
+    // dontCheckFirmwareSums's own comment in Patcher.hpp).
+    if (dontCheckFirmwareSums) {
         fprintf(stderr,
-                "patchRamdisk: %s is stale — the ramdisk/ overlay has changed since this was baked.\n"
-                "Re-run this (as root) before using blackb0x against this firmware:\n"
-                "  sudo ./bake-all-ramdisks\n",
+                "patchRamdisk: --dont-check-firmware-sums set — using %s as-is without checking "
+                "whether it still matches the current ramdisk/ overlay.\n",
                 patchedDMG.c_str());
-        return false;
+    } else {
+        std::string storedHash;
+        {
+            std::ifstream sumIn(sumFileFor(patchedDMG));
+            if (sumIn) std::getline(sumIn, storedHash);
+        }
+        if (storedHash != ramdiskOverlayContentHash()) {
+            fprintf(stderr,
+                    "patchRamdisk: %s is stale — the ramdisk/ overlay has changed since this was baked.\n"
+                    "Re-run this (as root) before using blackb0x against this firmware:\n"
+                    "  sudo ./bake-all-ramdisks\n"
+                    "Or pass --dont-check-firmware-sums to use it anyway.\n",
+                    patchedDMG.c_str());
+            return false;
+        }
     }
 
     outputs_.ramdisk = patchedDMG;
