@@ -61,6 +61,7 @@ static void request_image_validation(irecv_client_t client);
 static int msleep(long msec);
 static const char* mode_to_str(int mode);
 static bool serialStringIndicatesRealDFU(const char* serialString);
+static bool isPwnedDFU(const struct irecv_device_info* info);
 static int send_data(irecv_client_t client, unsigned char* data, size_t size);
 static bool commandExistsOnPath(const char* name);
 static int runGaster(const std::vector<std::string>& args, int timeoutSeconds = 0);
@@ -619,7 +620,7 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid, const std::string& pwnTool) {
         irecv_client_t already = get_tv(ecid);
         if (already) {
             const struct irecv_device_info* info = irecv_get_device_info(already);
-            bool alreadyPwned = info && strstr(info->serial_string, "PWND:[");
+            bool alreadyPwned = isPwnedDFU(info);
             irecv_close(already);
             if (alreadyPwned) {
                 status("Device already in pwned DFU");
@@ -669,7 +670,7 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid, const std::string& pwnTool) {
     }
 
     const struct irecv_device_info* info = irecv_get_device_info(client);
-    if (!info || !strstr(info->serial_string, "PWND:[")) {
+    if (!isPwnedDFU(info)) {
         irecv_close(client);
         fprintf(stderr, "checkm8: device did not report pwned DFU after %s.\n", pwnTool.c_str());
         status("Checkm8 unsuccessful");
@@ -1010,6 +1011,21 @@ static const char* mode_to_str(int mode) {
 //   Recovery: CPID:8947 CPRV:00 CPFM:03 SCEP:10 BDID:00 ECID:000002713C84D50E IBFL:1B SRNM:[F6KM4D1TFF54]
 static bool serialStringIndicatesRealDFU(const char* serialString) {
     return serialString && strstr(serialString, "iBoot") != nullptr;
+}
+
+// Shared by checkm8Attempt()/boot_client() below (the three call sites
+// this used to be duplicated at, one of which -- boot_client() -- was
+// missing this function's own null checks entirely, dereferencing
+// info->serial_string completely unguarded): true exactly when this
+// device's serial string carries "PWND:[", the only signal this project
+// has for telling a checkm8/SHAtter-exploited DFU device apart from a
+// genuinely un-pwned one. Both `info` itself and `info->serial_string`
+// need checking -- irecv_get_device_info() can return null, and even
+// when it doesn't, serial_string can still be null (see
+// serialStringIndicatesRealDFU()'s own null check just above for the
+// same reason).
+static bool isPwnedDFU(const struct irecv_device_info* info) {
+    return info && info->serial_string && strstr(info->serial_string, "PWND:[") != nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,24 +1452,41 @@ static bool checkDeviceLeftRecoveryModeAfterBoot(uint64_t ecid) {
                 i, mode, (info && info->serial_string) ? info->serial_string : "(none)");
 
         std::string console = captureConsoleLog(check);
+        irecv_close(check);
         if (!console.empty()) {
             fprintf(stderr, "sendKernelCache: console output:\n%s\n", console.c_str());
-            size_t pos = console.find("Boot Failure Count:");
-            if (pos != std::string::npos) {
+            // "Boot Failure Count:" only ever appears in this capture at
+            // all because it's iBoot's own fresh startup banner, printed
+            // exactly once per Recovery-mode session (see this function's
+            // own comment above) -- seeing it here already means the
+            // device reset and iBoot gave up and dropped back to its own
+            // command prompt. That's a definitive, already-final answer,
+            // not a "maybe still booting" state, so there's no reason to
+            // keep burning through the rest of the 5s budget waiting for
+            // a boot that has already failed -- fail immediately instead.
+            if (console.find("Boot Failure Count:") != std::string::npos) {
                 fprintf(stderr,
                         "sendKernelCache: *** iBoot reports a boot failure count -- this is iBoot's own "
                         "startup banner, meaning the device actually reset and iBoot ran its own boot "
-                        "sequence again. If this count is going UP across repeated attempts with this "
-                        "same kernelcache/ramdisk/devicetree, that's strong evidence iBoot itself is "
-                        "rejecting the boot, not a fluke. ***\n");
+                        "sequence again. Treating this as an immediate failure instead of waiting out the "
+                        "rest of the 5s window -- iBoot has already rejected the uploaded kernelcache/"
+                        "ramdisk/devicetree combination. ***\n");
+                return false;
             }
         }
-        irecv_close(check);
     }
+    // Reaching here means the device stayed in Recovery mode for the full
+    // 5s without ever reporting a boot failure count above -- per this
+    // function's own reasoning, that combination should be impossible (a
+    // working boot leaves well under 5s; a failing one reprints iBoot's
+    // startup banner, caught above). Still a failure either way, just an
+    // unexplained one worth calling out as such rather than implying the
+    // usual "iBoot rejected it" diagnosis applies.
     fprintf(stderr,
-            "sendKernelCache: device is STILL in Recovery mode 5s after 'bootx' was acknowledged -- "
-            "treating this as a failure. iBoot most likely rejected or failed to boot the uploaded "
-            "kernelcache/ramdisk/devicetree combination.\n");
+            "sendKernelCache: device is STILL in Recovery mode 5s after 'bootx' was acknowledged, without "
+            "ever reporting a boot failure count -- treating this as a failure too, but this specific "
+            "outcome (neither a clean handoff nor an explicit iBoot failure banner) shouldn't be possible "
+            "and is worth investigating on its own.\n");
     return false;
 }
 
@@ -1697,8 +1730,7 @@ static int boot_client(irecv_client_t client, void* buf, size_t sz, bool allowUn
     }
 
     const struct irecv_device_info* info = irecv_get_device_info(client);
-    const char* pwnd_str = strstr(info->serial_string, "PWND:[");
-    if (!pwnd_str) {
+    if (!isPwnedDFU(info)) {
         if (!allowUnpwned) {
             irecv_close(client);
             fprintf(stderr, "Device is not in pwned DFU mode.\n");
