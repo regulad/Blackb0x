@@ -274,3 +274,36 @@ native there instead of a bolted-on Linux kernel driver:
 
 No code started here — this is scoping notes only, to pick up whenever
 this is prioritized.
+
+### 4b. `blackb0x-pwn`: Blackb0x's own original checkm8/SHAtter, standalone and IOKit-only
+
+Added: a new `if(APPLE)`-gated executable target (`CMakeLists.txt`,
+`Blackb0x/Source/Pwn/`), independent of both the main `blackb0x` binary's
+gaster-based `checkm8Attempt()` and of gaster itself. Ports
+`DeviceManager.m`'s original `+SHAtter:`/`+checkm8:` (deleted from the
+tree in `907b64b`, recovered from git history — see `Checkm8Pwn.c`'s own
+header comment for the exact `git show` invocation) byte-for-byte to C,
+same "translate, don't improve" rule the main binary's own `SHAtter()`
+port already follows.
+
+"IOKit-only" is a real, verified build-time guarantee, not just "happens
+to run on macOS": `third_party/libirecovery` has its own genuine upstream
+`--with-iokit` native Darwin backend (confirmed by reading
+`configure.ac`/`libirecovery.c` directly, not assumed) as an alternative
+to libusb. `blackb0x-pwn` gets its own separate libirecovery build
+(`libirecovery_iokit_ext`, own install prefix, out-of-source so it can't
+collide with the shared in-source `libirecovery_ext`) with `--with-iokit`
+passed explicitly, so its configure step fails loudly if IOKit isn't
+available rather than silently falling back to libusb. Confirmed: no
+`deps::usb` anywhere in this target's link line at all.
+
+Verified so far: the exploit-body C file (`Checkm8Pwn.c`) is genuinely
+backend-agnostic (only calls through libirecovery's public `irecv_*` API,
+never touches IOKit/CoreFoundation directly) — confirmed directly by
+compiling and linking it *on Linux* against the existing libusb-backed
+libirecovery headers/library with `-Wall -Wextra` (zero warnings) and
+inspecting its undefined symbols (only `irecv_*` + libc, nothing
+IOKit-shaped). That's real signal the C is correct, but it is **not** a
+substitute for actually building/running on macOS, which hasn't happened
+yet — the CMake plumbing (the new out-of-source `libirecovery_iokit_ext`
+ExternalProject in particular) is entirely unverified on a real host.

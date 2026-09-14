@@ -351,9 +351,27 @@ set(DEPS_MODERN_PKGCONFIG ${DEPS_MODERN_PREFIX}/lib/pkgconfig)
 ExternalProject_Add(libusb_ext
     SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libusb
     BUILD_IN_SOURCE 1
+    # --disable-examples-build/--disable-tests-build: both already default
+    # to "no" in libusb's own configure.ac, but passed explicitly anyway
+    # after a real build showed libusb's bundled `examples`/`tests`
+    # subdirectories getting built (and, since automake's recursive
+    # "install" target builds a subdirectory's `noinst_PROGRAMS` before
+    # installing, even a plain top-level `make install` hits this, not
+    # just `make`) despite that default -- root cause not fully pinned
+    # down (stale cache in a from-source ExternalProject_Add checkout is
+    # the leading suspect), but this project never needs libusb's own
+    # example/test binaries either way, only libusb-1.0.a itself, so
+    # forcing both off explicitly is correct regardless of why the
+    # default wasn't already doing that. This is what actually fixed a
+    # real macOS build failure: those examples need `-framework
+    # CoreFoundation -framework IOKit -framework Security`
+    # (darwin_usb.c's own CoreFoundation/IOKit/Security API use) that
+    # this project's own build has no reason to provide, since it never
+    # links those example binaries into anything.
     CONFIGURE_COMMAND ${AUTOTOOLS_ENV} ./autogen.sh --prefix=${DEPS_PREFIX}
                         --enable-static --disable-shared
                         --disable-udev
+                        --disable-examples-build --disable-tests-build
     BUILD_COMMAND   ${AUTOTOOLS_ENV} make -j
     INSTALL_COMMAND make install
 )
@@ -1000,6 +1018,94 @@ else()
     # this libusb/wolfSSL path — the native Apple path above has no vendored
     # ExternalProject dependency of its own.
     add_dependencies(gaster libusb_ext wolfssl_ext)
+endif()
+
+# ---------------------------------------------------------------------------
+# blackb0x-pwn: Blackb0x's own original checkm8/SHAtter exploit, standalone
+# and IOKit-only.
+#
+# Apple platforms only -- this target does not exist at all on Linux, not
+# just an empty stub, matching how gaster's own IOKit branch above is
+# genuinely unbuildable there too. Ports DeviceManager.m's original
+# +SHAtter:/+checkm8: methods (deleted from the tree in 907b64b, recovered
+# from git history -- see Blackb0x/Source/Pwn/Checkm8Pwn.c's own header
+# comment) byte-for-byte, independent of both gaster (a different
+# implementation, from a different author, covering a broader chip range)
+# and the main `blackb0x` binary's own gaster-based checkm8Attempt().
+#
+# "IOKit-only" means more than "happens to run on macOS": libirecovery
+# itself (third_party/libirecovery) has a real, upstream, --with-iokit
+# native Darwin backend (configure.ac, defaults to yes when IOKit is
+# available) as an alternative to its libusb backend -- confirmed by
+# reading configure.ac and libirecovery.c's own iokit_usb_control_transfer/
+# iokit_async_usb_control_transfer directly, not assumed. The existing
+# libirecovery_ext target above never passes --with-iokit or
+# --without-iokit explicitly, so it already gets IOKit for free on a real
+# macOS build (nothing to change there) -- but that's an implicit default,
+# not a guarantee, and libirecovery_ext is shared with the main `blackb0x`
+# binary. blackb0x-pwn instead gets its own separate libirecovery build
+# (libirecovery_iokit_ext, installed to its own prefix so it can't collide
+# with libirecovery_ext's in-source build artifacts) with --with-iokit
+# passed explicitly, so its own configure step fails loudly if IOKit isn't
+# available rather than silently falling back to libusb.
+if(APPLE)
+    set(DEPS_IOKIT_PREFIX ${CMAKE_BINARY_DIR}/deps-iokit)
+    set(DEPS_IOKIT_INCLUDE ${DEPS_IOKIT_PREFIX}/include)
+    set(DEPS_IOKIT_LIB ${DEPS_IOKIT_PREFIX}/lib)
+
+    # BUILD_IN_SOURCE 0 (the default -- omitted, unlike every libusb-backed
+    # ExternalProject_Add above): libirecovery_ext already builds in-source
+    # directly inside third_party/libirecovery, so a second in-source build
+    # here with different configure flags would overwrite its Makefile/
+    # config.status/object files out from under it. NOCONFIGURE=1
+    # ./autogen.sh (first COMMAND) only bootstraps the shared, generic
+    # `configure` script (aclocal/autoheader/automake/autoconf -- see
+    # autogen.sh's own NOCONFIGURE check) without running ./configure
+    # in-source; the real, differently-flagged ./configure call (second
+    # COMMAND) then runs out-of-source, from this step's own separate
+    # <BINARY_DIR>, exactly like every other out-of-source autotools
+    # ExternalProject_Add would. DEPENDS libirecovery_ext purely to
+    # serialize the two targets' autogen.sh runs against the same source
+    # directory -- both are idempotent and would otherwise be a real race
+    # under parallel `make -j`.
+    ExternalProject_Add(libirecovery_iokit_ext
+        DEPENDS         libirecovery_ext libplist_ext libimobiledevice_glue_ext
+        SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libirecovery
+        CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env NOCONFIGURE=1
+                            ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR}/third_party/libirecovery ./autogen.sh
+                  COMMAND ${AUTOTOOLS_ENV_WITH_MODERN} ${CMAKE_SOURCE_DIR}/third_party/libirecovery/configure
+                            --prefix=${DEPS_IOKIT_PREFIX}
+                            --enable-static --disable-shared --with-iokit
+        BUILD_COMMAND   ${AUTOTOOLS_ENV_WITH_MODERN} make -j
+        INSTALL_COMMAND make install
+    )
+
+    add_library(deps::irecovery_iokit STATIC IMPORTED GLOBAL)
+    set_target_properties(deps::irecovery_iokit PROPERTIES
+        IMPORTED_LOCATION ${DEPS_IOKIT_LIB}/libirecovery-1.0.a
+        INTERFACE_INCLUDE_DIRECTORIES ${DEPS_IOKIT_INCLUDE})
+
+    add_executable(blackb0x-pwn
+        Blackb0x/Source/Pwn/main.c
+        Blackb0x/Source/Pwn/Checkm8Pwn.c)
+    target_include_directories(blackb0x-pwn PRIVATE Blackb0x/Source)
+    # deps::imobiledevice_glue/deps::plist: libirecovery-1.0.a's own real
+    # (backend-independent) link dependencies -- confirmed via its
+    # installed .pc file's Requires.private, same two archives the main
+    # blackb0x binary already links for the same reason. No deps::usb here
+    # at all: unlike the shared libirecovery_ext build, this one's own
+    # Makefile.am never populates $(libusb_CFLAGS)/$(libusb_LIBS) once
+    # --with-iokit succeeds (confirmed by reading configure.ac's own
+    # AS_IF branching directly), so there is nothing libusb-related to
+    # link against in the first place.
+    target_link_libraries(blackb0x-pwn PRIVATE
+        deps::irecovery_iokit
+        deps::imobiledevice_glue
+        deps::plist
+        Threads::Threads
+        "-framework CoreFoundation"
+        "-framework IOKit")
+    add_dependencies(blackb0x-pwn libirecovery_iokit_ext libimobiledevice_glue_ext libplist_ext)
 endif()
 
 # ---------------------------------------------------------------------------
