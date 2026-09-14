@@ -21,7 +21,7 @@
 //  checks the same sidecar before trusting a dist/ entry for the same
 //  reason.
 //
-//  Usage: sudo ./bake-all-ramdisks [--signed-only] [--device <model>]
+//  Usage: sudo ./bake-all-ramdisks [--signed-only] [--device <model>] [--build <buildID>]
 //  (needs CAP_SYS_ADMIN/CAP_CHOWN, same as bakeRamdisk() itself — see its
 //  header comment for why)
 //
@@ -37,6 +37,12 @@
 //  92 known (device, firmware) combinations on every single test run —
 //  combine with --signed-only to narrow to just that device's currently-
 //  signed build(s).
+//
+//  --build <buildID> restricts the run to just that one firmware build
+//  (e.g. "12H606"), across whichever known device(s) have it. Same
+//  rationale as --device — iterating without paying for every known
+//  combination — and combines with --device (and --signed-only) to pin
+//  the run down to exactly one (device, buildID) pair.
 //
 
 #include "BakeRamdisk.hpp"
@@ -89,6 +95,7 @@ static std::vector<std::pair<std::string, std::string>> knownFirmwareTargets() {
 int main(int argc, char** argv) {
     bool signedOnly = false;
     std::string deviceFilter;
+    std::string buildFilter;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--signed-only") == 0) {
             signedOnly = true;
@@ -98,9 +105,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
             deviceFilter = argv[++i];
+        } else if (strcmp(argv[i], "--build") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "bake-all-ramdisks: --build requires a value (e.g. --build 12H606)\n");
+                return 2;
+            }
+            buildFilter = argv[++i];
         } else {
             fprintf(stderr, "bake-all-ramdisks: unrecognized argument %s\n", argv[i]);
-            fprintf(stderr, "usage: bake-all-ramdisks [--signed-only] [--device <model>]\n");
+            fprintf(stderr, "usage: bake-all-ramdisks [--signed-only] [--device <model>] [--build <buildID>]\n");
             return 2;
         }
     }
@@ -124,6 +137,21 @@ int main(int argc, char** argv) {
         if (targets.empty()) {
             fprintf(stderr, "bake-all-ramdisks: no known (device, firmware) combinations for device %s\n",
                     deviceFilter.c_str());
+            return 1;
+        }
+    }
+
+    if (!buildFilter.empty()) {
+        size_t before = targets.size();
+        std::vector<std::pair<std::string, std::string>> filtered;
+        for (auto& target : targets) {
+            if (target.second == buildFilter) filtered.push_back(target);
+        }
+        targets = std::move(filtered);
+        printf("--build %s: %zu of %zu known combinations match.\n", buildFilter.c_str(), targets.size(), before);
+        if (targets.empty()) {
+            fprintf(stderr, "bake-all-ramdisks: no known (device, firmware) combinations for build %s\n",
+                    buildFilter.c_str());
             return 1;
         }
     }
