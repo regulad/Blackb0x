@@ -819,6 +819,19 @@ int runCli(const CliOptions& options) {
 
     std::string buildToRequest = tetherBoot ? device.buildID : kJailbreakTargetBuild;
     if (device.jailbroken) buildToRequest = device.buildID;
+    // --stock-securom's whole point is testing against a build the
+    // device's real SecureROM will actually accept a personalized SHSH
+    // ticket for -- kJailbreakTargetBuild is fixed to the specific old
+    // build this project's own jailbreak patches/ImageKeys/baked
+    // ramdisks are tuned for, almost never Apple's current signing
+    // window. Apple always has at least one currently-signed build for
+    // any still-supported device (this is what makes ipsw.me's "latest"
+    // endpoint meaningful at all) -- IpswFetch::firmwareURLForDevice()
+    // already treats the literal string "latest" as a request for
+    // exactly that (see its own implementation), so just ask for it
+    // directly instead of guessing/enumerating signedBuildsForDevice()'s
+    // own (unordered, not "give me the newest") result set.
+    if (options.stockSecurom) buildToRequest = "latest";
 
     auto components = downloadAndPatchComponents(patcher, device, buildToRequest, tetherBoot,
                                                    options.dontCheckFirmwareSums, options.stockRamdisk,
