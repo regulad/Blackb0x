@@ -132,6 +132,22 @@ public:
                  std::shared_ptr<void> buildIdentity = nullptr, const std::string& deviceModel = "",
                  const std::string& buildID = "");
     int sendiBEC(const std::string& path, uint64_t ecid);
+    // Gated on stockRecovery (Cli.hpp's CliOptions), not stockSecurom --
+    // this is about whether useStockIBEC()'s genuinely-unpatched iBEC is
+    // what's running, not whether checkm8 ran to get there (see
+    // Cli.cpp's sendComponentsToDevice() own comment for the full
+    // reasoning). Fetches and sends the combined APTicket that
+    // authorizes every component after iBSS together -- see
+    // Personalize.hpp's own fetchAPTicket() comment for why this is a
+    // separate step from personalizing iBSS itself. Must be called once,
+    // after sendiBEC() succeeds and before
+    // sendDeviceTree()/sendRamdisk()/sendKernelCache() -- a stock iBEC
+    // won't accept any of those without this on file first, matching
+    // real idevicerestore's own ordering (recovery.c's
+    // recovery_send_ticket(), called immediately on entering Recovery
+    // mode, before anything else).
+    int sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
+                      const std::string& buildID);
     int sendRamdisk(const std::string& path, uint64_t ecid);
     int sendKernelCache(const std::string& path, uint64_t ecid);
     int sendDeviceTree(const std::string& path, uint64_t ecid);

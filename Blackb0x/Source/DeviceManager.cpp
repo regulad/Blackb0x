@@ -1201,6 +1201,43 @@ int DeviceManager::sendiBEC(const std::string& iBECpath, uint64_t ecid) {
     return (err == IRECV_E_SUCCESS) ? 0 : -1;
 }
 
+int DeviceManager::sendAPTicket(uint64_t ecid, std::shared_ptr<void> buildIdentity, const std::string& deviceModel,
+                                 const std::string& buildID) {
+    irecv_client_t client = get_tv_patient(ecid);
+    if (!client) {
+        fprintf(stderr, "sendAPTicket: device did not reconnect\n");
+        return -1;
+    }
+
+    const struct irecv_device_info* info = irecv_get_device_info(client);
+    auto ticket =
+        fetchAPTicket(buildIdentity, ecid, info->ap_nonce, info->ap_nonce_size, deviceModel, buildID);
+    if (!ticket) {
+        irecv_close(client);
+        return -1;
+    }
+
+    irecv_error_t err = irecv_send_buffer(client, ticket->data(), ticket->size(), 0);
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendAPTicket: failed to send ApTicket (%zu bytes): %s\n", ticket->size(),
+                irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+
+    err = irecv_send_command(client, "ticket");
+    if (err != IRECV_E_SUCCESS) {
+        fprintf(stderr, "sendAPTicket: failed to send 'ticket' command: %s\n", irecv_strerror(err));
+        irecv_close(client);
+        return -1;
+    }
+
+    fprintf(stderr, "sendAPTicket: sent ApTicket (%zu bytes) and device acknowledged the 'ticket' command.\n",
+            ticket->size());
+    irecv_close(client);
+    return 0;
+}
+
 // Shared by sendRamdisk()/sendKernelCache()/sendDeviceTree() below: send a
 // file, then a follow-up command that tells the device what to do with it
 // (e.g. "ramdisk", "bootx", "devicetree"). Sending the command after a

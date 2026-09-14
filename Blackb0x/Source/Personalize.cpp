@@ -29,18 +29,21 @@ constexpr const char* kTSSServerURL = "https://gs.apple.com/TSS/controller?actio
 // first (ECID) element's own fixed, known size. Matched exactly rather than
 // re-derived, per this file's own "don't reimplement, adapt exactly" intent.
 constexpr size_t kTssBlobSizeCheck = 64;
-}  // namespace
 
-std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& componentName,
-                                                               const std::string& rawImg3Path,
-                                                               std::shared_ptr<void> buildIdentity, uint64_t ecid,
-                                                               const unsigned char* apNonce, unsigned int apNonceSize,
-                                                               const std::string& deviceModel,
-                                                               const std::string& buildID) {
+// Shared by personalizeIMG3Component()/fetchAPTicket() below -- one real
+// TSS request/response covers every Trusted component in the manifest at
+// once (tss_parameters_add_from_manifest()'s own "include_manifest=true"
+// copies the whole thing in), including the combined ApTicket that
+// authorizes all of them together, so both callers just need their own
+// extraction step afterward, not a separate request each. Caller owns
+// the returned plist_t (plist_free() it) -- nullptr on failure, with the
+// reason already printed to stderr.
+plist_t requestTSS(std::shared_ptr<void> buildIdentity, uint64_t ecid, const unsigned char* apNonce,
+                    unsigned int apNonceSize, const std::string& deviceModel, const std::string& buildID) {
     plist_t identity = static_cast<plist_t>(buildIdentity.get());
     if (!identity) {
-        fprintf(stderr, "personalizeIMG3Component: no BuildIdentity available for %s\n", componentName.c_str());
-        return std::nullopt;
+        fprintf(stderr, "requestTSS: no BuildIdentity available\n");
+        return nullptr;
     }
 
     // Best-effort, cheap check before ever bothering Apple's real TSS
@@ -53,9 +56,9 @@ std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& 
         std::set<std::string> signedBuilds = signedBuildsForDevice(deviceModel);
         if (!signedBuilds.count(buildID)) {
             fprintf(stderr,
-                    "personalizeIMG3Component: ipsw.me does not currently list %s %s as signed by Apple -- the "
-                    "TSS request below is very likely to be refused. Trying anyway, since ipsw.me's own "
-                    "signing-status snapshot isn't authoritative.\n",
+                    "requestTSS: ipsw.me does not currently list %s %s as signed by Apple -- the TSS request "
+                    "below is very likely to be refused. Trying anyway, since ipsw.me's own signing-status "
+                    "snapshot isn't authoritative.\n",
                     deviceModel.c_str(), buildID.c_str());
         }
     }
@@ -79,37 +82,46 @@ std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& 
 
     plist_t request = tss_request_new(nullptr);
     if (!request) {
-        fprintf(stderr, "personalizeIMG3Component: tss_request_new failed\n");
+        fprintf(stderr, "requestTSS: tss_request_new failed\n");
         plist_free(parameters);
-        return std::nullopt;
+        return nullptr;
     }
 
     if (tss_request_add_common_tags(request, parameters, nullptr) < 0 ||
         tss_request_add_ap_tags(request, parameters, nullptr) < 0 ||
         tss_request_add_ap_img3_tags(request, parameters) < 0) {
-        fprintf(stderr, "personalizeIMG3Component: failed to build TSS request for %s\n", componentName.c_str());
+        fprintf(stderr, "requestTSS: failed to build TSS request\n");
         plist_free(request);
         plist_free(parameters);
-        return std::nullopt;
+        return nullptr;
     }
 
-    fprintf(stderr,
-            "personalizeIMG3Component: requesting a real, ECID-personalized SHSH ticket for %s from Apple's "
-            "signing server...\n",
-            componentName.c_str());
+    fprintf(stderr, "requestTSS: requesting a real, ECID-personalized ticket from Apple's signing server...\n");
     plist_t response = tss_request_send(request, kTSSServerURL);
     plist_free(request);
     plist_free(parameters);
 
     if (!response) {
         fprintf(stderr,
-                "personalizeIMG3Component: Apple's TSS server would not sign %s -- most likely this build has "
-                "left Apple's current signing window (a SHSH-less downgrade to firmware Apple no longer signs "
-                "isn't possible without a blob saved while it was still signed). This is a real, expected "
-                "answer, not a bug in this tool.\n",
-                componentName.c_str());
-        return std::nullopt;
+                "requestTSS: Apple's TSS server would not sign this request -- most likely this build has left "
+                "Apple's current signing window (a SHSH-less downgrade to firmware Apple no longer signs isn't "
+                "possible without a blob saved while it was still signed). This is a real, expected answer, not "
+                "a bug in this tool.\n");
+        return nullptr;
     }
+
+    return response;
+}
+}  // namespace
+
+std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& componentName,
+                                                               const std::string& rawImg3Path,
+                                                               std::shared_ptr<void> buildIdentity, uint64_t ecid,
+                                                               const unsigned char* apNonce, unsigned int apNonceSize,
+                                                               const std::string& deviceModel,
+                                                               const std::string& buildID) {
+    plist_t response = requestTSS(buildIdentity, ecid, apNonce, apNonceSize, deviceModel, buildID);
+    if (!response) return std::nullopt;
 
     unsigned char* blob = nullptr;
     if (tss_response_get_blob_by_entry(response, componentName.c_str(), &blob) < 0 || !blob) {
@@ -142,5 +154,25 @@ std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& 
 
     std::vector<uint8_t> result(static_cast<uint8_t*>(stitched), static_cast<uint8_t*>(stitched) + stitchedSize);
     free(stitched);
+    return result;
+}
+
+std::optional<std::vector<uint8_t>> fetchAPTicket(std::shared_ptr<void> buildIdentity, uint64_t ecid,
+                                                    const unsigned char* apNonce, unsigned int apNonceSize,
+                                                    const std::string& deviceModel, const std::string& buildID) {
+    plist_t response = requestTSS(buildIdentity, ecid, apNonce, apNonceSize, deviceModel, buildID);
+    if (!response) return std::nullopt;
+
+    unsigned char* ticket = nullptr;
+    unsigned int ticketSize = 0;
+    if (tss_response_get_ap_ticket(response, &ticket, &ticketSize) < 0 || !ticket) {
+        fprintf(stderr, "fetchAPTicket: TSS response has no ApTicket\n");
+        plist_free(response);
+        return std::nullopt;
+    }
+    plist_free(response);
+
+    std::vector<uint8_t> result(ticket, ticket + ticketSize);
+    free(ticket);
     return result;
 }

@@ -61,3 +61,22 @@ std::optional<std::vector<uint8_t>> personalizeIMG3Component(const std::string& 
                                                                const unsigned char* apNonce, unsigned int apNonceSize,
                                                                const std::string& deviceModel,
                                                                const std::string& buildID);
+
+// The combined APTicket that authorizes every OTHER (non-iBSS) Trusted
+// component in the manifest together -- iBSS/LLB are personalized
+// per-file (see personalizeIMG3Component() above), but a stock iBEC
+// checks everything it loads next (kernelcache, ramdisk, devicetree,
+// ...) against this ticket instead, and won't accept them without it on
+// file first. Real idevicerestore sends this immediately after Recovery
+// mode is entered (recovery.c's recovery_send_ticket()), before
+// anything else -- DeviceManager::sendAPTicket() does the same: uploads
+// these bytes as a plain buffer, then sends the "ticket" command, on a
+// live Recovery-mode connection (this is not img3 content, nothing gets
+// stitched into it).
+//
+// Same parameters as personalizeIMG3Component() above, minus
+// componentName/rawImg3Path (this isn't tied to one component). Returns
+// std::nullopt on failure, same reasoning as above.
+std::optional<std::vector<uint8_t>> fetchAPTicket(std::shared_ptr<void> buildIdentity, uint64_t ecid,
+                                                    const unsigned char* apNonce, unsigned int apNonceSize,
+                                                    const std::string& deviceModel, const std::string& buildID);

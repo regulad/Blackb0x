@@ -568,6 +568,31 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
     printf("Waiting for device to come back up in Recovery mode...\n");
     fflush(stdout);
 
+    // Gated on stockRecovery, NOT stockSecurom: this is about whether
+    // useStockIBEC()'s genuinely-unpatched iBEC is what's running, not
+    // whether checkm8 ran to get there. patch_ticket_check() (patchiBEC(),
+    // applied by default) is what makes a ticket unnecessary, and it only
+    // ever runs against blackb0x's own patched iBEC -- stockRecovery's
+    // stock iBEC has no such patch applied regardless of stockSecurom, so
+    // it enforces real ticket verification on whatever it loads next
+    // (DeviceTree/Ramdisk/KernelCache) either way. See Personalize.hpp's
+    // fetchAPTicket()/DeviceManager::sendAPTicket()'s own comments. Must
+    // run right after iBEC succeeds, before anything else is sent --
+    // matching real idevicerestore's own ordering.
+    auto sendTicketIfNeeded = [&]() -> bool {
+        if (!stockRecovery) return true;
+        printf("Sending APTicket -> ");
+        fflush(stdout);
+        int i = deviceManager.sendAPTicket(device.ecid, components.buildIdentity, device.deviceModel,
+                                            components.buildID);
+        printf("%s\n", (i == 0) ? "Sent" : "Error");
+        if (i != 0) {
+            fprintf(stderr, "Failed to send APTicket. Re-enter DFU mode and try again.\n");
+            return false;
+        }
+        return true;
+    };
+
     if (tetherBoot) {
         printf("Sending iBEC (downgrade) -> ");
         fflush(stdout);
@@ -580,6 +605,7 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
             return false;
         }
         device.didTetheredBoot = 1;
+        if (!sendTicketIfNeeded()) return false;
     } else {
         printf("Sending iBEC (boot) -> ");
         fflush(stdout);
@@ -592,6 +618,7 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
                     "mode and try again.\n");
             return false;
         }
+        if (!sendTicketIfNeeded()) return false;
 
         printf("Sending DeviceTree -> ");
         fflush(stdout);
