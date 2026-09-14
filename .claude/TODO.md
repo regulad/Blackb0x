@@ -416,9 +416,10 @@ legacy-recreation case `bakeRamdisk()` currently refuses outright (see its
 own early bail-out), older firmware branches' different persistence
 payloads (`stageVersionBranch()`), or firmware-version-gated `Depends:`
 resolution now that the synthetic `firmware` package is pinned to each
-tuple's real version instead of a single hardcoded constant (see item 4a's
-own history) — a bad pin for one specific version could silently break
-just that tuple's dependency resolution without showing up anywhere else.
+device model's newest known version instead of a single hardcoded
+constant (see item 4a's own history, and item 8 below) — a bad pin for
+one specific device model could silently break every tuple of that
+model's dependency resolution without showing up anywhere else.
 
 ## 7. CI/CD system for prebuilt, patched firmware suite
 
@@ -436,3 +437,25 @@ without the underlying Apple firmware changing, and whether publishing
 prebuilt jailbreak components anywhere public raises different
 considerations than this project's current "you build it yourself"
 posture.
+
+## 8. Author a script to generate the (identifier, build) → firmware version binding
+
+Not started. `bake-all-ramdisks` currently resolves the version that
+drives persistence-payload selection (`stageVersionBranch()`) and the
+synthetic `firmware` dpkg package's pin via a live `newestVersionForDevice()`
+call per device model at bake time (`IPSW.cpp`, memoized per run in
+`BakeAllRamdisks.cpp` — see `docs/HISTORY.md`/this session's own fix for
+why it has to be the newest-known-per-model version, not a given tuple's
+own `ProductVersion`). `Blackb0x/Misc/firmware_versions.txt` (one
+`<device> <buildID> <version>` line per known `Blackb0x/ImageKeys/` tuple)
+already exists as a similar, related binding, but was hand-collected by
+an agent doing one-off research (ipsw.me queries, range-fetched
+`BuildManifest.plist`s, AppleDB cross-checks for builds ipsw.me doesn't
+carry) — not reproducible by running a script. Worth authoring a real
+script (under `scripts/`, matching this project's existing
+`build_deb_cache*.py` house style) that regenerates that same binding on
+demand, so it can be refreshed as new builds/tuples get added to
+`ImageKeys/` instead of staying a stale, manually-produced snapshot, and
+so the exact sourcing logic (ipsw.me primary, `BuildManifest.plist`/AppleDB
+fallback for builds ipsw.me doesn't list) is checked-in and auditable
+rather than only described after the fact.
