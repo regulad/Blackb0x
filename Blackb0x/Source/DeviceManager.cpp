@@ -1334,58 +1334,24 @@ static int sendFileThenCommand(irecv_client_t client, const char* what, const st
     return 0;
 }
 
-// A real run against an AppleTV3,2 failed mid-Ramdisk-upload with a bulk
-// short-write ("wrote 0 of 32768 bytes") at exactly packet 2049/2204 -- byte
-// offset 0x4000000 (64MiB) on the nose, on a 68.9MiB ramdisk. Too round a
-// number to be USB flakiness (this same host/libusb stack sends much larger
-// files fine via checkra1n against >A7 devices): this looks like the
-// device's own recovery-mode staging buffer for the ramdisk running out,
-// not a bug in how we drive libusb. Recovery-mode devices advertise their
-// real limit via a "ramdisk-size" getenv variable (irecv_getenv(),
-// unused anywhere else in this codebase until now) -- checking it here
-// turns a cryptic mid-transfer USB failure into an upfront, actionable
-// diagnostic, and either confirms or rules out this theory outright on the
-// next real run. Warn-only, not a hard fail: unclear yet whether every
-// firmware/device combination this tool targets even implements this env
-// var, and a wrong guess here shouldn't block a transfer that might
-// otherwise have worked.
-static void warnIfRamdiskExceedsDeviceLimit(irecv_client_t client, const std::string& path) {
-    if (!client) return;
-
-    std::error_code ec;
-    uint64_t fileSize = std::filesystem::file_size(path, ec);
-    if (ec) return;
-
-    char* value = nullptr;
-    irecv_error_t err = irecv_getenv(client, "ramdisk-size", &value);
-    if (err != IRECV_E_SUCCESS || !value || !value[0]) {
-        free(value);
-        fprintf(stderr, "warnIfRamdiskExceedsDeviceLimit: device did not report a ramdisk-size (or getenv "
-                        "unsupported on this device/firmware) -- skipping the size check\n");
-        return;
-    }
-
-    char* end = nullptr;
-    uint64_t deviceLimit = strtoull(value, &end, 0);
-    bool parsed = end != value && deviceLimit != 0;
-    if (parsed && fileSize > deviceLimit) {
-        fprintf(stderr,
-                "warnIfRamdiskExceedsDeviceLimit: %s is %llu bytes, but the device reports a ramdisk-size "
-                "limit of %llu bytes (%s) -- the upload is very likely to fail partway through once it hits "
-                "that boundary. A smaller baked ramdisk is the real fix.\n",
-                path.c_str(), (unsigned long long)fileSize, (unsigned long long)deviceLimit, value);
-    } else if (!parsed) {
-        fprintf(stderr, "warnIfRamdiskExceedsDeviceLimit: device reported ramdisk-size=\"%s\", not parseable "
-                        "as a number -- skipping the size check\n", value);
-    }
-    free(value);
-}
-
+// A real run against an AppleTV3,2 once failed mid-Ramdisk-upload with a
+// bulk short-write ("wrote 0 of 32768 bytes") at exactly packet 2049/2204
+// -- byte offset 0x4000000 (64MiB) on the nose, on a 68.9MiB ramdisk. This
+// project used to send a "getenv ramdisk-size" (irecv_getenv(), a full
+// command-then-read-response round trip) before every ramdisk upload to
+// turn that into an upfront diagnostic instead of a cryptic mid-transfer
+// failure -- removed again: real idevicerestore's own equivalent
+// (recovery_send_ramdisk(), recovery.c) only ever fires a bare
+// "getenv ramdisk-delay" via plain irecv_send_command() (no response read
+// at all, just letting the device print it to its own console), never
+// irecv_getenv()'s extra IN control transfer this project's own check
+// relied on -- and that extra read, not anything else in this sequence,
+// is suspected (real hardware, not yet fully isolated) of being what was
+// actually interfering with the restore-tail cycle.
 int DeviceManager::sendRamdisk(const std::string& Ramdisk_Path, uint64_t ecid) {
     // get_tv_patient(): same reasoning as sendiBEC() above -- this reconnect
     // follows DeviceTree's own NOTIFY_FINISH-triggered reset.
     irecv_client_t client = get_tv_patient(ecid);
-    warnIfRamdiskExceedsDeviceLimit(client, Ramdisk_Path);
     int result = sendFileThenCommand(client, "sendRamdisk", Ramdisk_Path, "ramdisk");
     sleep(2);
     return result;
@@ -1627,7 +1593,6 @@ int DeviceManager::sendStockRestoreTail(uint64_t ecid, const PatchedComponents& 
             irecv_close(client);
             return -1;
         }
-        warnIfRamdiskExceedsDeviceLimit(client, *components.ramdisk);
         if (!sendFileThenCommandWithReconnect("sendStockRestoreTail(Ramdisk)", *components.ramdisk, "ramdisk")) {
             if (client) irecv_close(client);
             return -1;
