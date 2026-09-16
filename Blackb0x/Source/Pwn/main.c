@@ -4,8 +4,10 @@
 //
 //  Standalone CLI for Blackb0x's own original checkm8/SHAtter exploit
 //  implementations (see Checkm8Pwn.c) -- deliberately independent of the
-//  main `blackb0x` binary's gaster-based checkm8Attempt() path. Apple/
-//  IOKit only; see this target's own block in CMakeLists.txt.
+//  main `blackb0x` binary's gaster-based checkm8Attempt() path. Builds on
+//  every platform: nothing here is Apple-specific, only libirecovery's own
+//  backend-independent irecv_* API, which resolves to IOKit on Darwin and
+//  libusb elsewhere. See this target's own block in CMakeLists.txt.
 //
 
 #include "Checkm8Pwn.h"
@@ -22,9 +24,9 @@ static void printUsage(const char* argv0) {
         "  shatter  Apple TV 2,1 SecureROM DFU exploit\n"
         "\n"
         "Runs Blackb0x's own original, hand-ported exploit implementations\n"
-        "directly over libirecovery's native IOKit backend -- no libusb, no\n"
-        "gaster. Waits for a single already-connected DFU-mode device; if\n"
-        "--ecid is omitted, the first one found is used.\n",
+        "directly over libirecovery (its native IOKit backend on macOS, libusb\n"
+        "elsewhere) -- no gaster. Waits for a single already-connected DFU-mode\n"
+        "device; if --ecid is omitted, the first one found is used.\n",
         argv0);
 }
 

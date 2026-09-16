@@ -1177,19 +1177,32 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# blackb0x-pwn: Blackb0x's own original checkm8/SHAtter exploit, standalone
-# and IOKit-only.
+# blackb0x-pwn: Blackb0x's own original checkm8/SHAtter exploit, standalone.
 #
-# Apple platforms only -- this target does not exist at all on Linux, not
-# just an empty stub, matching how gaster's own IOKit branch above is
-# genuinely unbuildable there too. Ports DeviceManager.m's original
+# Built on every platform. Its own sources (Blackb0x/Source/Pwn/) contain no
+# Apple-specific code at all -- only backend-independent irecv_* calls, every
+# one of which libirecovery implements for libusb as well as IOKit -- so the
+# Apple-only gate this target used to sit behind was a packaging decision
+# from the macOS effort, not a source requirement. It is built on Linux
+# specifically to serve as a control against gaster: blackb0x-pwn is the
+# implementation confirmed working on real Apple TV 3,2 hardware (on macOS),
+# so running it over libusb is what distinguishes "Linux's USB stack cannot
+# do checkm8" from "gaster specifically fails here" -- a question
+# docs/HISTORY.md currently answers on gaster's evidence alone. Ports
+# DeviceManager.m's original
 # +SHAtter:/+checkm8: methods (deleted from the tree in 907b64b, recovered
 # from git history -- see Blackb0x/Source/Pwn/Checkm8Pwn.c's own header
 # comment) byte-for-byte, independent of both gaster (a different
 # implementation, from a different author, covering a broader chip range)
 # and the main `blackb0x` binary's own gaster-based checkm8Attempt().
 #
-# "IOKit-only" means more than "happens to run on macOS": libirecovery
+# On Apple platforms it keeps its own private, IOKit-backed libirecovery
+# build (below) rather than sharing libirecovery_ext, since that is the
+# configuration actually confirmed against real hardware. On every other
+# platform it links the ordinary deps::irecovery the rest of this project
+# already uses, which is libusb-backed.
+#
+# "IOKit-backed" means more than "happens to run on macOS": libirecovery
 # itself (third_party/libirecovery) has a real, upstream, --with-iokit
 # native Darwin backend (configure.ac, defaults to yes when IOKit is
 # available) as an alternative to its libusb backend -- confirmed by
@@ -1258,20 +1271,23 @@ if(APPLE)
     set_target_properties(deps::irecovery_iokit PROPERTIES
         IMPORTED_LOCATION ${DEPS_IOKIT_LIB}/libirecovery-1.0.a
         INTERFACE_INCLUDE_DIRECTORIES ${DEPS_IOKIT_INCLUDE})
+endif()
 
-    add_executable(blackb0x-pwn
-        Blackb0x/Source/Pwn/main.c
-        Blackb0x/Source/Pwn/Checkm8Pwn.c)
-    target_include_directories(blackb0x-pwn PRIVATE Blackb0x/Source)
-    # deps::imobiledevice_glue/deps::plist: libirecovery-1.0.a's own real
-    # (backend-independent) link dependencies -- confirmed via its
-    # installed .pc file's Requires.private, same two archives the main
-    # blackb0x binary already links for the same reason. No deps::usb here
-    # at all: unlike the shared libirecovery_ext build, this one's own
-    # Makefile.am never populates $(libusb_CFLAGS)/$(libusb_LIBS) once
-    # --with-iokit succeeds (confirmed by reading configure.ac's own
-    # AS_IF branching directly), so there is nothing libusb-related to
-    # link against in the first place.
+add_executable(blackb0x-pwn
+    Blackb0x/Source/Pwn/main.c
+    Blackb0x/Source/Pwn/Checkm8Pwn.c)
+target_include_directories(blackb0x-pwn PRIVATE Blackb0x/Source)
+
+# deps::imobiledevice_glue/deps::plist on both branches: libirecovery-1.0.a's
+# own real (backend-independent) link dependencies -- confirmed via its
+# installed .pc file's Requires.private, the same two archives the main
+# blackb0x binary already links for the same reason.
+if(APPLE)
+    # No deps::usb here at all: unlike the shared libirecovery_ext build,
+    # this one's own Makefile.am never populates $(libusb_CFLAGS)/
+    # $(libusb_LIBS) once --with-iokit succeeds (confirmed by reading
+    # configure.ac's own AS_IF branching directly), so there is nothing
+    # libusb-related to link against in the first place.
     target_link_libraries(blackb0x-pwn PRIVATE
         deps::irecovery_iokit
         deps::imobiledevice_glue
@@ -1280,6 +1296,18 @@ if(APPLE)
         "-framework CoreFoundation"
         "-framework IOKit")
     add_dependencies(blackb0x-pwn libirecovery_iokit_ext libimobiledevice_glue_ext libplist_ext)
+else()
+    # deps::usb is required here but not on the Apple branch: the shared
+    # libirecovery_ext build has no IOKit to select, so it resolves its
+    # transfers through libusb and leaves those symbols undefined in the
+    # archive.
+    target_link_libraries(blackb0x-pwn PRIVATE
+        deps::irecovery
+        deps::imobiledevice_glue
+        deps::plist
+        deps::usb
+        Threads::Threads)
+    add_dependencies(blackb0x-pwn libirecovery_ext libimobiledevice_glue_ext libplist_ext libusb_ext)
 endif()
 
 # ---------------------------------------------------------------------------
