@@ -18,7 +18,8 @@
 	branch = legacy
 [submodule "third_party/libirecovery"]
 	path = third_party/libirecovery
-	url = https://github.com/synackuk/libirecovery.git
+	url = https://github.com/regulad/libirecovery.git
+	branch = libusb-async-cancel-fix
 [submodule "third_party/libgeneral"]
 	path = third_party/libgeneral
 	url = https://github.com/tihmstar/libgeneral.git

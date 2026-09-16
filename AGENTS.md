@@ -109,13 +109,13 @@ statically linked. **Forked** means: patched on our own branch, pushed, pointed 
 |---|---|---|
 | `libplist`, `libusbmuxd` | libimobiledevice/* | No — historically pinned |
 | `libimobiledevice` | **regulad/libimobiledevice**@`legacy` | Yes — additive, `--with-ssl-implementation=wolfssl`-selectable SSL backend for `idevice.c` (real OpenSSL/GnuTLS untouched, still selectable) |
-| `libirecovery` | synackuk/libirecovery | No |
+| `libirecovery` | **regulad/libirecovery**@`libusb-async-cancel-fix`, off synackuk/libirecovery | Yes — `irecv_async_usb_control_transfer_with_cancel()`'s libusb branch had a use-after-free, a double free and a non-terminating completion wait; it was unreachable until `blackb0x-pwn` was built for non-Apple. Plus real stderr diagnostics on `irecv_send_buffer()`'s upload-failure paths, which previously returned `IRECV_E_USB_UPLOAD` silently unless built with `debug()` on |
 | `libimobiledevice-glue`, `libplist-modern` | libimobiledevice/* | No — current HEAD, not historically pinned (see HISTORY for why two `libplist`s) |
 | `libfragmentzip` | **regulad/libfragmentzip**@`fix-cxx-stdbool-header` | Yes — one header fix (C++/`<stdbool.h>` collision) |
 | `libgeneral` | tihmstar/libgeneral | No |
 | `xpwn` | **regulad/xpwn**@`legacy` | Yes — a wolfSSL AES-CBC buffer over-read fix in `img3.c`, plus disabling the legacy-libusb-0.1-only `pwnmetheus2` subdirectory |
 | `wolfssl`, `curl`, `libusb`, `libzip`, `libpng`, `bzip2`, `zlib` | upstream | No — current HEAD or latest stable tag; none of these existed in the original app |
-| `gaster` | **regulad/gaster** (fork), `linux-reset-race` branch, off verygenericname/gaster | Yes — claims interface 0 (with `libusb_set_auto_detach_kernel_driver()`) instead of sending every DFU class request unclaimed, which is what the kernel's own "did not claim interface 0 before use" warning was about. A second change (skipping the post-`SETUP`/`SPRAY` reset) was tried and reverted after real hardware proved it load-bearing, not precautionary — see `docs/HISTORY.md` |
+| `gaster` | **regulad/gaster** (fork), `linux-reset-race` branch, off verygenericname/gaster | Yes — claims interface 0 (with `libusb_set_auto_detach_kernel_driver()`) instead of sending every DFU class request unclaimed, which is what the kernel's own "did not claim interface 0 before use" warning was about. A second change (skipping the post-`SETUP`/`SPRAY` reset) was tried and reverted after real hardware proved it load-bearing, not precautionary — see `docs/HISTORY.md`. Also carries `checkm8_stage_setup()` instrumentation: it logs the cancelled transfer's reported size (the only value the cancel delay actually feeds, and the reason sweeping `CANCEL_DELAY_US` changes nothing), and `GASTER_SETUP_FULL_PAD=1` pads as `blackb0x-pwn` does instead of trusting that size |
 
 `Blackb0x/Libraries/xpwntool.c` (in-tree, not a submodule) is confirmed sourced from
 `zzanehip/xpwntool-swift`, unchanged.

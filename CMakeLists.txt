@@ -769,12 +769,33 @@ ExternalProject_Add(libimobiledevice_glue_ext
 set(AUTOTOOLS_ENV_WITH_MODERN ${CMAKE_COMMAND} -E env
     "PKG_CONFIG_PATH=${DEPS_MODERN_PKGCONFIG}:${DEPS_PKGCONFIG}")
 
+# libirecovery has a real, upstream native Darwin backend (configure.ac's
+# --with-iokit, which defaults to yes whenever IOKit is detected) as an
+# alternative to its libusb one -- confirmed by reading configure.ac and
+# libirecovery.c's own iokit_usb_control_transfer/
+# iokit_async_usb_control_transfer, not assumed. Passed explicitly on Apple
+# rather than relying on that default, so a macOS build fails loudly at
+# configure time if IOKit isn't available instead of silently producing a
+# libusb-backed archive: IOKit is the configuration blackb0x-pwn's checkm8
+# implementation is actually confirmed working against on real hardware, so
+# quietly getting the other one there would be a genuinely misleading
+# result rather than a mild inefficiency.
+#
+# blackb0x-pwn used to get its own second, private copy of this build for
+# exactly that guarantee (libirecovery_iokit_ext, a separate prefix and a
+# separate source copy). One explicit flag here gives the same guarantee
+# without a duplicate build of the same source at a second version.
+set(LIBIRECOVERY_BACKEND_ARGS "")
+if(APPLE)
+    set(LIBIRECOVERY_BACKEND_ARGS --with-iokit)
+endif()
+
 ExternalProject_Add(libirecovery_ext
     DEPENDS         libplist_ext libimobiledevice_glue_ext
     SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libirecovery
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ${AUTOTOOLS_ENV_WITH_MODERN} ./autogen.sh --prefix=${DEPS_PREFIX}
-                        --enable-static --disable-shared
+                        --enable-static --disable-shared ${LIBIRECOVERY_BACKEND_ARGS}
     BUILD_COMMAND   ${AUTOTOOLS_ENV_WITH_MODERN} make -j
     INSTALL_COMMAND make install
 )
@@ -1196,118 +1217,42 @@ endif()
 # implementation, from a different author, covering a broader chip range)
 # and the main `blackb0x` binary's own gaster-based checkm8Attempt().
 #
-# On Apple platforms it keeps its own private, IOKit-backed libirecovery
-# build (below) rather than sharing libirecovery_ext, since that is the
-# configuration actually confirmed against real hardware. On every other
-# platform it links the ordinary deps::irecovery the rest of this project
-# already uses, which is libusb-backed.
-#
-# "IOKit-backed" means more than "happens to run on macOS": libirecovery
-# itself (third_party/libirecovery) has a real, upstream, --with-iokit
-# native Darwin backend (configure.ac, defaults to yes when IOKit is
-# available) as an alternative to its libusb backend -- confirmed by
-# reading configure.ac and libirecovery.c's own iokit_usb_control_transfer/
-# iokit_async_usb_control_transfer directly, not assumed. The existing
-# libirecovery_ext target above never passes --with-iokit or
-# --without-iokit explicitly, so it already gets IOKit for free on a real
-# macOS build (nothing to change there) -- but that's an implicit default,
-# not a guarantee, and libirecovery_ext is shared with the main `blackb0x`
-# binary. blackb0x-pwn instead gets its own separate libirecovery build
-# (libirecovery_iokit_ext, installed to its own prefix so it can't collide
-# with libirecovery_ext's in-source build artifacts) with --with-iokit
-# passed explicitly, so its own configure step fails loudly if IOKit isn't
-# available rather than silently falling back to libusb.
-if(APPLE)
-    set(DEPS_IOKIT_PREFIX ${CMAKE_BINARY_DIR}/deps-iokit)
-    set(DEPS_IOKIT_INCLUDE ${DEPS_IOKIT_PREFIX}/include)
-    set(DEPS_IOKIT_LIB ${DEPS_IOKIT_PREFIX}/lib)
-    # Must exist at configure time, same reasoning as DEPS_INCLUDE's own
-    # file(MAKE_DIRECTORY) near the top of this file: an IMPORTED target's
-    # INTERFACE_INCLUDE_DIRECTORIES is checked for existence at configure
-    # time, before libirecovery_iokit_ext has actually run and populated
-    # it -- deps::irecovery_iokit below would otherwise fail CMake's own
-    # "includes non-existent path" check on every clean configure.
-    file(MAKE_DIRECTORY ${DEPS_IOKIT_INCLUDE})
-
-    # A first attempt tried to reuse third_party/libirecovery's own
-    # checkout directly, out-of-source (VPATH), to avoid colliding with
-    # libirecovery_ext's in-source build there -- autoconf's generated
-    # `configure` refuses that outright ("source directory already
-    # configured; run 'make clean' first") the moment it notices the
-    # source directory itself already has build artifacts in it from
-    # libirecovery_ext's own in-source run, regardless of DEPENDS
-    # ordering. Autotools genuinely does not support in-source and
-    # out-of-source builds against the same source tree at once.
-    #
-    # Fixed by giving this target its own private, pristine copy of the
-    # source instead: `git ls-files -z | tar ...` copies exactly the
-    # tracked files AT THEIR CURRENT WORKING-TREE CONTENT (not just
-    # HEAD -- deliberately, since third_party/libirecovery can carry a
-    # real uncommitted local fix at any given time, per this project's own
-    # "fork it, don't leave an uncommitted patch" convention being
-    # aspirational rather than always-instantaneously-true; confirmed
-    # directly that a real uncommitted edit to src/libirecovery.c survives
-    # this copy), while implicitly excluding every untracked/gitignored
-    # generated file (configure, Makefile, config.status, .libs/, *.lo/
-    # *.o, autom4te.cache/) that caused the VPATH conflict above in the
-    # first place -- a completely independent, ordinary in-source
-    # ./autogen.sh build against that private copy has nothing left to
-    # collide with libirecovery_ext over.
-    set(LIBIRECOVERY_IOKIT_SRC ${CMAKE_BINARY_DIR}/libirecovery-iokit-src)
-    ExternalProject_Add(libirecovery_iokit_ext
-        DEPENDS         libplist_ext libimobiledevice_glue_ext
-        SOURCE_DIR      ${LIBIRECOVERY_IOKIT_SRC}
-        DOWNLOAD_COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIBIRECOVERY_IOKIT_SRC}
-                  COMMAND ${CMAKE_COMMAND} -E make_directory ${LIBIRECOVERY_IOKIT_SRC}
-                  COMMAND sh -c "cd '${CMAKE_SOURCE_DIR}/third_party/libirecovery' && git ls-files -z | tar -cf - --null -T - | tar -xf - -C '${LIBIRECOVERY_IOKIT_SRC}'"
-        BUILD_IN_SOURCE 1
-        CONFIGURE_COMMAND ${AUTOTOOLS_ENV_WITH_MODERN} ./autogen.sh --prefix=${DEPS_IOKIT_PREFIX}
-                            --enable-static --disable-shared --with-iokit
-        BUILD_COMMAND   ${AUTOTOOLS_ENV_WITH_MODERN} make -j
-        INSTALL_COMMAND make install
-    )
-
-    add_library(deps::irecovery_iokit STATIC IMPORTED GLOBAL)
-    set_target_properties(deps::irecovery_iokit PROPERTIES
-        IMPORTED_LOCATION ${DEPS_IOKIT_LIB}/libirecovery-1.0.a
-        INTERFACE_INCLUDE_DIRECTORIES ${DEPS_IOKIT_INCLUDE})
-endif()
+# It links the same deps::irecovery every other target here does. On Apple
+# that archive is IOKit-backed, which libirecovery_ext now guarantees by
+# passing --with-iokit explicitly (see its own block above) rather than
+# leaving it to configure's default. This target used to carry a second,
+# private libirecovery build purely to get that guarantee: a duplicate
+# ExternalProject, a duplicate install prefix, and a build-time copy of the
+# submodule source, all to compile the same source with the same flags.
 
 add_executable(blackb0x-pwn
     Blackb0x/Source/Pwn/main.c
     Blackb0x/Source/Pwn/Checkm8Pwn.c)
 target_include_directories(blackb0x-pwn PRIVATE Blackb0x/Source)
 
-# deps::imobiledevice_glue/deps::plist on both branches: libirecovery-1.0.a's
-# own real (backend-independent) link dependencies -- confirmed via its
-# installed .pc file's Requires.private, the same two archives the main
-# blackb0x binary already links for the same reason.
+# deps::imobiledevice_glue/deps::plist: libirecovery-1.0.a's own real
+# (backend-independent) link dependencies -- confirmed via its installed
+# .pc file's Requires.private, the same two archives the main blackb0x
+# binary already links for the same reason.
+target_link_libraries(blackb0x-pwn PRIVATE
+    deps::irecovery
+    deps::imobiledevice_glue
+    deps::plist
+    Threads::Threads)
+add_dependencies(blackb0x-pwn libirecovery_ext libimobiledevice_glue_ext libplist_ext)
+
+# The backend's own dependencies, and the only part of this target that
+# differs per platform. With --with-iokit, libirecovery's Makefile.am never
+# populates $(libusb_CFLAGS)/$(libusb_LIBS) at all (confirmed by reading
+# configure.ac's AS_IF branching), so an Apple build has nothing
+# libusb-related to link and needs the two frameworks instead.
 if(APPLE)
-    # No deps::usb here at all: unlike the shared libirecovery_ext build,
-    # this one's own Makefile.am never populates $(libusb_CFLAGS)/
-    # $(libusb_LIBS) once --with-iokit succeeds (confirmed by reading
-    # configure.ac's own AS_IF branching directly), so there is nothing
-    # libusb-related to link against in the first place.
     target_link_libraries(blackb0x-pwn PRIVATE
-        deps::irecovery_iokit
-        deps::imobiledevice_glue
-        deps::plist
-        Threads::Threads
         "-framework CoreFoundation"
         "-framework IOKit")
-    add_dependencies(blackb0x-pwn libirecovery_iokit_ext libimobiledevice_glue_ext libplist_ext)
 else()
-    # deps::usb is required here but not on the Apple branch: the shared
-    # libirecovery_ext build has no IOKit to select, so it resolves its
-    # transfers through libusb and leaves those symbols undefined in the
-    # archive.
-    target_link_libraries(blackb0x-pwn PRIVATE
-        deps::irecovery
-        deps::imobiledevice_glue
-        deps::plist
-        deps::usb
-        Threads::Threads)
-    add_dependencies(blackb0x-pwn libirecovery_ext libimobiledevice_glue_ext libplist_ext libusb_ext)
+    target_link_libraries(blackb0x-pwn PRIVATE deps::usb)
+    add_dependencies(blackb0x-pwn libusb_ext)
 endif()
 
 # ---------------------------------------------------------------------------
