@@ -535,3 +535,29 @@ real, per-package assertion the existing `kNeverStageDebs` audit already
 used (not guessed) before moving anything: confirm nothing in the
 bootstrap closure itself, and nothing that runs before `postinstall.sh`
 gets a working apt, actually `Depends:`/`Pre-Depends:` on it.
+
+## 11. Convert blackb0x's own install content into a real `xyz.regulad.blackb0x` .deb
+
+Not started. `stageBlackb0xTree()` (`BakeRamdisk.cpp`) currently stages
+blackb0x's own install content as plain loose files via `stageFile()`,
+untracked by dpkg at all — unlike literally everything else this ramdisk
+installs, which goes through the real dpkg/apt mechanism
+(`computePreinstalledPackages()`/`stageDebcache()`). Specifically:
+`private/etc/apt/sources.list.d/regulad.list` +
+`private/etc/apt/trusted.gpg.d/regulad.gpg` (the repo/key pair pointing
+at this project's own apt source, staged the exact same way as
+saurik/awkwardtv/bigboss/xbmc/net.tihmstar's — see item 9's saurik.list
+entry above for that same list/gpg pairing pattern), `postinstall.sh`
+itself (templated into `var/mobile/.blackb0x/postinstall.sh` by
+`stagePostinstallScript()`), and
+`System/Library/LaunchDaemons/xyz.regulad.blackb0x.postinstall.plist` (the
+LaunchDaemon that actually runs it — already named in this project's own
+reverse-DNS style, just not packaged as one). Wrapping these into one real
+`xyz.regulad.blackb0x` `.deb` — built at bake time the same way
+`stagePostinstallScript()` already templates `postinstall.sh`'s
+`__BLACKB0X_PACKAGES__` placeholder, then packaged rather than staged
+loose — would let dpkg/apt actually track blackb0x's own install content
+like every other package on the device (real `Status:`/`.list`/`.md5sums`
+entries, upgradeable/removable through normal apt instead of being
+permanently-invisible loose files), instead of being the one piece of
+this ramdisk's own content dpkg has no record of at all.
