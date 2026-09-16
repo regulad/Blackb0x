@@ -16,6 +16,7 @@
 
 #include "Cli.hpp"
 
+#include "Console.hpp"
 #include "DeviceManager.hpp"
 #include "IPSW.hpp"
 #include "IPSWDownloader.hpp"
@@ -32,6 +33,9 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <thread>
@@ -265,15 +269,30 @@ std::optional<uint64_t> selectDevice(DeviceManager& deviceManager, const CliOpti
         } else if (devices.size() == 1) {
             return devices[0].ecid;
         } else if (devices.size() > 1) {
-            printf("\nMultiple devices connected:\n");
-            for (size_t i = 0; i < devices.size(); i++) printDeviceLine(devices[i], (int)i);
-            printf("Select a device number: ");
-            fflush(stdout);
+            // printDeviceLine() reports whether each device is jailbroken,
+            // which needs a real AFC handshake to know. Done here rather
+            // than in the background, so the menu isn't printed before the
+            // answers it shows are in. checkJailbreak() is a no-op after the
+            // first call per device, so re-entering this loop is free.
+            for (auto& d : devices) {
+                if (d.mode == "Normal" && !d.udid.empty()) deviceManager.checkJailbreak(d.udid);
+            }
+            devices = deviceManager.devicesSnapshot();
+
+            {
+                // Scoped to the printing only. Holding the console lock
+                // across the scanf() below would block a device-event thread
+                // for as long as the user takes to answer.
+                console::Block block;
+                console::out("\nMultiple devices connected:\n");
+                for (size_t i = 0; i < devices.size(); i++) printDeviceLine(devices[i], (int)i);
+                console::out("Select a device number: ");
+            }
             int choice = -1;
             if (scanf("%d", &choice) == 1 && choice >= 0 && (size_t)choice < devices.size()) {
                 return devices[(size_t)choice].ecid;
             }
-            printf("Invalid selection, still waiting.\n");
+            console::out("Invalid selection, still waiting.\n");
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -740,12 +759,15 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
         return true;
     }
 
-    printf("Sending iBSS -> ");
-    fflush(stdout);
+    // Whole lines, never "Sending X -> " followed by a bare "Sent" once the
+    // send returns: each of these sends takes seconds, during which the
+    // device re-enumerates and get_tv() reports its reconnect attempts, so
+    // an unterminated line left open across that span got everything else
+    // spliced onto the end of it ("Sending iBSS -> Disconnected (123)").
+    console::out("Sending iBSS...\n");
     if (deviceManager.sendiBSS(*components.iBSS, device.ecid, stockRecovery, stockSecurerom,
                                 components.buildIdentity, device.deviceModel, components.buildID) != 0) {
-        printf("Error\n");
-        fprintf(stderr, "Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
+        console::err("Failed to send iBSS. Please re-enter DFU mode and try again.%s\n",
                 stockSecurerom ? " (--stock-securerom personalizes the image with a real TSS-issued SHSH ticket "
                                "before sending it via the standard DFU route -- if this still fails, it's a "
                                "real signal about the image/device/firmware match itself, not an artifact of "
@@ -753,14 +775,13 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
                              : "");
         return false;
     }
-    printf("Sent\n");
+    console::out("iBSS sent.\n");
     // iBSS running successfully means the device is about to reboot and
     // re-enumerate in Recovery mode -- sendiBEC() below (get_tv_patient())
     // blocks retrying for up to ~30s waiting for exactly that, with no
     // status of its own in between. Without this, that whole window reads
     // as silently stuck rather than an expected, normal wait.
-    printf("Waiting for device to come back up in Recovery mode...\n");
-    fflush(stdout);
+    console::out("Waiting for device to come back up in Recovery mode...\n");
 
     // Gated on stockRecovery, NOT stockSecurerom: this is about whether
     // useStockIBEC()'s genuinely-unpatched iBEC is what's running, not
@@ -781,92 +802,87 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
     // recovery_enter_restore(), which never closes its connection across
     // this same span either. See sendStockRestoreTail()'s own comment.
     auto sendStockTail = [&](bool onlyBootComponents) -> bool {
-        printf("Sending APTicket%s -> ", onlyBootComponents ? " + KernelCache"
-                                                              : " + RestoreLogo + Ramdisk + DeviceTree + "
-                                                                "KernelCache");
-        fflush(stdout);
+        const char* what = onlyBootComponents
+                               ? "APTicket + KernelCache"
+                               : "APTicket + RestoreLogo + Ramdisk + DeviceTree + KernelCache";
+        console::out("Sending %s...\n", what);
         int i = deviceManager.sendStockRestoreTail(device.ecid, components, device.deviceModel, onlyBootComponents);
-        printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
-            fprintf(stderr, "Failed to send the post-iBEC stock restore sequence. Re-enter DFU mode and try "
-                             "again.\n");
+            console::err("Failed to send the post-iBEC stock restore sequence. Re-enter DFU mode and try "
+                         "again.\n");
             return false;
         }
+        console::out("%s sent.\n", what);
         return true;
     };
 
     if (tetherBoot) {
-        printf("Sending iBEC (downgrade) -> ");
-        fflush(stdout);
+        console::out("Sending iBEC (downgrade)...\n");
         int i = components.iBECDowngrade ? deviceManager.sendiBEC(*components.iBECDowngrade, device.ecid) : -1;
-        printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
-            fprintf(stderr,
-                    "Failed to send iBEC (downgrade) -- the device may have rebooted out of the exploited\n"
-                    "state instead of staying put. Re-enter DFU mode and try again.\n");
+            console::err("Failed to send iBEC (downgrade) -- the device may have rebooted out of the exploited\n"
+                         "state instead of staying put. Re-enter DFU mode and try again.\n");
             return false;
         }
+        console::out("iBEC (downgrade) sent.\n");
         device.didTetheredBoot = 1;
 
         if (stockRecovery) {
             if (!sendStockTail(/*onlyBootComponents=*/true)) return false;
             device.waitForRecovery = 1;
-            printf("Waiting for Apple TV to boot\n");
+            console::out("Waiting for Apple TV to boot\n");
             return true;
         }
     } else {
-        printf("Sending iBEC (boot) -> ");
-        fflush(stdout);
+        console::out("Sending iBEC (boot)...\n");
         int i = components.iBECBoot ? deviceManager.sendiBEC(*components.iBECBoot, device.ecid) : -1;
-        printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
-            fprintf(stderr,
-                    "Failed to send iBEC (boot) -- the device may have rebooted out of the exploited state\n"
-                    "instead of staying put (see any reconnect-attempt lines above for detail). Re-enter DFU\n"
-                    "mode and try again.\n");
+            console::err("Failed to send iBEC (boot) -- the device may have rebooted out of the exploited state\n"
+                         "instead of staying put (see any reconnect-attempt lines above for detail). Re-enter DFU\n"
+                         "mode and try again.\n");
             return false;
         }
+        console::out("iBEC (boot) sent.\n");
 
         if (stockRecovery) {
             if (!sendStockTail(/*onlyBootComponents=*/false)) return false;
             device.needsPostInstall = 1;
             device.waitForRecovery = 1;
-            printf("Waiting for Apple TV to reboot\n");
+            console::out("Waiting for Apple TV to reboot\n");
             return true;
         }
 
-        printf("Sending Ramdisk -> ");
-        fflush(stdout);
+        console::out("Sending Ramdisk...\n");
         i = components.ramdisk ? deviceManager.sendRamdisk(*components.ramdisk, device.ecid) : -1;
-        printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
-            fprintf(stderr, "Failed to send Ramdisk. Re-enter DFU mode and try again.\n");
+            console::err("Failed to send Ramdisk. Re-enter DFU mode and try again.\n");
             return false;
         }
+        console::out("Ramdisk sent.\n");
 
-        printf("Sending DeviceTree -> ");
-        fflush(stdout);
+        console::out("Sending DeviceTree...\n");
         i = components.deviceTree ? deviceManager.sendDeviceTree(*components.deviceTree, device.ecid) : -1;
-        printf("%s\n", (i == 0) ? "Sent" : "Error");
         if (i != 0) {
-            fprintf(stderr, "Failed to send DeviceTree. Re-enter DFU mode and try again.\n");
+            console::err("Failed to send DeviceTree. Re-enter DFU mode and try again.\n");
             return false;
         }
+        console::out("DeviceTree sent.\n");
 
         device.needsPostInstall = 1;
     }
 
     // Only reached when stockRecovery is unset -- sendStockTail() above
     // already includes KernelCache and returns directly otherwise.
-    printf("Sending KernelCache -> ");
-    fflush(stdout);
+    console::out("Sending KernelCache...\n");
     int kernelResult = components.kernel ? deviceManager.sendKernelCache(*components.kernel, device.ecid) : -1;
-    printf("%s\n", (kernelResult == 0) ? "Sent" : "Error");
-
-    if (kernelResult != 0) return false;
+    if (kernelResult != 0) {
+        console::err("Failed to send KernelCache.\n");
+        return false;
+    }
+    console::out("KernelCache sent.\n");
 
     device.waitForRecovery = 1;
-    printf("%s\n", tetherBoot ? "Waiting for Apple TV to boot" : "Waiting for Apple TV to reboot");
+    console::out("%s\n", tetherBoot ? "Waiting for Apple TV to boot" : "Waiting for Apple TV to reboot");
     return true;
 }
 
@@ -877,6 +893,8 @@ bool sendComponentsToDevice(DeviceManager& deviceManager, AppleTVDevice& device,
 // ---------------------------------------------------------------------------
 
 int runCli(const CliOptions& options) {
+    console::init();
+
     if (options.help) {
         printCliUsage("blackb0x");
         return 0;
@@ -995,28 +1013,80 @@ int runCli(const CliOptions& options) {
     DeviceManager deviceManager;
     Patcher patcher;
 
-    // One line per real event, no restating what the previous line already
-    // said — this is the only place device connection/exploit status gets
-    // printed; DeviceManager itself stays quiet on success and only writes
-    // to stderr for genuine, otherwise-unexplained failures.
+    // One line per real CHANGE, not per event — this is the only place
+    // device connection/exploit status gets printed; DeviceManager itself
+    // stays quiet on success and only writes to stderr for genuine,
+    // otherwise-unexplained failures.
+    //
+    // Per-event was too noisy to read: the boot chain re-enumerates the
+    // device deliberately, several times, and DeviceManager re-reports it in
+    // full each time — so "is jailbroken" got reprinted on every reset, while
+    // a mode change (the one thing worth seeing) printed nothing at all,
+    // leaving a bare "Disconnected" with no matching reconnect. Tracking what
+    // was last said about each device fixes both ends of that.
+    //
+    // Held in a shared_ptr rather than a plain local: these lambdas run on
+    // libirecovery's and libimobiledevice's event threads, which are not
+    // torn down when runCli() returns.
+    struct AnnouncedState {
+        std::string mode;
+        int jailbroken = -1;
+        int jailbreakRunning = -1;
+        bool sshHintShown = false;
+    };
+    struct Announced {
+        std::mutex mutex;
+        std::map<uint64_t, AnnouncedState> byEcid;
+    };
+    auto announced = std::make_shared<Announced>();
+
     DeviceEventSink sink;
-    sink.onDeviceAdded = [](const AppleTVDevice& d) {
-        printf("Connected to %s (%llu) in %s\n", d.deviceModel.c_str(), (unsigned long long)d.ecid,
-               d.mode.c_str());
+    sink.onDeviceAdded = [announced](const AppleTVDevice& d) {
+        {
+            std::lock_guard<std::mutex> lock(announced->mutex);
+            announced->byEcid[d.ecid].mode = d.mode;
+        }
+        console::out("Connected to %s (%llu) in %s mode.\n", d.deviceModel.c_str(),
+                     (unsigned long long)d.ecid, d.mode.c_str());
     };
     sink.onDeviceRemoved = [](uint64_t ecid, const std::string& udid) {
-        (void)udid;
-        printf("Disconnected (%llu)\n", (unsigned long long)ecid);
+        // A usbmuxd-side removal carries a UDID and no ECID at all --
+        // DeviceManager's disconnectDevice() passes (uint64_t)-1 for it,
+        // which this used to print verbatim as 18446744073709551615.
+        if (ecid == (uint64_t)-1) console::out("Disconnected (%s).\n", udid.c_str());
+        else console::out("Disconnected (%llu).\n", (unsigned long long)ecid);
     };
-    sink.onStatus = [](const std::string& status) { printf("%s\n", status.c_str()); };
-    std::set<std::string> jailbreakRunningAnnouncedFor;
-    sink.onDeviceUpdated = [&jailbreakRunningAnnouncedFor](const AppleTVDevice& d) {
-        if (d.jailbroken) {
-            printf("%s is jailbroken%s\n", d.deviceModel.c_str(), d.jailbreakRunning == 1 ? " and running" : "");
+    sink.onStatus = [](const std::string& status) { console::out("%s\n", status.c_str()); };
+    sink.onDeviceUpdated = [announced](const AppleTVDevice& d) {
+        // Composed under announced->mutex but printed outside it: console's
+        // own lock is the one that has to be held across a whole block, and
+        // nesting the two in opposite orders elsewhere would be a deadlock
+        // waiting to happen.
+        std::string modeLine, jailbreakLine, sshLine;
+        {
+            std::lock_guard<std::mutex> lock(announced->mutex);
+            AnnouncedState& state = announced->byEcid[d.ecid];
+            if (!d.mode.empty() && d.mode != state.mode) {
+                state.mode = d.mode;
+                modeLine = d.deviceModel + " (" + std::to_string(d.ecid) + ") is now in " + d.mode + " mode.";
+            }
+            if (d.jailbroken != state.jailbroken || d.jailbreakRunning != state.jailbreakRunning) {
+                state.jailbroken = d.jailbroken;
+                state.jailbreakRunning = d.jailbreakRunning;
+                if (d.jailbroken) {
+                    jailbreakLine = d.deviceModel + " is jailbroken" +
+                                    (d.jailbreakRunning == 1 ? " and running." : ".");
+                }
+            }
+            if (d.jailbreakRunning == 1 && !state.sshHintShown) {
+                state.sshHintShown = true;
+                sshLine = "Run scripts/push_authorized_keys.sh if you want SSH access to " + d.deviceModel + ".";
+            }
         }
-        if (d.jailbreakRunning == 1 && jailbreakRunningAnnouncedFor.insert(d.udid).second) {
-            printf("Run scripts/push_authorized_keys.sh if you want SSH access to %s.\n", d.deviceModel.c_str());
-        }
+        console::Block block;
+        if (!modeLine.empty()) console::out("%s\n", modeLine.c_str());
+        if (!jailbreakLine.empty()) console::out("%s\n", jailbreakLine.c_str());
+        if (!sshLine.empty()) console::out("%s\n", sshLine.c_str());
     };
     deviceManager.setEventSink(sink);
 
@@ -1035,6 +1105,17 @@ int runCli(const CliOptions& options) {
             return 1;
         }
         device = *d;
+    }
+
+    // Has to happen here, synchronously, and only while the device is still
+    // in Normal mode: it needs a lockdownd/AFC handshake, which nothing can
+    // do once the device is sitting in DFU. device.jailbroken decides which
+    // build gets requested further down, so it has to be a settled answer by
+    // then rather than whatever a background check happened to have written
+    // by the time that line ran.
+    if (device.mode == "Normal" && !device.udid.empty()) {
+        deviceManager.checkJailbreak(device.udid);
+        if (AppleTVDevice* d = deviceManager.deviceWithUDID("", ecid)) device = *d;
     }
 
     bool tetherBoot = options.tetherBoot;
@@ -1065,20 +1146,26 @@ int runCli(const CliOptions& options) {
     }
 
     if (device.mode != "DFU") {
-        printf("\nTo enter DFU mode, on the Apple TV's remote:\n\n");
-        printf("  1. Hold MENU + DOWN together until the LED starts flashing rapidly\n");
-        printf("     (~6 seconds), then let go of BOTH buttons completely.\n");
-        printf("     This alone only reaches Recovery Mode, which blinks the same\n");
-        printf("     way DFU does -- it is not DFU mode yet.\n");
-        printf("  2. Immediately hold MENU + PLAY together until the LED starts\n");
-        printf("     flashing rapidly again (~6-7 seconds), then let go. This second\n");
-        printf("     step is what actually puts it in DFU mode.\n\n");
-        printf("If this repeatedly doesn't take: try a different micro-USB cable\n");
-        printf("(a bad cable is a common silent failure) and make sure the remote\n");
-        printf("has a clear line of sight to the Apple TV -- a missed button edge\n");
-        printf("during the handoff between steps 1 and 2 just leaves it in Recovery\n");
-        printf("Mode instead.\n\n");
-        printf("Waiting for the device to enter DFU mode...\n");
+        {
+            // Instructions the user has to follow step by step -- a device
+            // event landing in the middle of them makes them much harder to
+            // read than an extra line after them does.
+            console::Block block;
+            console::out("\nTo enter DFU mode, on the Apple TV's remote:\n\n");
+            console::out("  1. Hold MENU + DOWN together until the LED starts flashing rapidly\n");
+            console::out("     (~6 seconds), then let go of BOTH buttons completely.\n");
+            console::out("     This alone only reaches Recovery Mode, which blinks the same\n");
+            console::out("     way DFU does -- it is not DFU mode yet.\n");
+            console::out("  2. Immediately hold MENU + PLAY together until the LED starts\n");
+            console::out("     flashing rapidly again (~6-7 seconds), then let go. This second\n");
+            console::out("     step is what actually puts it in DFU mode.\n\n");
+            console::out("If this repeatedly doesn't take: try a different micro-USB cable\n");
+            console::out("(a bad cable is a common silent failure) and make sure the remote\n");
+            console::out("has a clear line of sight to the Apple TV -- a missed button edge\n");
+            console::out("during the handoff between steps 1 and 2 just leaves it in Recovery\n");
+            console::out("Mode instead.\n\n");
+            console::out("Waiting for the device to enter DFU mode...\n");
+        }
         if (!waitForDFUMode(deviceManager, ecid, device)) {
             fprintf(stderr, "Device never entered DFU mode.\n");
             return 1;

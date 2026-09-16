@@ -12,12 +12,14 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -177,6 +179,13 @@ public:
                               bool onlyBootComponents);
 
     // --- Jailbreak status polling (was checkJailbreak/checkJailbreakRunning) ---
+    // Blocks for up to a few seconds while it handshakes with the device
+    // over lockdownd/AFC, then updates that device's jailbroken/
+    // jailbreakRunning fields and fires onDeviceUpdated. Call it from the
+    // main flow at the point the answer is needed -- it is no longer
+    // dispatched in the background (see DeviceManager.cpp's newDevice()).
+    // Only meaningful for a device in Normal mode; a no-op after the first
+    // call for a given UDID.
     void checkJailbreak(const std::string& udid);
 
     // --- Device bookkeeping (replaces MainView.AppleTVs) ---
@@ -188,8 +197,34 @@ public:
 private:
     static DeviceManager* instance_;
 
+    // RAII window during which this process stays completely off USB and
+    // says nothing about what the device is doing -- held while an external
+    // pwntool owns the device. See its definition in DeviceManager.cpp for
+    // why ignoring the events is not enough on its own.
+    class UsbQuietWindow {
+    public:
+        explicit UsbQuietWindow(DeviceManager& deviceManager);
+        ~UsbQuietWindow();
+        UsbQuietWindow(const UsbQuietWindow&) = delete;
+        UsbQuietWindow& operator=(const UsbQuietWindow&) = delete;
+
+    private:
+        DeviceManager& deviceManager_;
+    };
+
     DeviceEventSink sink_;
     mutable std::mutex devicesMutex_;
+
+    // Kept so UsbQuietWindow can actually unsubscribe: libirecovery tears
+    // its event-handler thread (and with it all of its own USB polling)
+    // down only once the last listener is gone.
+    irecv_device_event_context_t irecvEventCtx_ = nullptr;
+    std::atomic<bool> deviceEventsSuspended_{false};
+
+    // UDIDs checkJailbreak() has already run a full AFC handshake for --
+    // see its own comment. Needs no mutex: nothing calls it off the main
+    // flow any more.
+    std::set<std::string> jailbreakChecked_;
     // deque, not vector: push_back must not invalidate AppleTVDevice*
     // pointers a background thread (e.g. checkJailbreak's poll loop) may
     // still be holding onto while a second device connects concurrently.

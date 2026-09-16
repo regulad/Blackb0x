@@ -19,6 +19,7 @@
 //
 
 #include "DeviceManager.hpp"
+#include "Console.hpp"
 #include "Patcher.hpp"
 #include "Personalize.hpp"
 #include "ResourcePath.hpp"
@@ -90,8 +91,7 @@ DeviceManager* DeviceManager::instance_ = nullptr;
 DeviceManager::DeviceManager() {
     instance_ = this;
 
-    irecv_device_event_context_t ctx;
-    irecv_device_event_subscribe(&ctx, blackb0x_irecv_device_event_cb, nullptr);
+    irecv_device_event_subscribe(&irecvEventCtx_, blackb0x_irecv_device_event_cb, nullptr);
     // Normal-mode discovery goes through the real system usbmuxd again (see
     // docs/HISTORY.md) — it must be run with --no-preflight for this project's
     // target hardware (pre-2013 Apple TV/iOS), whose lockdownd predates
@@ -164,10 +164,15 @@ void DeviceManager::newDevice(const std::string& productType, const std::string&
         sink_.onDeviceUpdated(*icon);
     }
 
-    if (icon->mode == "Normal") {
-        std::string udidCopy = icon->udid;
-        std::thread([this, udidCopy]() { checkJailbreak(udidCopy); }).detach();
-    }
+    // No jailbreak check fired from here. It used to be dispatched onto a
+    // detached thread, which meant it ran concurrently with (and usually
+    // finished after) the main flow's own read of icon->jailbroken -- so the
+    // value that decides which build gets requested was racing the check
+    // that produces it. Cli.cpp now calls checkJailbreak() synchronously at
+    // the point it actually needs the answer, which is also what keeps this
+    // process off USB entirely while a pwntool owns the device (see
+    // UsbQuietWindow): there is no longer any background thread left that
+    // could reach lockdownd/AFC on its own schedule.
 }
 
 void DeviceManager::disconnectDevice(uint64_t ecid, const std::string& udid) {
@@ -177,6 +182,54 @@ void DeviceManager::disconnectDevice(uint64_t ecid, const std::string& udid) {
         match->connected = 0;
     }
     if (sink_.onDeviceRemoved) sink_.onDeviceRemoved(ecid, udid);
+}
+
+// ---------------------------------------------------------------------------
+// USB quiet window
+// ---------------------------------------------------------------------------
+
+// While an external pwntool owns the device, this process has no business
+// touching USB at all: gaster/blackb0x-pwn claim the DFU interface for the
+// whole exploit and deliberately reset the device several times along the
+// way, and the pwn is the one operation here whose USB timing actually
+// matters. Left alone, this process talks to the same device from two
+// places of its own -- libirecovery's event-handler thread, which
+// libusb_open()s every Apple device it sees just to read the serial string,
+// and blackb0x_irecv_device_event_cb() calling get_tv() on top of that,
+// which opens the device again and retries for up to six seconds -- plus
+// libimobiledevice's own event thread, which reaches the device through
+// usbmuxd. None of the three is of any use during the exploit either: every
+// disconnect/reconnect they report is the pwntool's own normal operation,
+// announced against a device this process is not the one driving.
+//
+// Unsubscribing, rather than just ignoring the callbacks, is what actually
+// stops the traffic: both libraries tear their event thread down once the
+// last listener is gone (libirecovery.c's irecv_device_event_unsubscribe(),
+// idevice.c's idevice_event_unsubscribe()), so for the duration of the
+// window this process is single-threaded and genuinely silent on USB.
+// libirecovery's unsubscribe additionally blocks until any callback still
+// in progress has returned, since the same listener_mutex guards both.
+// deviceEventsSuspended_ covers the narrow window before each teardown
+// completes.
+DeviceManager::UsbQuietWindow::UsbQuietWindow(DeviceManager& deviceManager) : deviceManager_(deviceManager) {
+    deviceManager_.deviceEventsSuspended_.store(true);
+    if (deviceManager_.irecvEventCtx_) {
+        irecv_device_event_unsubscribe(deviceManager_.irecvEventCtx_);
+        deviceManager_.irecvEventCtx_ = nullptr;
+    }
+    idevice_event_unsubscribe();
+}
+
+// Re-subscribing replays IRECV_DEVICE_ADD for whatever is present now, which
+// is how the device's post-exploit state (the "PWND:[" in its serial string
+// in particular) gets back into devices_. It does not re-announce anything:
+// newDevice() finds the existing entry by ECID and updates it in place.
+DeviceManager::UsbQuietWindow::~UsbQuietWindow() {
+    deviceManager_.deviceEventsSuspended_.store(false);
+    if (!deviceManager_.irecvEventCtx_) {
+        irecv_device_event_subscribe(&deviceManager_.irecvEventCtx_, blackb0x_irecv_device_event_cb, nullptr);
+    }
+    idevice_event_subscribe(blackb0x_idevice_event_cb, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +554,14 @@ static int runLineBufferedSubprocess(const std::string& binaryPath, const std::v
     fcntl(errPipe[0], F_SETFL, O_NONBLOCK);
 
     auto pump = [&]() {
+        // read() hands back arbitrary chunk boundaries, which routinely fall
+        // mid-line -- holding the console lock across the whole drain keeps
+        // anything else that prints from landing inside one of those partial
+        // lines. In practice checkm8Attempt() already silences every other
+        // source for the duration of the pwn (see UsbQuietWindow); this is
+        // just so the helper stays safe if it ever gets used somewhere that
+        // doesn't.
+        console::Block block;
         char buf[512];
         ssize_t n;
         while ((n = read(outPipe[0], buf, sizeof(buf))) > 0) fwrite(buf, 1, (size_t)n, stdout);
@@ -633,6 +694,13 @@ bool DeviceManager::checkm8Attempt(uint64_t ecid, const std::string& pwnTool) {
 
     status("Exploiting with checkm8");
     progress(10.0);
+
+    // Held across the exploit AND its verification below, not just the
+    // subprocess: letting libirecovery's event thread back up the moment the
+    // pwntool exits would put a second libusb_open() of the device in flight
+    // against get_tv_patient()'s own reconnect retries, at exactly the moment
+    // the device is still settling from the exploit's last reset.
+    UsbQuietWindow quiet(*this);
 
     // pwnTool selects which subprocess actually runs the exploit -- see
     // Cli.hpp's CliOptions::pwnTool and docs/HISTORY.md for why: gaster
@@ -830,9 +898,9 @@ int isJailbreakRunning(const std::string& udid) {
     return 1;
 }
 
-// waitForAFC2's original recursive NSThread-sleep retry, now a plain
-// blocking loop — safe because it always runs on a detached background
-// thread (see DeviceManager::checkJailbreak).
+// waitForAFC2's original recursive NSThread-sleep retry, now a plain bounded
+// blocking loop — called only from checkJailbreak(), which the main flow
+// drives synchronously at the point it needs the answer.
 void DeviceManager::checkJailbreakRunning(const std::string& udid) {
     int jb = -1;
     for (int attempts = 5; attempts > 0; attempts--) {
@@ -852,19 +920,36 @@ void DeviceManager::checkJailbreakRunning(const std::string& udid) {
     if (sink_.onDeviceUpdated) sink_.onDeviceUpdated(*icon);
 }
 
-// checkJailbreak's original recursive dispatch_after retry (on the main
-// queue, to avoid blocking it) is now a plain blocking loop — safe because
-// it always runs on a detached background thread (see newDevice()).
+// Runs synchronously on whatever thread asks, which in practice is only ever
+// Cli.cpp's main flow (see newDevice()'s own comment on why this is no longer
+// dispatched onto a thread of its own).
+//
+// The retry is bounded, unlike the original's recursive dispatch_after, which
+// re-armed itself indefinitely: a device that never answers over AFC at all
+// has to end this call rather than wedge the one thread there is. Running out
+// of attempts leaves the device's jailbroken flag untouched at its default of
+// 0, which is the same answer the caller was already getting in practice --
+// the detached version almost never finished before the main flow read it.
+//
+// Idempotent per UDID once it has an answer: selectDevice() can reach this
+// once per pass through its own poll loop, and re-running a full AFC
+// handshake each time would be several seconds of USB traffic for something
+// that cannot have changed. A pass that ran out of attempts without getting
+// an answer is deliberately not recorded, so a device that was merely slow
+// to come up over AFC still gets looked at again on the next pass.
 void DeviceManager::checkJailbreak(const std::string& udid) {
     if (udid.empty()) return;
+    if (jailbreakChecked_.count(udid)) return;
 
     int jailbroken = -1;
-    while (jailbroken == -1) {
+    for (int attempts = 20; attempts > 0 && jailbroken == -1; attempts--) {
         jailbroken = isJailbroken(udid);
         if (jailbroken == -1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
     }
+    if (jailbroken == -1) return;
+    jailbreakChecked_.insert(udid);
 
     AppleTVDevice* icon = deviceWithUDID(udid);
     if (!icon) return;
@@ -903,6 +988,11 @@ extern "C" int blackb0x_irecv_progress_cb(irecv_client_t client, const irecv_eve
 extern "C" void blackb0x_irecv_device_event_cb(const irecv_device_event_t* event, void* user_data) {
     (void)user_data;
     if (!DeviceManager::instance()) return;
+    // A pwntool owns the device right now -- see UsbQuietWindow. Belt-and-
+    // braces against a callback already in flight when it unsubscribed: the
+    // get_tv() below would otherwise open the device out from under the
+    // exploit.
+    if (DeviceManager::instance()->deviceEventsSuspended_.load()) return;
 
     uint64_t ecid = event->device_info->ecid;
 
@@ -950,6 +1040,7 @@ extern "C" void blackb0x_irecv_device_event_cb(const irecv_device_event_t* event
 extern "C" void blackb0x_idevice_event_cb(const idevice_event_t* event, void* user_data) {
     (void)user_data;
     if (!DeviceManager::instance()) return;
+    if (DeviceManager::instance()->deviceEventsSuspended_.load()) return;
     if (event->udid == nullptr) return;
     if (event->conn_type == CONNECTION_NETWORK) return;
 
@@ -1043,7 +1134,7 @@ static irecv_client_t get_tv(uint64_t ecid) {
         irecv_error_t err = irecv_open_with_ecid(&client, ecid);
 
         if (err == IRECV_E_UNSUPPORTED) {
-            fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
+            console::err("ERROR: %s\n", irecv_strerror(err));
             return nullptr;
         } else if (err != IRECV_E_SUCCESS) {
             // Visible retry progress: without this, a device that dropped
@@ -1053,14 +1144,14 @@ static irecv_client_t get_tv(uint64_t ecid) {
             // re-enumerate -- both just sit silent for ~6 seconds before the
             // final "Unable to connect to device". Surfacing each attempt's
             // own error lets that distinction actually be made from the log.
-            fprintf(stderr, "  (reconnect attempt %d/6: %s, retrying...)\n", i + 1, irecv_strerror(err));
+            console::err("  (reconnect attempt %d/6: %s, retrying...)\n", i + 1, irecv_strerror(err));
             sleep(1);
         } else {
             break;
         }
 
         if (i == 5) {
-            fprintf(stderr, "ERROR: %s\n", irecv_strerror(err));
+            console::err("ERROR: %s\n", irecv_strerror(err));
             return nullptr;
         }
     }
@@ -1091,7 +1182,7 @@ NormalModeInfo plistInfoForDeviceUUID(const std::string& udid) {
     if (lockdownd_client_new_with_handshake(device, &client, "blackb0x") != LOCKDOWN_E_SUCCESS) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (lockdownd_client_new_with_handshake(device, &client, "blackb0x") != LOCKDOWN_E_SUCCESS) {
-            fprintf(stderr, "ERROR: Could not connect to lockdownd\n");
+            console::err("ERROR: Could not connect to lockdownd\n");
             idevice_free(device);
             return out;
         }

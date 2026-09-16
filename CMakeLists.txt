@@ -1292,6 +1292,7 @@ endif()
 add_executable(blackb0x
     Blackb0x/Source/main.cpp
     Blackb0x/Source/Cli.cpp
+    Blackb0x/Source/Console.cpp
     Blackb0x/Source/DeviceManager.cpp
     Blackb0x/Source/IPSW.cpp
     Blackb0x/Source/IPSWDownloader.cpp
