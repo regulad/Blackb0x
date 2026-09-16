@@ -570,6 +570,10 @@ in that comment:
   controller (older/cheaper laptops, many desktop motherboards) or at minimum a
   non-Thunderbolt-routed xHCI implementation from a different vendor generation, since
   every avenue on this specific Tiger Lake-LP/Thunderbolt setup has now been tried.
+  **SUPERSEDED** — see "`blackb0x-pwn` on Linux" at the end of this file. Running a
+  second, independent checkm8 implementation here with a usbmon capture shows the
+  resets completing cleanly every time; the failure is elsewhere, and the
+  host-controller-limitation conclusion above does not hold.
 
 ## Current state / how to build
 
@@ -2674,3 +2678,137 @@ baking a ramdisk natively on the real Mac test machine, rather than
 copying one over from elsewhere, resolves the persistent post-`bootx`
 boot failure documented in the entry above — is also still open, only
 answerable by actually running this on that machine.
+
+## `blackb0x-pwn` on Linux: an error-code bug, then a wire-level teardown of why checkm8 still fails
+
+`blackb0x-pwn` (this project's own hand-ported checkm8, confirmed working on real
+AppleTV3,2 hardware on macOS) had never been run on Linux at all — it was gated
+behind `if(APPLE)` in `CMakeLists.txt`. Nothing in `Blackb0x/Source/Pwn/` is
+actually Apple-specific, though: it uses only libirecovery's backend-independent
+`irecv_*` API, and every call it makes has a real libusb implementation. The gate
+was a packaging decision from the macOS effort. Building it on Linux turns it into
+a **control against gaster**, which matters because the entry above concludes that
+this machine's USB stack "genuinely cannot handle checkm8's device-initiated reset
+reliably" — a conclusion resting entirely on gaster, the only implementation ever
+run here.
+
+**That conclusion is wrong, and this entry supersedes it.** Across every run below,
+the device reset and re-enumerated cleanly three times, promptly, every time. The
+resets are not the problem.
+
+### Two real bugs found before any measurement was possible
+
+- **The `IRECV_E_PIPE`/`LIBUSB_ERROR_PIPE` gap, again.** First Linux run died
+  instantly with `Failed to stall pipe -9.` — and `-9` is `LIBUSB_ERROR_PIPE`, a
+  *successful* stall, which is checkm8's first exploit step. `irecv_usb_control_transfer()`
+  does not normalise its return across backends: IOKit translates into
+  libirecovery's enum (`IRECV_E_PIPE == -10`, `IRECV_E_TIMEOUT == -11`), libusb is
+  a bare pass-through of libusb's own unrelated codes (`-9`, `-7`). All six checks
+  compared against the IOKit spelling only. **This is the identical gap documented
+  in the libimobiledevice-fork entry above**, fixed once in the `DeviceManager.cpp`
+  `checkm8()` that predates this file, across the same six call sites; it returned
+  because `Checkm8Pwn.c` was recovered from the original Objective-C, which only
+  ever ran on IOKit. Now both spellings are accepted, which is safe because
+  `iokit_usb_control_transfer()`'s translation table cannot produce `-9`/`-7` at all.
+- **A use-after-free, double free and hang in libirecovery's libusb async-cancel
+  path.** `irecv_async_usb_control_transfer_with_cancel()` freed its buffer while
+  the transfer was still queued *and* left `LIBUSB_TRANSFER_FREE_BUFFER` set, never
+  called `libusb_free_transfer()`, and waited on `status != LIBUSB_TRANSFER_CANCELLED`
+  — which never terminates for a transfer that completes instead of being cancelled,
+  since the field is bzero'd and `LIBUSB_TRANSFER_COMPLETED` is itself 0. Unreachable
+  until now (its only consumer ran on IOKit). Fixed on **regulad/libirecovery@`libusb-async-cancel-fix`**.
+
+### Method: usbmon, because the tools' own logging cannot see the answer
+
+Kernel lockdown (forced on by Secure Boot) blocks the debugfs usbmon interface
+outright — `sudo cat /sys/kernel/debug/usb/usbmon/3u` returns `EPERM` no matter
+what, and `modprobe usbmon` "succeeds" while changing nothing because usbmon is
+built in. The binary interface at `/dev/usbmonN` is not debugfs and is not
+restricted, and libpcap talks to it directly: `sudo tcpdump -i usbmon3 -w out.pcap`.
+`scripts/analyze_usbmon_checkm8.py` summarises the result per request type.
+
+This matters because every heap-grooming request in checkm8 is *expected* to fail,
+so the tools' own "did it fail the right way?" checks pass identically whether the
+device serviced a request or the host cancelled it before it left. Only the wire
+distinguishes those.
+
+### What the wire shows
+
+The whole sequence executes, in order, on Linux: 2 stalls, 626+1 leaks, 1 no-leak,
+the 2048-byte bug-setup download, the abort, the 1660-byte overwrite, the 678-byte
+payload. Nothing is missing or misrouted.
+
+**The bug-setup partial transfer is precisely controllable.** `DEBUG_CANCEL_DELAY_US`
+sweeps how much of it the device consumes, and the relationship is cleanly linear:
+
+    bytes ~= 0.321 * delay_us - 5.5      (~321 bytes/ms, near-zero intercept)
+
+against a theoretical ceiling of 512 B/ms for 64-byte packets at one transaction per
+125us microframe. Predictions from this fit matched later runs to within one packet.
+**Linux's stack is behaving predictably and controllably here, not erratically.**
+Swept across 0 -> 1600 bytes — the entire window the tool considers valid — every
+value fails.
+
+**The overwrite is what never lands.** That transfer (`bmRequestType=0x00,
+bRequest=0`, 1660 bytes) carries the 1632-byte pad and the 28-byte
+`callback = 0x34000000`, and it is the step that performs the actual corruption:
+
+| bug-setup `sent` | overwrite outcome |
+|---|---|
+| 0 | stalled, **0 bytes** |
+| 128 | stalled, **0 bytes** |
+| 320 | stalled, **0 bytes** |
+| 1472 | accepted, **576 bytes** = `0x800 - 1472`, then stops |
+
+At `sent = 1472` the device accepts it as a *continuation of the same 2048-byte DFU
+buffer* and stops exactly when that buffer is full — reproducible at both 100ms and
+500ms timeouts, so it is a structural ceiling, not a rate limit. That leaves two
+incompatible requirements: acceptance needs `sent` above 320, and fitting all 1660
+bytes needs `sent <= 388` (`2048 - 1660`). **No setting satisfies both**, which is
+why no cancel delay helps.
+
+Two dead ends worth recording so they are not re-tried: holding the connection open
+through the overwrite (`DEBUG_KEEP_CONNECTION`, skipping the close/500ms/reopen)
+makes it *worse* — a groom leak returns `EPROTO` and every transfer after it also
+`EPROTO`s in ~141us, so the close/reopen is **recovering** from an endpoint error
+state rather than causing the problem. And the reopen path was audited and is
+innocent: `irecv_usb_set_configuration()` is guarded by `libusb_get_configuration()`,
+`irecv_close()` skips `libusb_release_interface()` for DFU-mode clients, and
+`irecv_usb_set_interface(0,0)` is a usbfs ioctl with no wire traffic.
+
+### gaster fails differently, and the contrast is the open question
+
+gaster does **not** fail the same way, contrary to what the entry above assumes. Its
+own equivalent request (`bmRequestType=0x00, bRequest=0`, 1632 bytes) **does deliver
+— up to all 1632 bytes, on 300 of 384 attempts.** So large malformed control writes
+are not blocked on this host. gaster's problem is the opposite: `checkm8_stage_setup()`
+requires that request to come back `USB_TRANSFER_STALL`, and on Linux it *succeeds*.
+It stalled once in 384 tries, so gaster spun in its unbounded retry loop and never
+left SETUP.
+
+**So the same request delivers for gaster and is refused for blackb0x-pwn**, differing
+only in what precedes it: gaster issues it immediately after the aborted download on
+one connection, while blackb0x-pwn issues it after `CLRSTATUS`, a close/reopen, a
+stall and a leak. That asymmetry is the unresolved question, and it is not a host-stack
+limitation.
+
+### Where this leaves the platform conclusion
+
+Not "Linux cannot do checkm8". The resets work, the partial-transfer mechanism is
+precise and predictable, and large malformed control writes are delivered. What has
+not been established is why the device refuses the overwrite for one implementation
+and accepts it for the other. The decisive measurement is what that same transfer does
+on a **working macOS run** — whether it is supposed to deliver 1660 bytes. To make that
+a single run,`analyze_usbmon_checkm8.py` now also reads `DLT_USB_DARWIN` captures
+(`sudo ifconfig XHC20 up && sudo tcpdump -i XHC20 -w out.pcap`). That Darwin
+pseudo-header layout is **unverified** — Wireshark's dissector gave the field order but
+the source fetch truncated before the offset arithmetic, and libpcap defines only the
+DLT number — so the script tries two candidate layouts, validates each against the
+capture's own `header_len` and enum fields, and **refuses to print numbers if neither
+matches** rather than emitting a confident guess. Sanity-check its first real output.
+
+All investigation knobs in both binaries are `DEBUG_`-prefixed and every default is the
+macOS-confirmed behaviour, so an unset environment is the original path byte for byte:
+`DEBUG_CANCEL_DELAY_US` (100), `DEBUG_OVERWRITE_TIMEOUT_MS` (100), `DEBUG_RECONNECT_ATTEMPTS`
+(30), `DEBUG_KEEP_CONNECTION` (unset), `DEBUG_IGNORE_GROOM_ERRORS` (unset); gaster adds
+`DEBUG_CANCEL_DELAY_US` and `DEBUG_SETUP_FULL_PAD`.

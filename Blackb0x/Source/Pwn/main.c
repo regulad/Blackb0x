@@ -26,7 +26,28 @@ static void printUsage(const char* argv0) {
         "Runs Blackb0x's own original, hand-ported exploit implementations\n"
         "directly over libirecovery (its native IOKit backend on macOS, libusb\n"
         "elsewhere) -- no gaster. Waits for a single already-connected DFU-mode\n"
-        "device; if --ecid is omitted, the first one found is used.\n",
+        "device; if --ecid is omitted, the first one found is used.\n"
+        "\n"
+        "env (all DEBUG_-prefixed knobs exist for investigating why this does\n"
+        "not work on Linux -- every default is the macOS-confirmed behaviour,\n"
+        "so leaving them unset changes nothing):\n"
+        "  DEBUG_CANCEL_DELAY_US\n"
+        "      Microseconds to let checkm8's bug-setup DFU_DNLOAD run before\n"
+        "      aborting it. Default 100, from the macOS original. gaster takes\n"
+        "      the same variable. See scripts/sweep_pwn_cancel_delay.py.\n"
+        "  DEBUG_OVERWRITE_TIMEOUT_MS\n"
+        "      Milliseconds to let the overwrite transfer deliver its payload.\n"
+        "      Default 100, likewise from the macOS original.\n"
+        "  DEBUG_KEEP_CONNECTION\n"
+        "      Hold one connection from the bug setup through the overwrite\n"
+        "      instead of closing, sleeping 500ms and reopening in between.\n"
+        "      Unset by default (the macOS behaviour).\n"
+        "  DEBUG_RECONNECT_ATTEMPTS\n"
+        "      One-second reconnect retries per stage. Default 30, from the\n"
+        "      macOS original; lower it to fail fast while sweeping.\n"
+        "  DEBUG_IGNORE_GROOM_ERRORS\n"
+        "      Report heap-groom requests that answer unexpectedly instead of\n"
+        "      aborting the run. Unset by default (the macOS behaviour).\n",
         argv0);
 }
 
